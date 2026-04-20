@@ -1,0 +1,18 @@
+# Virtual Environment 
+.venv*
+venv*
+
+# Mac OS Clutter
+.DS_Store
+._DS_Store
+
+# Python Cache
+*.pyc
+__pycache__
+
+# Temporary Build Directories
+build_assets/
+build/
+*.spec
+pyi_ffprobe_path_hook.py
+dist
