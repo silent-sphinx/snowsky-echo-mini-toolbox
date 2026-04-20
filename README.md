@@ -13,7 +13,6 @@ An easy desktop app to prepare your music folders and USB drives for the Snowsky
 
 - [Snowsky Echo Mini Toolbox](#snowsky-echo-mini-toolbox)
   - [Table of Contents](#table-of-contents)
-  - [Quick Start](#quick-start)
   - [Main Features](#main-features)
   - [Requirements](#requirements)
   - [Important Notes](#important-notes)
@@ -21,31 +20,6 @@ An easy desktop app to prepare your music folders and USB drives for the Snowsky
   - [Build from source](#build-from-source)
   - [Compatibility Rules](#compatibility-rules)
   - [Contributing](#contributing)
-
-## Quick Start
-
-1. Download or clone this repository.
-1. Create and activate a virtual environment.
-1. Install dependencies.
-1. Start the app.
-
-macOS and Linux:
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python3 main.py
-```
-
-Windows PowerShell:
-
-```powershell
-py -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python3 main.py
-```
 
 ## Main Features
 
@@ -72,7 +46,7 @@ python3 main.py
 
 - Python 3.12+
 - macOS, Linux, or Windows
-- 
+
 ## Important Notes
 
 - This program has the ability to modify your Snowsky Echo Mini Library, ALWAYS check to see if the program is making the intended changes on your data, before applying.

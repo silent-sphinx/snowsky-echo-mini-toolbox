@@ -15,11 +15,12 @@ from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import QDir, QModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QPalette, QPixmap
+from PySide6.QtGui import QColor, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFileSystemModel,
     QHBoxLayout,
@@ -35,7 +36,9 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QProgressDialog,
     QPushButton,
+    QScrollArea,
     QSplitter,
+    QSizePolicy,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -626,6 +629,190 @@ class FileTransferWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class BackupRestoreProgressDialog(QDialog):
+    cancelRequested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._allow_close = False
+        self._cancel_pending = False
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setWindowModality(Qt.WindowModal)
+        self.setModal(True)
+        self.setObjectName("backupRestoreProgressDialog")
+        self.setMinimumWidth(500)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        self._label = QLabel("Preparing...")
+        self._label.setWordWrap(True)
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 1)
+        self._progress.setValue(0)
+        self._progress.setFormat("0/1")
+        self._progress.setTextVisible(True)
+
+        self._cancel_button = QPushButton("Cancel")
+        self._cancel_button.clicked.connect(self._on_cancel_pressed)
+
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.addStretch(1)
+        button_row.addWidget(self._cancel_button)
+
+        layout.addWidget(self._label)
+        layout.addWidget(self._progress)
+        layout.addLayout(button_row)
+
+        self.setStyleSheet(
+            """
+            QDialog#backupRestoreProgressDialog {
+                background-color: #262626;
+                color: #ECECEC;
+                border: 1px solid #3C3C3C;
+                border-radius: 0px;
+            }
+            QDialog#backupRestoreProgressDialog QLabel {
+                background-color: transparent;
+                color: #ECECEC;
+            }
+            QDialog#backupRestoreProgressDialog QProgressBar {
+                background-color: #1F1F1F;
+                color: #EAEAEA;
+                border: 1px solid #434343;
+                border-radius: 0px;
+                text-align: center;
+                min-height: 18px;
+            }
+            QDialog#backupRestoreProgressDialog QProgressBar::chunk {
+                background-color: #565656;
+                border-radius: 0px;
+            }
+            QDialog#backupRestoreProgressDialog QPushButton {
+                background-color: #3A3A3A;
+                border: 1px solid #4B4B4B;
+                border-radius: 0px;
+                color: #F0F0F0;
+                padding: 7px 12px;
+                font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', sans-serif;
+                font-weight: 600;
+            }
+            QDialog#backupRestoreProgressDialog QPushButton:hover {
+                background-color: #4A4A4A;
+            }
+            QDialog#backupRestoreProgressDialog QPushButton:pressed {
+                background-color: #2F2F2F;
+            }
+            QDialog#backupRestoreProgressDialog QPushButton:disabled {
+                background-color: #242424;
+                border: 1px solid #353535;
+                color: #767676;
+            }
+            """
+        )
+
+    def begin(self, label_text: str) -> None:
+        self._allow_close = False
+        self._cancel_pending = False
+        self._cancel_button.setText("Cancel")
+        self._cancel_button.setEnabled(True)
+        self._progress.setRange(0, 1)
+        self._progress.setValue(0)
+        self._progress.setFormat("0/1")
+        self._label.setText(label_text)
+        if not self.isVisible():
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+    def update_progress(self, processed: int, total: int, detail_text: str) -> None:
+        total_for_ui = max(total, 1)
+        shown_value = min(processed, total_for_ui)
+        self._progress.setRange(0, total_for_ui)
+        self._progress.setValue(shown_value)
+        self._progress.setFormat(f"{shown_value}/{total}")
+        self._label.setText(detail_text)
+        if not self.isVisible():
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+    def mark_cancelling(self, label_text: str) -> None:
+        self._cancel_pending = True
+        self._label.setText(label_text)
+        self._cancel_button.setText("Cancelling...")
+        self._cancel_button.setEnabled(False)
+        if not self.isVisible():
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+    def finish_and_hide(self) -> None:
+        self._allow_close = True
+        self._cancel_pending = False
+        self.hide()
+
+    def closeEvent(self, event) -> None:
+        if not self._allow_close:
+            if not self._cancel_pending:
+                self._on_cancel_pressed()
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def _on_cancel_pressed(self) -> None:
+        if self._cancel_pending:
+            return
+        self.mark_cancelling("Cancelling backup/restore job...")
+        self.cancelRequested.emit()
+
+
+class HelpRail(QWidget):
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._expanded = True
+        self.setObjectName("helpRail")
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.setToolTip("Toggle help panel")
+
+    def setExpanded(self, expanded: bool) -> None:
+        self._expanded = expanded
+        self.setToolTip("Toggle help panel")
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        painter.setPen(QColor("#3C3C3C"))
+        painter.drawRect(rect)
+
+        painter.setPen(QColor("#E3E3E3"))
+
+        letters = ["H", "E", "L", "P"]
+        font_metrics = painter.fontMetrics()
+        slot_height = max(10, font_metrics.height() - 2)
+        letter_gap = -1
+        total_height = len(letters) * slot_height + (len(letters) - 1) * letter_gap
+        top_offset = max(18, (rect.height() - total_height) // 2)
+        for index, letter in enumerate(letters):
+            y_pos = top_offset + index * (slot_height + letter_gap)
+            painter.drawText(0, y_pos, rect.width(), slot_height, Qt.AlignHCenter | Qt.AlignVCenter, letter)
+
+
 def apply_charcoal_palette(app: QApplication) -> None:
     palette = QPalette()
     palette.setColor(QPalette.ColorRole.Window, QColor("#262626"))
@@ -660,6 +847,9 @@ class ToolboxWindow(QMainWindow):
         self._backup_restore_thread: QThread | None = None
         self._backup_restore_worker: QObject | None = None
         self._backup_restore_active_operation = ""
+        self._backup_restore_active_kind = ""
+        self._backup_restore_busy = False
+        self._backup_restore_progress_dialog: BackupRestoreProgressDialog | None = None
         self._dir_size_scan_thread: QThread | None = None
         self._dir_size_scan_worker: DirectorySizeScanWorker | None = None
         self._dir_size_scan_target: str | None = None
@@ -682,6 +872,8 @@ class ToolboxWindow(QMainWindow):
         self._active_audio_metadata_path: Path | None = None
         self._updating_file_props_table = False
         self._help_pane_width = 280
+        self._help_rail_width = 34
+        self._help_pane_collapsed = False
 
         self.setWindowTitle("Snowsky Echo Mini Toolbox")
         self.resize(920, 620)
@@ -767,6 +959,18 @@ class ToolboxWindow(QMainWindow):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._position_header_logo()
+
+    def _configure_resizable_table_columns(
+        self, table: QTableWidget, default_widths: list[int] | tuple[int, ...] | None = None
+    ) -> None:
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        header.setSectionsClickable(True)
+        if default_widths:
+            for column, width in enumerate(default_widths):
+                if width > 0:
+                    table.setColumnWidth(column, width)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -870,8 +1074,7 @@ class ToolboxWindow(QMainWindow):
         self.info_table = QTableWidget(0, 2)
         self.info_table.setHorizontalHeaderLabels(["Property", "Value"])
         self.info_table.verticalHeader().setVisible(False)
-        self.info_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.info_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._configure_resizable_table_columns(self.info_table, [220, 520])
         self.info_table.setAlternatingRowColors(True)
         self.info_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.info_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -912,11 +1115,7 @@ class ToolboxWindow(QMainWindow):
             ["File", "Status", "Progressive", "File Type", "Resolution"]
         )
         self.album_art_table.verticalHeader().setVisible(False)
-        self.album_art_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.album_art_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.album_art_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.album_art_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.album_art_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self._configure_resizable_table_columns(self.album_art_table, [420, 140, 120, 120, 140])
         self.album_art_table.setAlternatingRowColors(True)
         self.album_art_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.album_art_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -975,14 +1174,10 @@ class ToolboxWindow(QMainWindow):
             ]
         )
         self.music_compatibility_table.verticalHeader().setVisible(False)
-        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeToContents)
+        self._configure_resizable_table_columns(
+            self.music_compatibility_table,
+            [340, 110, 120, 260, 150, 100, 110, 90],
+        )
         self.music_compatibility_table.setAlternatingRowColors(True)
         self.music_compatibility_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.music_compatibility_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1157,9 +1352,7 @@ class ToolboxWindow(QMainWindow):
         self.file_props_table = QTableWidget(0, 2)
         self.file_props_table.setHorizontalHeaderLabels(["Property", "Value"])
         self.file_props_table.verticalHeader().setVisible(False)
-        self.file_props_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
-        self.file_props_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.file_props_table.setColumnWidth(0, 240)
+        self._configure_resizable_table_columns(self.file_props_table, [240, 520])
         self.file_props_table.setAlternatingRowColors(True)
         self.file_props_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.file_props_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1250,11 +1443,7 @@ class ToolboxWindow(QMainWindow):
             ["Remove", "File Type", "Type", "Files", "Total Size"]
         )
         self.cleanup_table.verticalHeader().setVisible(False)
-        self.cleanup_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.cleanup_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.cleanup_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.cleanup_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.cleanup_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self._configure_resizable_table_columns(self.cleanup_table, [80, 220, 120, 100, 150])
         self.cleanup_table.setAlternatingRowColors(True)
         self.cleanup_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.cleanup_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1274,16 +1463,34 @@ class ToolboxWindow(QMainWindow):
         )
         backup_restore_hint.setObjectName("targetSummary")
 
+        backup_restore_section_title = QLabel("Backup/Restore Operations")
+        backup_restore_section_title.setObjectName("sectionLabel")
+
         zip_controls = QHBoxLayout()
         self.backup_zip_path_input = QLineEdit()
         self.backup_zip_path_input.setPlaceholderText("Backup zip path (for example: /Volumes/Backup/MyDrive.zip)")
         self.backup_zip_browse_btn = QPushButton("Choose Zip Location")
         self.backup_zip_browse_btn.clicked.connect(self.choose_backup_zip_path)
         self.backup_zip_run_btn = QPushButton("Backup Target To Zip")
+        self.backup_zip_run_btn.setEnabled(False)
         self.backup_zip_run_btn.clicked.connect(self.start_zip_backup)
+        self.backup_zip_path_input.textChanged.connect(self._update_backup_zip_run_button_state)
         zip_controls.addWidget(self.backup_zip_path_input, 1)
         zip_controls.addWidget(self.backup_zip_browse_btn)
         zip_controls.addWidget(self.backup_zip_run_btn)
+
+        backup_zip_section = QWidget()
+        backup_zip_section.setObjectName("panelSection")
+        backup_zip_section_layout = QVBoxLayout(backup_zip_section)
+        backup_zip_section_layout.setContentsMargins(10, 10, 10, 10)
+        backup_zip_section_layout.setSpacing(8)
+        backup_zip_title = QLabel("Backup Target To Zip")
+        backup_zip_title.setObjectName("sectionLabel")
+        backup_zip_hint = QLabel("Create a full zip archive of the selected target.")
+        backup_zip_hint.setObjectName("targetSummary")
+        backup_zip_section_layout.addWidget(backup_zip_title)
+        backup_zip_section_layout.addWidget(backup_zip_hint)
+        backup_zip_section_layout.addLayout(zip_controls)
 
         transfer_controls = QHBoxLayout()
         self.transfer_destination_input = QLineEdit()
@@ -1294,34 +1501,31 @@ class ToolboxWindow(QMainWindow):
         self.transfer_mode_combo.addItem("Copy", "copy")
         self.transfer_mode_combo.addItem("Move", "move")
         self.transfer_run_btn = QPushButton("Start Copy/Move")
+        self.transfer_run_btn.setEnabled(False)
         self.transfer_run_btn.clicked.connect(self.start_copy_or_move)
+        self.transfer_destination_input.textChanged.connect(self._update_transfer_run_button_state)
         transfer_controls.addWidget(self.transfer_destination_input, 1)
         transfer_controls.addWidget(self.transfer_destination_browse_btn)
         transfer_controls.addWidget(self.transfer_mode_combo)
         transfer_controls.addWidget(self.transfer_run_btn)
 
-        self.backup_restore_summary_label = QLabel("No backup/restore job run yet.")
-        self.backup_restore_summary_label.setObjectName("targetSummary")
+        transfer_section = QWidget()
+        transfer_section.setObjectName("panelSection")
+        transfer_section_layout = QVBoxLayout(transfer_section)
+        transfer_section_layout.setContentsMargins(10, 10, 10, 10)
+        transfer_section_layout.setSpacing(8)
+        transfer_title = QLabel("Copy/Move To Destination")
+        transfer_title.setObjectName("sectionLabel")
+        transfer_hint = QLabel("Choose destination, then select Copy or Move mode.")
+        transfer_hint.setObjectName("targetSummary")
+        transfer_section_layout.addWidget(transfer_title)
+        transfer_section_layout.addWidget(transfer_hint)
+        transfer_section_layout.addLayout(transfer_controls)
 
-        self.backup_restore_progress = QProgressBar()
-        self.backup_restore_progress.setRange(0, 1)
-        self.backup_restore_progress.setValue(0)
-        self.backup_restore_progress.setFormat("Idle")
-        self.backup_restore_progress.setTextVisible(True)
-
-        cancel_row = QHBoxLayout()
-        self.backup_restore_cancel_btn = QPushButton("Cancel Job")
-        self.backup_restore_cancel_btn.setEnabled(False)
-        self.backup_restore_cancel_btn.clicked.connect(self.cancel_backup_restore_job)
-        cancel_row.addStretch(1)
-        cancel_row.addWidget(self.backup_restore_cancel_btn)
-
+        backup_restore_layout.addWidget(backup_restore_section_title)
         backup_restore_layout.addWidget(backup_restore_hint)
-        backup_restore_layout.addLayout(zip_controls)
-        backup_restore_layout.addLayout(transfer_controls)
-        backup_restore_layout.addWidget(self.backup_restore_summary_label)
-        backup_restore_layout.addWidget(self.backup_restore_progress)
-        backup_restore_layout.addLayout(cancel_row)
+        backup_restore_layout.addWidget(backup_zip_section)
+        backup_restore_layout.addWidget(transfer_section)
         backup_restore_layout.addStretch(1)
 
         self._about_tab_index = self.tabs.addTab(about_tab, "About Folder/Drive")
@@ -1343,7 +1547,7 @@ class ToolboxWindow(QMainWindow):
         content_row.setContentsMargins(0, 0, 0, 0)
         content_row.setSpacing(10)
         content_row.addWidget(self.tabs, 1)
-        content_row.addWidget(self.help_pane, 0)
+        content_row.addWidget(self.help_container, 0)
 
         layout.addLayout(content_row, 1)
 
@@ -1354,10 +1558,24 @@ class ToolboxWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
 
     def _build_help_pane(self) -> None:
+        self.help_container = QWidget()
+        self.help_container.setObjectName("helpContainer")
+        self.help_container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+
+        help_container_layout = QHBoxLayout(self.help_container)
+        help_container_layout.setContentsMargins(0, 0, 0, 0)
+        help_container_layout.setSpacing(0)
+
+        self.help_rail = HelpRail(self.help_container)
+        self.help_rail.setFixedWidth(self._help_rail_width)
+        self.help_rail.clicked.connect(self._toggle_help_pane)
+        help_container_layout.addWidget(self.help_rail, 0)
+
         self.help_pane = QWidget()
         self.help_pane.setObjectName("helpPane")
         self.help_pane.setMinimumWidth(self._help_pane_width)
         self.help_pane.setFixedWidth(self._help_pane_width)
+        help_container_layout.addWidget(self.help_pane, 0)
 
         help_layout = QVBoxLayout(self.help_pane)
         help_layout.setContentsMargins(8, 8, 8, 8)
@@ -1373,8 +1591,14 @@ class ToolboxWindow(QMainWindow):
         self.help_context_label = QLabel("")
         self.help_context_label.setObjectName("targetSummary")
 
+        self.help_close_btn = QPushButton("X")
+        self.help_close_btn.setObjectName("helpCloseButton")
+        self.help_close_btn.setFixedSize(20, 20)
+        self.help_close_btn.clicked.connect(lambda: self._set_help_pane_collapsed(True))
+
         help_header_row.addWidget(self.help_title_label)
         help_header_row.addStretch(1)
+        help_header_row.addWidget(self.help_close_btn)
 
         self.help_body_label = QLabel()
         self.help_body_label.setObjectName("helpBody")
@@ -1382,11 +1606,33 @@ class ToolboxWindow(QMainWindow):
         self.help_body_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.help_body_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
+        self.help_body_scroll = QScrollArea()
+        self.help_body_scroll.setObjectName("helpBodyScroll")
+        self.help_body_scroll.setWidgetResizable(True)
+        self.help_body_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.help_body_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.help_body_scroll.setWidget(self.help_body_label)
+
         help_layout.addLayout(help_header_row)
         help_layout.addWidget(self.help_context_label)
-        help_layout.addWidget(self.help_body_label, 1)
+        help_layout.addWidget(self.help_body_scroll, 1)
 
+        self._set_help_pane_collapsed(self._help_pane_collapsed)
         self._update_help_for_tab(self.tabs.currentIndex())
+
+    def _toggle_help_pane(self) -> None:
+        self._set_help_pane_collapsed(not self._help_pane_collapsed)
+
+    def _set_help_pane_collapsed(self, collapsed: bool) -> None:
+        self._help_pane_collapsed = collapsed
+        self.help_pane.setVisible(not collapsed)
+        self.help_rail.setVisible(collapsed)
+        self.help_rail.setExpanded(not collapsed)
+
+        if collapsed:
+            self.help_container.setFixedWidth(self._help_rail_width)
+        else:
+            self.help_container.setFixedWidth(self._help_pane_width)
 
     def _update_help_for_tab(self, index: int) -> None:
         tab_name = ""
@@ -1506,13 +1752,17 @@ class ToolboxWindow(QMainWindow):
         if app is None:
             return
 
-        app.setStyleSheet(
-            """
+        combo_arrow_path = self._asset_path("assets", "combo_down_arrow.svg").resolve().as_posix()
+
+        style_sheet = """
             QMainWindow, QWidget {
                 background-color: #262626;
                 color: #ECECEC;
                 font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', 'Noto Sans', sans-serif;
                 font-size: 13px;
+            }
+            QLabel {
+                background-color: transparent;
             }
             QLabel#title {
                 font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', sans-serif;
@@ -1539,11 +1789,76 @@ class ToolboxWindow(QMainWindow):
                 border: 1px solid #3C3C3C;
                 border-radius: 0px;
             }
+            QWidget#helpContainer {
+                background-color: transparent;
+                border: none;
+            }
+            QWidget#helpRail {
+                background-color: #2A2A2A;
+                border: 1px solid #3C3C3C;
+                border-radius: 0px;
+            }
+            QWidget#helpRail:hover {
+                background-color: #333333;
+            }
+            QPushButton#helpCloseButton {
+                background-color: #343434;
+                border: 1px solid #4A4A4A;
+                border-radius: 0px;
+                color: #D7D7D7;
+                padding: 0px;
+                font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', sans-serif;
+                font-size: 12px;
+                font-weight: 700;
+                min-width: 20px;
+                max-width: 20px;
+                min-height: 20px;
+                max-height: 20px;
+            }
+            QPushButton#helpCloseButton:hover {
+                background-color: #454545;
+                color: #FFFFFF;
+            }
+            QPushButton#helpCloseButton:pressed {
+                background-color: #2D2D2D;
+            }
+            QWidget#panelSection {
+                background-color: #2B2B2B;
+                border: 1px solid #3C3C3C;
+                border-radius: 0px;
+            }
             QLabel#helpBody {
                 color: #D7D7D7;
                 background-color: #262626;
                 border: none;
                 padding: 2px 2px 4px 2px;
+            }
+            QScrollArea#helpBodyScroll {
+                background-color: #262626;
+                border: none;
+            }
+            QScrollArea#helpBodyScroll > QWidget > QWidget {
+                background-color: #262626;
+            }
+            QScrollArea#helpBodyScroll QScrollBar:vertical {
+                background-color: #1F1F1F;
+                width: 10px;
+                margin: 0px;
+            }
+            QScrollArea#helpBodyScroll QScrollBar::handle:vertical {
+                background-color: #4A4A4A;
+                min-height: 30px;
+            }
+            QScrollArea#helpBodyScroll QScrollBar::handle:vertical:hover {
+                background-color: #5A5A5A;
+            }
+            QScrollArea#helpBodyScroll QScrollBar::add-line:vertical,
+            QScrollArea#helpBodyScroll QScrollBar::sub-line:vertical,
+            QScrollArea#helpBodyScroll QScrollBar::add-page:vertical,
+            QScrollArea#helpBodyScroll QScrollBar::sub-page:vertical {
+                background: none;
+                border: none;
+                height: 0px;
             }
             QLabel#fileArtPreview {
                 background-color: #1F1F1F;
@@ -1583,11 +1898,21 @@ class ToolboxWindow(QMainWindow):
                 color: #F0F0F0;
                 font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', 'Noto Sans', sans-serif;
             }
+            QComboBox {
+                padding-right: 28px;
+            }
             QLineEdit:focus, QComboBox:focus {
                 border: 1px solid #5A5A5A;
             }
             QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 22px;
                 border: none;
+            }
+            __COMBO_DOWN_ARROW_RULE__
+            QComboBox::down-arrow:on {
+                margin-top: 1px;
             }
             QComboBox QAbstractItemView {
                 background-color: #1F1F1F;
@@ -1707,7 +2032,17 @@ class ToolboxWindow(QMainWindow):
                 color: #BCBCBC;
             }
             """
+
+        combo_arrow_rule = (
+            "QComboBox::down-arrow {"
+            f"image: url(\"{combo_arrow_path}\");"
+            "width: 12px;"
+            "height: 12px;"
+            "margin-right: 8px;"
+            "}"
         )
+
+        app.setStyleSheet(style_sheet.replace("__COMBO_DOWN_ARROW_RULE__", combo_arrow_rule))
 
     def browse_folder(self) -> None:
         dialog = QFileDialog(self, "Select Folder", str(Path.home()))
@@ -2004,41 +2339,64 @@ class ToolboxWindow(QMainWindow):
         self.lyrics_manager_table.setHorizontalHeaderLabels(
             ["File", "Embedded", "Matching LRC File"]
         )
-        header = self.lyrics_manager_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self._configure_resizable_table_columns(self.lyrics_manager_table, [420, 120, 220])
 
     def _configure_lyrics_manager_lookup_table(self) -> None:
         self.lyrics_manager_table.setColumnCount(5)
         self.lyrics_manager_table.setHorizontalHeaderLabels(
             ["File", "Lookup", "Source", "Apply", "Preview"]
         )
-        header = self.lyrics_manager_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        self._configure_resizable_table_columns(
+            self.lyrics_manager_table,
+            [320, 120, 140, 100, 340],
+        )
 
     def _set_backup_restore_idle(self, message: str) -> None:
-        self.backup_restore_summary_label.setText(message)
-        self.backup_restore_progress.setRange(0, 1)
-        self.backup_restore_progress.setValue(0)
-        self.backup_restore_progress.setFormat("Idle")
+        self._set_backup_restore_status(message)
+        self._hide_backup_restore_progress_dialog()
+
+    def _set_backup_restore_status(self, message: str, timeout_ms: int = 0) -> None:
+        self.statusBar().showMessage(message, timeout_ms)
+
+    def _ensure_backup_restore_progress_dialog(self) -> BackupRestoreProgressDialog:
+        if self._backup_restore_progress_dialog is None:
+            dialog = BackupRestoreProgressDialog(self)
+            dialog.cancelRequested.connect(self.cancel_backup_restore_job)
+            self._backup_restore_progress_dialog = dialog
+
+        return self._backup_restore_progress_dialog
+
+    def _hide_backup_restore_progress_dialog(self) -> None:
+        if self._backup_restore_progress_dialog is not None:
+            self._backup_restore_progress_dialog.finish_and_hide()
+
+    def _update_backup_restore_progress_dialog(
+        self, processed: int, total: int, detail_text: str
+    ) -> None:
+        dialog = self._ensure_backup_restore_progress_dialog()
+        dialog.update_progress(processed, total, detail_text)
+
+    def _update_backup_zip_run_button_state(self) -> None:
+        has_zip_destination = bool(self.backup_zip_path_input.text().strip())
+        self.backup_zip_run_btn.setEnabled(has_zip_destination and not self._backup_restore_busy)
+
+    def _update_transfer_run_button_state(self) -> None:
+        has_transfer_destination = bool(self.transfer_destination_input.text().strip())
+        self.transfer_run_btn.setEnabled(has_transfer_destination and not self._backup_restore_busy)
 
     def _set_backup_restore_busy(self, busy: bool, operation_label: str = "") -> None:
+        self._backup_restore_busy = busy
         self.backup_zip_browse_btn.setEnabled(not busy)
-        self.backup_zip_run_btn.setEnabled(not busy)
+        self._update_backup_zip_run_button_state()
         self.transfer_destination_browse_btn.setEnabled(not busy)
         self.transfer_mode_combo.setEnabled(not busy)
-        self.transfer_run_btn.setEnabled(not busy)
-        self.backup_restore_cancel_btn.setEnabled(busy)
+        self._update_transfer_run_button_state()
         if busy and operation_label:
-            self.backup_restore_summary_label.setText(operation_label)
-            self.backup_restore_progress.setRange(0, 1)
-            self.backup_restore_progress.setValue(0)
-            self.backup_restore_progress.setFormat("Preparing...")
+            self._set_backup_restore_status(operation_label)
+            dialog = self._ensure_backup_restore_progress_dialog()
+            dialog.begin(f"{operation_label} Preparing...")
+        if not busy:
+            self._hide_backup_restore_progress_dialog()
 
     def _resolve_current_target_dir(self) -> Path | None:
         target_text = self.path_input.text().strip()
@@ -2061,12 +2419,15 @@ class ToolboxWindow(QMainWindow):
 
         return target_path.resolve()
 
-    def _run_backup_restore_worker(self, worker: QObject, operation_label: str) -> None:
+    def _run_backup_restore_worker(
+        self, worker: QObject, operation_label: str, operation_kind: str
+    ) -> None:
         if self._backup_restore_thread is not None and self._backup_restore_thread.isRunning():
             QMessageBox.information(self, "Job Running", "A backup/restore job is already running.")
             return
 
         self._backup_restore_active_operation = operation_label
+        self._backup_restore_active_kind = operation_kind
         self._set_backup_restore_busy(True, operation_label)
 
         self._backup_restore_thread = QThread(self)
@@ -2111,6 +2472,7 @@ class ToolboxWindow(QMainWindow):
         )
         if selected:
             self.backup_zip_path_input.setText(selected)
+            self._update_backup_zip_run_button_state()
 
     def choose_transfer_destination(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -2120,6 +2482,7 @@ class ToolboxWindow(QMainWindow):
         )
         if selected:
             self.transfer_destination_input.setText(selected)
+            self._update_transfer_run_button_state()
 
     def start_zip_backup(self) -> None:
         source_path = self._resolve_current_target_dir()
@@ -2178,7 +2541,7 @@ class ToolboxWindow(QMainWindow):
 
         worker = ZipBackupWorker(source_path, zip_path)
         worker.finished.connect(self._on_zip_backup_finished)
-        self._run_backup_restore_worker(worker, "Creating zip backup...")
+        self._run_backup_restore_worker(worker, "Creating zip backup...", "zip")
         self.statusBar().showMessage("Zip backup started")
 
     def start_copy_or_move(self) -> None:
@@ -2255,28 +2618,30 @@ class ToolboxWindow(QMainWindow):
 
         worker = FileTransferWorker(source_path, destination_target, mode)
         worker.finished.connect(self._on_transfer_finished)
-        self._run_backup_restore_worker(worker, f"{mode_label} in progress...")
+        self._run_backup_restore_worker(worker, f"{mode_label} in progress...", "transfer")
         self.statusBar().showMessage(f"{mode_label} started")
 
     def cancel_backup_restore_job(self) -> None:
         if self._backup_restore_worker is None:
+            self._hide_backup_restore_progress_dialog()
             return
 
         request_cancel = getattr(self._backup_restore_worker, "request_cancel", None)
         if callable(request_cancel):
             request_cancel()
-            self.backup_restore_summary_label.setText("Cancelling backup/restore job...")
-            self.statusBar().showMessage("Cancelling backup/restore job...")
+            cancelling_label = self._backup_restore_active_operation or "Backup/restore job"
+            cancelling_text = f"Cancelling {cancelling_label.lower()}..."
+            self._set_backup_restore_status(cancelling_text)
+            dialog = self._ensure_backup_restore_progress_dialog()
+            dialog.mark_cancelling(cancelling_text)
 
     @Slot(int, int, str)
     def _on_backup_restore_progress(self, processed: int, total: int, current_item: str) -> None:
-        total_for_ui = max(total, 1)
-        self.backup_restore_progress.setRange(0, total_for_ui)
-        self.backup_restore_progress.setValue(min(processed, total_for_ui))
-        self.backup_restore_progress.setFormat(f"{processed}/{total}")
-        self.backup_restore_summary_label.setText(
+        progress_text = (
             f"{self._backup_restore_active_operation} {processed}/{total}: {current_item}"
         )
+        self._update_backup_restore_progress_dialog(processed, total, progress_text)
+        self._set_backup_restore_status(progress_text)
 
     @Slot(object)
     def _on_zip_backup_finished(self, payload_obj) -> None:
@@ -2287,13 +2652,10 @@ class ToolboxWindow(QMainWindow):
         skipped = int(payload.get("skipped") or 0)
 
         self._set_backup_restore_busy(False)
-        self.backup_restore_progress.setRange(0, max(total, 1))
-        self.backup_restore_progress.setValue(max(total, 0))
-        self.backup_restore_progress.setFormat("Completed")
-        self.backup_restore_summary_label.setText(
-            f"Zip backup completed. Files archived: {processed}/{total}. Symlink files skipped: {skipped}."
+        self._set_backup_restore_status(
+            f"Zip backup completed. Files archived: {processed}/{total}. Symlink files skipped: {skipped}.",
+            5000,
         )
-        self.statusBar().showMessage("Zip backup completed", 5000)
         QMessageBox.information(
             self,
             "Zip Backup Completed",
@@ -2311,13 +2673,10 @@ class ToolboxWindow(QMainWindow):
         mode_label = "Move" if mode == "move" else "Copy"
 
         self._set_backup_restore_busy(False)
-        self.backup_restore_progress.setRange(0, max(total, 1))
-        self.backup_restore_progress.setValue(max(total, 0))
-        self.backup_restore_progress.setFormat("Completed")
-        self.backup_restore_summary_label.setText(
-            f"{mode_label} completed. Files processed: {processed}/{total}. Symlink files skipped: {skipped}."
+        self._set_backup_restore_status(
+            f"{mode_label} completed. Files processed: {processed}/{total}. Symlink files skipped: {skipped}.",
+            5000,
         )
-        self.statusBar().showMessage(f"{mode_label} completed", 5000)
         QMessageBox.information(
             self,
             f"{mode_label} Completed",
@@ -2331,11 +2690,7 @@ class ToolboxWindow(QMainWindow):
     @Slot(str)
     def _on_backup_restore_failed(self, error: str) -> None:
         self._set_backup_restore_busy(False)
-        self.backup_restore_progress.setRange(0, 1)
-        self.backup_restore_progress.setValue(0)
-        self.backup_restore_progress.setFormat("Failed")
-        self.backup_restore_summary_label.setText(f"Backup/restore failed: {error}")
-        self.statusBar().showMessage("Backup/restore failed", 5000)
+        self._set_backup_restore_status(f"Backup/restore failed: {error}", 5000)
         QMessageBox.warning(self, "Backup/Restore Failed", error)
 
     @Slot(object)
@@ -2344,19 +2699,17 @@ class ToolboxWindow(QMainWindow):
         processed = int(payload.get("processed") or 0)
         total = int(payload.get("total") or 0)
         self._set_backup_restore_busy(False)
-        self.backup_restore_progress.setRange(0, max(total, 1))
-        self.backup_restore_progress.setValue(min(processed, max(total, 1)))
-        self.backup_restore_progress.setFormat("Cancelled")
-        self.backup_restore_summary_label.setText(
-            f"Backup/restore cancelled after {processed}/{total} files processed."
+        self._set_backup_restore_status(
+            f"Backup/restore cancelled after {processed}/{total} files processed.",
+            5000,
         )
-        self.statusBar().showMessage("Backup/restore job cancelled", 5000)
 
     @Slot()
     def _clear_backup_restore_refs(self) -> None:
         self._backup_restore_worker = None
         self._backup_restore_thread = None
         self._backup_restore_active_operation = ""
+        self._backup_restore_active_kind = ""
 
     def _metadata_value_to_text(self, value) -> str:
         if value is None:
