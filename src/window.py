@@ -1,0 +1,6102 @@
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import zipfile
+import json
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import OrderedDict
+from pathlib import Path
+
+from PySide6.QtCore import QDir, QModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot
+from PySide6.QtGui import QColor, QPalette, QPixmap
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QComboBox,
+    QFileDialog,
+    QFileSystemModel,
+    QHBoxLayout,
+    QHeaderView,
+    QInputDialog,
+    QLabel,
+    QListView,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QProgressDialog,
+    QPushButton,
+    QSplitter,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTreeView,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .album_art import (
+    AlbumArtScanWorker,
+    image_size_from_bytes,
+    jpeg_scan_type,
+    read_embedded_album_art,
+    to_non_progressive_jpeg,
+    write_embedded_album_art,
+)
+from .constants import ALBUM_ART_CACHE_LIMIT, AUDIO_FILE_EXTENSIONS
+from .music_compatibility import MusicCompatibilityScanWorker
+from .models import DriveOption
+from .system_info import collect_target_info, format_bytes, list_removable_drives
+
+try:
+    import mutagen
+except Exception:
+    mutagen = None
+
+
+IMAGE_FILE_EXTENSIONS = {
+    ".bmp",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
+
+VIDEO_FILE_EXTENSIONS = {
+    ".3gp",
+    ".avi",
+    ".flv",
+    ".m2ts",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".mts",
+    ".ts",
+    ".webm",
+    ".wmv",
+}
+
+DOCUMENT_FILE_EXTENSIONS = {
+    ".csv",
+    ".doc",
+    ".docx",
+    ".epub",
+    ".md",
+    ".ods",
+    ".odt",
+    ".pdf",
+    ".ppt",
+    ".pptx",
+    ".rtf",
+    ".txt",
+    ".xls",
+    ".xlsx",
+}
+
+ARCHIVE_FILE_EXTENSIONS = {
+    ".7z",
+    ".bz2",
+    ".gz",
+    ".rar",
+    ".tar",
+    ".tgz",
+    ".xz",
+    ".zip",
+}
+
+PLAYLIST_FILE_EXTENSIONS = {
+    ".asx",
+    ".cue",
+    ".m3u",
+    ".m3u8",
+    ".pls",
+    ".xspf",
+}
+
+SUBTITLE_FILE_EXTENSIONS = {
+    ".ass",
+    ".lrc",
+    ".srt",
+    ".ssa",
+    ".sub",
+    ".vtt",
+}
+
+EXECUTABLE_FILE_EXTENSIONS = {
+    ".app",
+    ".bat",
+    ".bin",
+    ".command",
+    ".exe",
+    ".msi",
+    ".pkg",
+    ".run",
+    ".sh",
+}
+
+FILE_CLEANUP_CATEGORY_ORDER = [
+    "Audio",
+    "Image",
+    "Video",
+    "Document",
+    "Archive",
+    "Playlist",
+    "Subtitle",
+    "Executable",
+    "Hidden",
+    "Other",
+]
+
+
+class FileBrowserProxyModel(QSortFilterProxyModel):
+    """Adds recursive directory size values and stable numeric sorting for the Size column."""
+
+    def __init__(self, source_model: QFileSystemModel, parent=None):
+        super().__init__(parent)
+        self.setSourceModel(source_model)
+        self._directory_size_cache: dict[str, int] = {}
+        self._directory_sizes_enabled = False
+
+    @property
+    def directory_sizes_enabled(self) -> bool:
+        return self._directory_sizes_enabled
+
+    def set_directory_sizes_enabled(self, enabled: bool) -> None:
+        self._directory_sizes_enabled = enabled
+
+    def set_directory_size_cache(self, cache: dict[str, int]) -> None:
+        self._directory_size_cache = cache.copy()
+
+    def has_directory_size_cache(self) -> bool:
+        return bool(self._directory_size_cache)
+
+    def clear_size_cache(self) -> None:
+        self._directory_size_cache.clear()
+
+    def _directory_size_bytes(self, path: str) -> int:
+        cached = self._directory_size_cache.get(path)
+        if cached is not None:
+            return cached
+
+        total = 0
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            total += self._directory_size_bytes(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except (OSError, PermissionError):
+                        continue
+        except (OSError, PermissionError):
+            total = 0
+
+        self._directory_size_cache[path] = total
+        return total
+
+    def _index_size_bytes(self, source_index) -> int:
+        if not source_index.isValid():
+            return 0
+        source_model = self.sourceModel()
+        if source_model is None:
+            return 0
+
+        path = source_model.filePath(source_index)
+        if source_model.isDir(source_index):
+            return self._directory_size_bytes(path)
+
+        try:
+            return source_model.size(source_index)
+        except Exception:
+            return 0
+
+    def _size_value_for_source_index(self, source_index) -> int:
+        source_model = self.sourceModel()
+        if source_model is None or not source_index.isValid():
+            return 0
+
+        if source_model.isDir(source_index):
+            if not self._directory_sizes_enabled:
+                return -1
+            path = source_model.filePath(source_index)
+            cached = self._directory_size_cache.get(path)
+            return -1 if cached is None else cached
+
+        return self._index_size_bytes(source_index)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return super().data(index, role)
+
+        source_index = self.mapToSource(index)
+        if index.column() == 1:
+            source_model = self.sourceModel()
+            if source_model is None:
+                return super().data(index, role)
+
+            if source_model.isDir(source_index):
+                size_bytes = self._size_value_for_source_index(source_index)
+                if role in (Qt.DisplayRole, Qt.EditRole):
+                    if not self._directory_sizes_enabled:
+                        return "-"
+                    return format_bytes(size_bytes) if size_bytes >= 0 else "Scanning..."
+                if role == Qt.UserRole:
+                    return size_bytes
+
+            size_bytes = self._index_size_bytes(source_index)
+            if role in (Qt.DisplayRole, Qt.EditRole):
+                return format_bytes(size_bytes)
+            if role == Qt.UserRole:
+                return size_bytes
+
+        return super().data(index, role)
+
+    def lessThan(self, left, right) -> bool:
+        if left.column() == 1 and right.column() == 1:
+            left_size = self._size_value_for_source_index(left)
+            right_size = self._size_value_for_source_index(right)
+            return int(left_size or 0) < int(right_size or 0)
+        return super().lessThan(left, right)
+
+
+class DirectorySizeScanWorker(QObject):
+    progress = Signal(int)
+    finished = Signal(str, dict)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, root_path: str):
+        super().__init__()
+        self.root_path = root_path
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            sizes = self._scan_directory_sizes(self.root_path)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+
+        if sizes is None:
+            self.cancelled.emit()
+            return
+
+        self.finished.emit(self.root_path, sizes)
+
+    def _scan_directory_sizes(self, root_path: str) -> dict[str, int] | None:
+        # Stack frame: [directory path, scandir iterator, subtotal bytes]
+        stack: list[list[object]] = []
+        sizes: dict[str, int] = {}
+        visited_dirs: set[tuple[int, int]] = set()
+        scanned_dirs = 0
+
+        try:
+            root_stat = os.stat(root_path, follow_symlinks=False)
+            visited_dirs.add((root_stat.st_dev, root_stat.st_ino))
+            root_iter = os.scandir(root_path)
+        except (OSError, PermissionError):
+            return {root_path: 0}
+
+        stack.append([root_path, root_iter, 0])
+
+        while stack:
+            if self._cancel_requested:
+                for _path, entry_iter, _subtotal in stack:
+                    try:
+                        entry_iter.close()
+                    except Exception:
+                        pass
+                return None
+
+            frame = stack[-1]
+            path = frame[0]
+            entry_iter = frame[1]
+
+            try:
+                entry = next(entry_iter)
+            except StopIteration:
+                try:
+                    entry_iter.close()
+                except Exception:
+                    pass
+
+                subtotal = int(frame[2])
+                sizes[str(path)] = subtotal
+                stack.pop()
+                if stack:
+                    stack[-1][2] = int(stack[-1][2]) + subtotal
+
+                scanned_dirs += 1
+                if scanned_dirs % 500 == 0:
+                    self.progress.emit(scanned_dirs)
+                continue
+            except (OSError, PermissionError):
+                try:
+                    entry_iter.close()
+                except Exception:
+                    pass
+                stack.pop()
+                scanned_dirs += 1
+                if scanned_dirs % 500 == 0:
+                    self.progress.emit(scanned_dirs)
+                continue
+
+            try:
+                if entry.is_symlink():
+                    continue
+
+                if entry.is_file(follow_symlinks=False):
+                    frame[2] = int(frame[2]) + entry.stat(follow_symlinks=False).st_size
+                    continue
+
+                if entry.is_dir(follow_symlinks=False):
+                    try:
+                        dir_stat = entry.stat(follow_symlinks=False)
+                        inode_key = (dir_stat.st_dev, dir_stat.st_ino)
+                        if inode_key in visited_dirs:
+                            continue
+                        visited_dirs.add(inode_key)
+                        child_iter = os.scandir(entry.path)
+                    except (OSError, PermissionError):
+                        continue
+                    stack.append([entry.path, child_iter, 0])
+            except (OSError, PermissionError):
+                continue
+
+        self.progress.emit(scanned_dirs)
+        return sizes
+
+
+class DriveScanWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            options = list_removable_drives()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(options)
+
+
+class ZipBackupWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal(object)
+
+    def __init__(self, source_path: Path, zip_path: Path):
+        super().__init__()
+        self.source_path = source_path
+        self.zip_path = zip_path
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+
+    @Slot()
+    def run(self) -> None:
+        total_files = 0
+        processed = 0
+        skipped = 0
+        try:
+            source = self.source_path
+            zip_path = self.zip_path
+
+            if not source.exists() or not source.is_dir():
+                raise RuntimeError("Source folder is not available.")
+
+            source_files: list[Path] = []
+            for root_dir, _dir_names, file_names in os.walk(str(source)):
+                if self._cancel_requested:
+                    self.cancelled.emit(
+                        {
+                            "processed": processed,
+                            "total": total_files,
+                            "partial_zip": str(zip_path),
+                        }
+                    )
+                    return
+                root_path = Path(root_dir)
+                for file_name in file_names:
+                    file_path = root_path / file_name
+                    if file_path.is_symlink():
+                        skipped += 1
+                        continue
+                    if file_path.is_file():
+                        source_files.append(file_path)
+
+            total_files = len(source_files)
+
+            zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+            root_name = source.name.strip() or "backup"
+            with zipfile.ZipFile(
+                str(zip_path),
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+                allowZip64=True,
+            ) as archive:
+                archive.writestr(f"{root_name}/", "")
+
+                for current_dir, dir_names, file_names in os.walk(str(source)):
+                    if self._cancel_requested:
+                        raise InterruptedError("cancelled")
+
+                    current_dir_path = Path(current_dir)
+                    rel_dir = current_dir_path.relative_to(source)
+                    arc_dir = (Path(root_name) / rel_dir).as_posix()
+
+                    if rel_dir != Path(".") and not dir_names and not file_names:
+                        archive.writestr(f"{arc_dir}/", "")
+
+                    for file_name in file_names:
+                        file_path = current_dir_path / file_name
+                        if file_path.is_symlink():
+                            continue
+                        if not file_path.is_file():
+                            continue
+
+                        if self._cancel_requested:
+                            raise InterruptedError("cancelled")
+
+                        rel_file = file_path.relative_to(source).as_posix()
+                        arc_name = (Path(root_name) / rel_file).as_posix()
+                        archive.write(str(file_path), arcname=arc_name)
+
+                        processed += 1
+                        self.progress.emit(processed, max(total_files, 1), rel_file)
+
+            self.finished.emit(
+                {
+                    "zip_path": str(zip_path),
+                    "processed": processed,
+                    "total": total_files,
+                    "skipped": skipped,
+                }
+            )
+        except InterruptedError:
+            try:
+                if self.zip_path.exists():
+                    self.zip_path.unlink()
+            except Exception:
+                pass
+            self.cancelled.emit(
+                {
+                    "processed": processed,
+                    "total": total_files,
+                    "partial_zip": str(self.zip_path),
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class FileTransferWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal(object)
+
+    def __init__(self, source_path: Path, destination_path: Path, mode: str):
+        super().__init__()
+        self.source_path = source_path
+        self.destination_path = destination_path
+        self.mode = mode
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            source = self.source_path
+            destination = self.destination_path
+
+            if not source.exists() or not source.is_dir():
+                raise RuntimeError("Source folder is not available.")
+
+            skipped = 0
+            source_files: list[Path] = []
+            for root_dir, _dir_names, file_names in os.walk(str(source)):
+                if self._cancel_requested:
+                    self.cancelled.emit({"processed": 0, "total": 0})
+                    return
+
+                root_path = Path(root_dir)
+                for file_name in file_names:
+                    file_path = root_path / file_name
+                    if file_path.is_symlink():
+                        skipped += 1
+                        continue
+                    if file_path.is_file():
+                        source_files.append(file_path)
+
+            total_files = len(source_files)
+            processed = 0
+
+            destination.mkdir(parents=True, exist_ok=True)
+            for current_dir, dir_names, _file_names in os.walk(str(source)):
+                if self._cancel_requested:
+                    self.cancelled.emit(
+                        {
+                            "processed": processed,
+                            "total": total_files,
+                            "destination": str(destination),
+                            "mode": self.mode,
+                        }
+                    )
+                    return
+
+                current_dir_path = Path(current_dir)
+                rel_dir = current_dir_path.relative_to(source)
+                for dir_name in dir_names:
+                    (destination / rel_dir / dir_name).mkdir(parents=True, exist_ok=True)
+
+            for source_file in source_files:
+                if self._cancel_requested:
+                    self.cancelled.emit(
+                        {
+                            "processed": processed,
+                            "total": total_files,
+                            "destination": str(destination),
+                            "mode": self.mode,
+                        }
+                    )
+                    return
+
+                rel_file = source_file.relative_to(source)
+                target_file = destination / rel_file
+                target_file.parent.mkdir(parents=True, exist_ok=True)
+
+                if self.mode == "move":
+                    shutil.move(str(source_file), str(target_file))
+                else:
+                    shutil.copy2(str(source_file), str(target_file))
+
+                processed += 1
+                self.progress.emit(processed, max(total_files, 1), rel_file.as_posix())
+
+            if self.mode == "move":
+                for current_dir, dir_names, file_names in os.walk(str(source), topdown=False):
+                    if dir_names or file_names:
+                        continue
+                    try:
+                        Path(current_dir).rmdir()
+                    except Exception:
+                        continue
+
+            self.finished.emit(
+                {
+                    "destination": str(destination),
+                    "processed": processed,
+                    "total": total_files,
+                    "skipped": skipped,
+                    "mode": self.mode,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+def apply_charcoal_palette(app: QApplication) -> None:
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#262626"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#ECECEC"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#1F1F1F"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#242424"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#1F1F1F"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#ECECEC"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#F0F0F0"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#3A3A3A"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#F0F0F0"))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor("#FFFFFF"))
+    palette.setColor(QPalette.ColorRole.Link, QColor("#9CA6B5"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#4A4A4A"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
+    app.setPalette(palette)
+
+
+class ToolboxWindow(QMainWindow):
+    def __init__(self, initial_path: str | None = None):
+        super().__init__()
+        self.drive_options: list[DriveOption] = []
+        self._album_art_cache: OrderedDict[
+            tuple[str, int, int], tuple[bytes | None, str]
+        ] = OrderedDict()
+        self._scan_thread: QThread | None = None
+        self._scan_worker: AlbumArtScanWorker | None = None
+        self._music_compatibility_scan_thread: QThread | None = None
+        self._music_compatibility_scan_worker: MusicCompatibilityScanWorker | None = None
+        self._drive_scan_thread: QThread | None = None
+        self._drive_scan_worker: DriveScanWorker | None = None
+        self._backup_restore_thread: QThread | None = None
+        self._backup_restore_worker: QObject | None = None
+        self._backup_restore_active_operation = ""
+        self._dir_size_scan_thread: QThread | None = None
+        self._dir_size_scan_worker: DirectorySizeScanWorker | None = None
+        self._dir_size_scan_target: str | None = None
+        self._pending_dir_size_scan_target: str | None = None
+        self._about_tab_index = -1
+        self._music_compatibility_tab_index = -1
+        self._lyrics_manager_tab_index = -1
+        self._file_rename_tab_index = -1
+        self._cleanup_tab_index = -1
+        self._directory_tab_index = -1
+        self._backup_restore_tab_index = -1
+        self._directory_scan_armed = False
+        self._cleanup_scan_target: str | None = None
+        self._file_rename_scan_target: str | None = None
+        self._lyrics_manager_scan_target: str | None = None
+        self._lyrics_lookup_results: list[dict[str, object]] = []
+        self._cleanup_type_files: dict[str, list[Path]] = {}
+        self._last_scan_target: str | None = None
+        self._last_incompatible_files: list[str] = []
+        self._active_audio_metadata_path: Path | None = None
+        self._updating_file_props_table = False
+        self._help_pane_width = 280
+
+        self.setWindowTitle("Snowsky Echo Mini Toolbox")
+        self.resize(920, 620)
+
+        self._build_ui()
+        self._apply_charcoal_theme()
+        self.refresh_drives()
+
+        if initial_path:
+            self.path_input.setText(str(Path(initial_path).expanduser()))
+            self.show_info()
+
+    def _asset_path(self, *parts: str) -> Path:
+        if getattr(sys, "frozen", False):
+            base_path = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+        else:
+            base_path = Path(__file__).resolve().parent.parent
+        return base_path.joinpath(*parts)
+
+    def _header_logo_pixmap(self) -> QPixmap | None:
+        logo_path = self._asset_path("assets", "logo.png")
+        if not logo_path.exists():
+            return None
+
+        pixmap = QPixmap(str(logo_path))
+        if pixmap.isNull():
+            return None
+        return pixmap
+
+    def _position_header_logo(self) -> None:
+        if not hasattr(self, "header_logo_label") or not hasattr(self, "_header_logo_source"):
+            return
+        if self._header_logo_source is None:
+            self.header_logo_label.hide()
+            return
+
+        root = self.centralWidget()
+        if root is None or root.layout() is None:
+            return
+
+        margins = root.layout().contentsMargins()
+        top_y = self.title_label.geometry().top()
+        bottom_y = self.target_label.geometry().bottom()
+        available_height = max(24, bottom_y - top_y + 1)
+
+        left_content_width = max(
+            self.title_label.sizeHint().width(),
+            self.target_label.sizeHint().width(),
+        )
+        left_content_right = margins.left() + left_content_width
+        minimum_gap = 16
+        available_width = root.width() - margins.right() - left_content_right - minimum_gap
+
+        if available_width < 24:
+            self.header_logo_label.hide()
+            return
+
+        scaled = self._header_logo_source.scaled(
+            available_width,
+            available_height,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        if scaled.isNull():
+            self.header_logo_label.hide()
+            return
+
+        x_pos = root.width() - margins.right() - scaled.width()
+        min_x_pos = left_content_right + minimum_gap
+        if x_pos < min_x_pos:
+            self.header_logo_label.hide()
+            return
+        y_pos = top_y + max(0, (available_height - scaled.height()) // 2)
+        self.header_logo_label.setPixmap(scaled)
+        self.header_logo_label.setGeometry(x_pos, y_pos, scaled.width(), scaled.height())
+        self.header_logo_label.show()
+        self.header_logo_label.raise_()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._position_header_logo()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_header_logo()
+
+    def _build_ui(self) -> None:
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        self.title_label = QLabel("Snowsky Echo Mini Toolbox")
+        self.title_label.setObjectName("title")
+        layout.addWidget(self.title_label)
+
+        self.target_label = QLabel("Select a Folder or Removable Drive")
+        self.target_label.setObjectName("sectionLabel")
+        layout.addWidget(self.target_label)
+
+        self.header_logo_label = QLabel(root)
+        self.header_logo_label.setObjectName("headerLogo")
+        self.header_logo_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        self.header_logo_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._header_logo_source = self._header_logo_pixmap()
+        if self._header_logo_source is not None:
+            self.header_logo_label.setToolTip("Snowsky Echo Mini Toolbox")
+        else:
+            self.header_logo_label.hide()
+
+        path_row = QHBoxLayout()
+        self.path_input = QLineEdit()
+        self.path_input.setPlaceholderText("Folder or drive path")
+
+        browse_btn = QPushButton("Browse Folder")
+        browse_btn.clicked.connect(self.browse_folder)
+
+        path_row.addWidget(self.path_input, 1)
+        path_row.addWidget(browse_btn)
+
+        drive_row = QHBoxLayout()
+        self.drive_combo = QComboBox()
+        popup_view = QListView()
+        popup_view.setMouseTracking(True)
+        popup_view.setUniformItemSizes(True)
+        popup_view.setSpacing(2)
+        popup_view.setWordWrap(False)
+        popup_view.viewport().setAttribute(Qt.WA_Hover, True)
+        popup_view.setStyleSheet(
+            """
+            QListView {
+                background-color: #1F1F1F;
+                color: #F0F0F0;
+                border: 1px solid #434343;
+                outline: 0;
+            }
+            QListView::item {
+                min-height: 24px;
+                padding: 2px 8px;
+                margin: 1px 0px;
+                background-color: #1F1F1F;
+                color: #F0F0F0;
+            }
+            QListView::item:hover {
+                background-color: #6A6A6A;
+                color: #FFFFFF;
+            }
+            QListView::item:selected {
+                background-color: #4A4A4A;
+                color: #FFFFFF;
+            }
+            """
+        )
+        self.drive_combo.setView(popup_view)
+        self.drive_combo.currentIndexChanged.connect(self.pick_drive)
+        self.drive_combo.view().setMouseTracking(True)
+
+        self.refresh_drives_btn = QPushButton("Refresh Drives")
+        self.refresh_drives_btn.clicked.connect(self.refresh_drives)
+
+        self.unmount_drive_btn = QPushButton("Unmount Drive")
+        self.unmount_drive_btn.clicked.connect(self.unmount_selected_drive)
+        self.unmount_drive_btn.setEnabled(False)
+
+        drive_row.addWidget(self.drive_combo, 1)
+        drive_row.addWidget(self.refresh_drives_btn)
+        drive_row.addWidget(self.unmount_drive_btn)
+
+        self.current_target_label = QLabel("Current target: none selected")
+        self.current_target_label.setObjectName("targetSummary")
+
+        layout.addLayout(path_row)
+        layout.addLayout(drive_row)
+        layout.addWidget(self.current_target_label)
+
+        self.tabs = QTabWidget()
+
+        about_tab = QWidget()
+        about_layout = QVBoxLayout(about_tab)
+        about_layout.setContentsMargins(10, 10, 10, 10)
+        about_layout.setSpacing(10)
+
+        self.path_input.returnPressed.connect(self.show_info)
+        self.path_input.editingFinished.connect(self.show_info)
+
+        self.info_table = QTableWidget(0, 2)
+        self.info_table.setHorizontalHeaderLabels(["Property", "Value"])
+        self.info_table.verticalHeader().setVisible(False)
+        self.info_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.info_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.info_table.setAlternatingRowColors(True)
+        self.info_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.info_table.setEditTriggers(QTableWidget.NoEditTriggers)
+
+        about_layout.addWidget(self.info_table, 1)
+
+        album_art_tab = QWidget()
+        album_art_layout = QVBoxLayout(album_art_tab)
+        album_art_layout.setContentsMargins(10, 10, 10, 10)
+        album_art_layout.setSpacing(10)
+
+        album_art_hint = QLabel(
+            "Compatibility rule: embedded artwork must be JPEG and non-progressive."
+        )
+        album_art_hint.setObjectName("targetSummary")
+
+        album_art_controls = QHBoxLayout()
+        self.album_art_scan_btn = QPushButton("Scan Album Art Compatibility")
+        self.album_art_scan_btn.clicked.connect(self.scan_album_art_compatibility)
+        self.album_art_fix_btn = QPushButton("Fix Incompatible Files")
+        self.album_art_fix_btn.setEnabled(False)
+        self.album_art_fix_btn.clicked.connect(self.fix_incompatible_files)
+        album_art_controls.addWidget(self.album_art_scan_btn)
+        album_art_controls.addWidget(self.album_art_fix_btn)
+        album_art_controls.addStretch(1)
+
+        self.album_art_summary_label = QLabel("No scan run yet.")
+        self.album_art_summary_label.setObjectName("targetSummary")
+
+        self.album_art_progress = QProgressBar()
+        self.album_art_progress.setRange(0, 1)
+        self.album_art_progress.setValue(0)
+        self.album_art_progress.setFormat("Idle")
+        self.album_art_progress.setTextVisible(True)
+
+        self.album_art_table = QTableWidget(0, 5)
+        self.album_art_table.setHorizontalHeaderLabels(
+            ["File", "Status", "Progressive", "File Type", "Resolution"]
+        )
+        self.album_art_table.verticalHeader().setVisible(False)
+        self.album_art_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.album_art_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.album_art_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.album_art_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.album_art_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.album_art_table.setAlternatingRowColors(True)
+        self.album_art_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.album_art_table.setEditTriggers(QTableWidget.NoEditTriggers)
+
+        album_art_layout.addWidget(album_art_hint)
+        album_art_layout.addLayout(album_art_controls)
+        album_art_layout.addWidget(self.album_art_summary_label)
+        album_art_layout.addWidget(self.album_art_progress)
+        album_art_layout.addWidget(self.album_art_table, 1)
+
+        music_compatibility_tab = QWidget()
+        music_compatibility_layout = QVBoxLayout(music_compatibility_tab)
+        music_compatibility_layout.setContentsMargins(10, 10, 10, 10)
+        music_compatibility_layout.setSpacing(10)
+
+        music_compatibility_hint = QLabel(
+            "Checks all files against Echo Mini music rules (supported, unsupported, unknown, skipped)."
+        )
+        music_compatibility_hint.setObjectName("targetSummary")
+
+        music_compatibility_controls = QHBoxLayout()
+        self.music_compatibility_scan_btn = QPushButton("Scan Music Compatibility")
+        self.music_compatibility_scan_btn.clicked.connect(self.scan_music_compatibility)
+        music_compatibility_controls.addWidget(self.music_compatibility_scan_btn)
+        music_compatibility_controls.addStretch(1)
+
+        self.music_compatibility_search_input = QLineEdit()
+        self.music_compatibility_search_input.setPlaceholderText(
+            "Search compatibility results (file, status, reason, extension, block size, DSD...)"
+        )
+        self.music_compatibility_search_input.setClearButtonEnabled(True)
+        self.music_compatibility_search_input.textChanged.connect(
+            self._apply_music_compatibility_table_filter
+        )
+
+        self.music_compatibility_summary_label = QLabel("No compatibility scan run yet.")
+        self.music_compatibility_summary_label.setObjectName("targetSummary")
+
+        self.music_compatibility_progress = QProgressBar()
+        self.music_compatibility_progress.setRange(0, 1)
+        self.music_compatibility_progress.setValue(0)
+        self.music_compatibility_progress.setFormat("Idle")
+        self.music_compatibility_progress.setTextVisible(True)
+
+        self.music_compatibility_table = QTableWidget(0, 8)
+        self.music_compatibility_table.setHorizontalHeaderLabels(
+            [
+                "File",
+                "Extension",
+                "Status",
+                "Reason",
+                "Sample Rate (Hz)",
+                "Bit Depth",
+                "Block Size",
+                "DSD",
+            ]
+        )
+        self.music_compatibility_table.verticalHeader().setVisible(False)
+        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeToContents)
+        self.music_compatibility_table.setAlternatingRowColors(True)
+        self.music_compatibility_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.music_compatibility_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.music_compatibility_table.setSortingEnabled(True)
+
+        music_compatibility_layout.addWidget(music_compatibility_hint)
+        music_compatibility_layout.addLayout(music_compatibility_controls)
+        music_compatibility_layout.addWidget(self.music_compatibility_search_input)
+        music_compatibility_layout.addWidget(self.music_compatibility_summary_label)
+        music_compatibility_layout.addWidget(self.music_compatibility_progress)
+        music_compatibility_layout.addWidget(self.music_compatibility_table, 1)
+
+        lyrics_manager_tab = QWidget()
+        lyrics_manager_layout = QVBoxLayout(lyrics_manager_tab)
+        lyrics_manager_layout.setContentsMargins(10, 10, 10, 10)
+        lyrics_manager_layout.setSpacing(10)
+
+        lyrics_manager_controls = QHBoxLayout()
+        self.lyrics_manager_scan_btn = QPushButton("Scan Lyrics")
+        self.lyrics_manager_scan_btn.clicked.connect(self.scan_embedded_lyrics)
+        self.lyrics_manager_bulk_lookup_btn = QPushButton("Bulk Lookup")
+        self.lyrics_manager_bulk_lookup_btn.clicked.connect(self.bulk_lookup_lyrics)
+        self.lyrics_manager_export_lrc_btn = QPushButton("Convert Embedded Lyrics To .lrc")
+        self.lyrics_manager_export_lrc_btn.clicked.connect(self.convert_embedded_lyrics_to_lrc)
+        self.lyrics_manager_apply_lookup_btn = QPushButton("Apply Lookup Results")
+        self.lyrics_manager_apply_lookup_btn.setEnabled(False)
+        self.lyrics_manager_apply_lookup_btn.clicked.connect(self.apply_bulk_lookup_results)
+        lyrics_manager_controls.addWidget(self.lyrics_manager_scan_btn)
+        lyrics_manager_controls.addWidget(self.lyrics_manager_bulk_lookup_btn)
+        lyrics_manager_controls.addWidget(self.lyrics_manager_export_lrc_btn)
+        lyrics_manager_controls.addWidget(self.lyrics_manager_apply_lookup_btn)
+        lyrics_manager_controls.addStretch(1)
+
+        self.lyrics_manager_summary_label = QLabel("No lyrics scan run yet.")
+        self.lyrics_manager_summary_label.setObjectName("targetSummary")
+
+        self.lyrics_manager_progress = QProgressBar()
+        self.lyrics_manager_progress.setRange(0, 1)
+        self.lyrics_manager_progress.setValue(0)
+        self.lyrics_manager_progress.setFormat("Idle")
+        self.lyrics_manager_progress.setTextVisible(True)
+
+        self.lyrics_manager_table = QTableWidget(0, 3)
+        self.lyrics_manager_table.verticalHeader().setVisible(False)
+        self._configure_lyrics_manager_scan_table()
+        self.lyrics_manager_table.setAlternatingRowColors(True)
+        self.lyrics_manager_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.lyrics_manager_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.lyrics_manager_table.setSortingEnabled(True)
+
+        lyrics_manager_layout.addLayout(lyrics_manager_controls)
+        lyrics_manager_layout.addWidget(self.lyrics_manager_summary_label)
+        lyrics_manager_layout.addWidget(self.lyrics_manager_progress)
+        lyrics_manager_layout.addWidget(self.lyrics_manager_table, 1)
+
+        file_rename_tab = QWidget()
+        file_rename_layout = QVBoxLayout(file_rename_tab)
+        file_rename_layout.setContentsMargins(10, 10, 10, 10)
+        file_rename_layout.setSpacing(10)
+
+        file_rename_controls = QHBoxLayout()
+        self.file_rename_preset_combo = QComboBox()
+        self.file_rename_preset_combo.addItem(
+            "Metadata Numbering [TrackNo. TrackName]",
+            "trackno_trackname",
+        )
+
+        self.file_rename_scan_btn = QPushButton("Scan Rename Suggestions")
+        self.file_rename_scan_btn.clicked.connect(self.scan_file_rename_suggestions)
+
+        self.file_rename_apply_btn = QPushButton("Rename Selected Files")
+        self.file_rename_apply_btn.setEnabled(False)
+        self.file_rename_apply_btn.clicked.connect(self.rename_selected_files)
+
+        file_rename_controls.addWidget(self.file_rename_preset_combo)
+        file_rename_controls.addWidget(self.file_rename_scan_btn)
+        file_rename_controls.addWidget(self.file_rename_apply_btn)
+        file_rename_controls.addStretch(1)
+
+        self.file_rename_summary_label = QLabel("No rename scan run yet.")
+        self.file_rename_summary_label.setObjectName("targetSummary")
+
+        self.file_rename_table = QTableWidget(0, 6)
+        self.file_rename_table.setHorizontalHeaderLabels(
+            ["Rename", "Current File", "Suggested File", "Track No", "Track Name", "Reason"]
+        )
+        self.file_rename_table.verticalHeader().setVisible(False)
+        file_rename_header = self.file_rename_table.horizontalHeader()
+        file_rename_header.setSectionResizeMode(QHeaderView.Interactive)
+        file_rename_header.setStretchLastSection(False)
+        file_rename_header.setSectionsClickable(True)
+        self.file_rename_table.setColumnWidth(0, 72)
+        self.file_rename_table.setColumnWidth(1, 320)
+        self.file_rename_table.setColumnWidth(2, 320)
+        self.file_rename_table.setColumnWidth(3, 90)
+        self.file_rename_table.setColumnWidth(4, 220)
+        self.file_rename_table.setColumnWidth(5, 280)
+        self.file_rename_table.setAlternatingRowColors(True)
+        self.file_rename_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.file_rename_table.setEditTriggers(QTableWidget.NoEditTriggers)
+
+        file_rename_layout.addLayout(file_rename_controls)
+        file_rename_layout.addWidget(self.file_rename_summary_label)
+        file_rename_layout.addWidget(self.file_rename_table, 1)
+
+        browser_tab = QWidget()
+        browser_layout = QVBoxLayout(browser_tab)
+        browser_layout.setContentsMargins(10, 10, 10, 10)
+        browser_layout.setSpacing(10)
+
+        self.browser_root_label = QLabel("Root: no valid target selected")
+        self.browser_root_label.setObjectName("targetSummary")
+
+        self.browser_size_progress = QProgressBar()
+        self.browser_size_progress.setRange(0, 1)
+        self.browser_size_progress.setValue(0)
+        self.browser_size_progress.setFormat("Folder size scan idle")
+        self.browser_size_progress.setTextVisible(True)
+        self.browser_size_progress.hide()
+
+        self.browser_tree = QTreeView()
+        self.browser_model = QFileSystemModel(self.browser_tree)
+        self.browser_model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot)
+        self.browser_model.setReadOnly(True)
+        self.browser_proxy_model = FileBrowserProxyModel(self.browser_model, self.browser_tree)
+        self.browser_tree.setModel(self.browser_proxy_model)
+        self.browser_tree.setRootIndex(QModelIndex())
+        self.browser_tree.setHeaderHidden(False)
+        self.browser_tree.setAnimated(True)
+        self.browser_tree.setTextElideMode(Qt.ElideNone)
+        self.browser_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.browser_tree.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.browser_tree.setSortingEnabled(True)
+
+        browser_header = self.browser_tree.header()
+        browser_header.setSectionResizeMode(QHeaderView.Interactive)
+        browser_header.setStretchLastSection(False)
+        browser_header.setSectionsClickable(True)
+        browser_header.setSortIndicatorShown(True)
+        browser_header.setSortIndicator(0, Qt.AscendingOrder)
+
+        self.browser_tree.sortByColumn(0, Qt.AscendingOrder)
+
+        # Start with roomy defaults; users can drag header separators to adjust.
+        self.browser_tree.setColumnWidth(0, 420)
+        self.browser_tree.setColumnWidth(1, 130)
+        self.browser_tree.setColumnWidth(2, 170)
+        self.browser_tree.setColumnWidth(3, 190)
+
+        self.browser_tree.clicked.connect(self.on_browser_item_clicked)
+        self.browser_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.browser_tree.customContextMenuRequested.connect(self.on_browser_context_menu)
+        self.browser_tree.setEnabled(False)
+
+        browser_right = QWidget()
+        browser_right_layout = QVBoxLayout(browser_right)
+        browser_right_layout.setContentsMargins(0, 0, 0, 0)
+        browser_right_layout.setSpacing(8)
+
+        self.file_details_tabs = QTabWidget()
+
+        properties_tab = QWidget()
+        properties_layout = QVBoxLayout(properties_tab)
+        properties_layout.setContentsMargins(0, 0, 0, 0)
+        properties_layout.setSpacing(8)
+
+        self.file_props_title = QLabel("File Properties")
+        self.file_props_title.setObjectName("sectionLabel")
+        self.file_props_hint = QLabel("Select an audio file to view details.")
+        self.file_props_hint.setObjectName("targetSummary")
+
+        self.file_props_table = QTableWidget(0, 2)
+        self.file_props_table.setHorizontalHeaderLabels(["Property", "Value"])
+        self.file_props_table.verticalHeader().setVisible(False)
+        self.file_props_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.file_props_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.file_props_table.setColumnWidth(0, 240)
+        self.file_props_table.setAlternatingRowColors(True)
+        self.file_props_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.file_props_table.setEditTriggers(QTableWidget.NoEditTriggers)
+
+        properties_layout.addWidget(self.file_props_title)
+        properties_layout.addWidget(self.file_props_hint)
+        properties_layout.addWidget(self.file_props_table, 1)
+
+        lyrics_tab = QWidget()
+        lyrics_layout = QVBoxLayout(lyrics_tab)
+        lyrics_layout.setContentsMargins(0, 0, 0, 0)
+        lyrics_layout.setSpacing(8)
+
+        self.file_lyrics_title = QLabel("Embedded Lyrics")
+        self.file_lyrics_title.setObjectName("sectionLabel")
+        self.file_lyrics_hint = QLabel("Select an audio file to view embedded lyrics.")
+        self.file_lyrics_hint.setObjectName("targetSummary")
+
+        self.file_lyrics_text = QPlainTextEdit()
+        self.file_lyrics_text.setReadOnly(True)
+        self.file_lyrics_text.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+
+        lyrics_layout.addWidget(self.file_lyrics_title)
+        lyrics_layout.addWidget(self.file_lyrics_hint)
+        lyrics_layout.addWidget(self.file_lyrics_text, 1)
+
+        self.file_details_tabs.addTab(properties_tab, "Properties")
+        self.file_details_tabs.addTab(lyrics_tab, "Embedded Lyrics")
+
+        browser_right_layout.addWidget(self.file_details_tabs, 1)
+
+        self.lrc_preview_panel = QWidget()
+        lrc_preview_layout = QVBoxLayout(self.lrc_preview_panel)
+        lrc_preview_layout.setContentsMargins(0, 0, 0, 0)
+        lrc_preview_layout.setSpacing(8)
+
+        self.lrc_preview_title = QLabel("LRC File Contents")
+        self.lrc_preview_title.setObjectName("sectionLabel")
+        self.lrc_preview_hint = QLabel("Select an .lrc file to view contents.")
+        self.lrc_preview_hint.setObjectName("targetSummary")
+
+        self.lrc_preview_text = QPlainTextEdit()
+        self.lrc_preview_text.setReadOnly(True)
+        self.lrc_preview_text.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+
+        lrc_preview_layout.addWidget(self.lrc_preview_title)
+        lrc_preview_layout.addWidget(self.lrc_preview_hint)
+        lrc_preview_layout.addWidget(self.lrc_preview_text, 1)
+
+        browser_right_layout.addWidget(self.lrc_preview_panel, 1)
+        self.lrc_preview_panel.hide()
+
+        browser_splitter = QSplitter(Qt.Horizontal)
+        browser_splitter.addWidget(self.browser_tree)
+        browser_splitter.addWidget(browser_right)
+        browser_splitter.setStretchFactor(0, 3)
+        browser_splitter.setStretchFactor(1, 2)
+
+        browser_layout.addWidget(self.browser_root_label)
+        browser_layout.addWidget(self.browser_size_progress)
+        browser_layout.addWidget(browser_splitter, 1)
+
+        cleanup_tab = QWidget()
+        cleanup_layout = QVBoxLayout(cleanup_tab)
+        cleanup_layout.setContentsMargins(10, 10, 10, 10)
+        cleanup_layout.setSpacing(10)
+
+        cleanup_hint = QLabel(
+            "Scan the current target, then select file type categories to remove."
+        )
+        cleanup_hint.setObjectName("targetSummary")
+
+        cleanup_controls = QHBoxLayout()
+        self.cleanup_scan_btn = QPushButton("Scan File Types")
+        self.cleanup_scan_btn.clicked.connect(self.scan_file_cleanup_breakdown)
+        self.cleanup_remove_btn = QPushButton("Remove Selected Types")
+        self.cleanup_remove_btn.setEnabled(False)
+        self.cleanup_remove_btn.clicked.connect(self.remove_selected_file_types)
+        cleanup_controls.addWidget(self.cleanup_scan_btn)
+        cleanup_controls.addWidget(self.cleanup_remove_btn)
+        cleanup_controls.addStretch(1)
+
+        self.cleanup_summary_label = QLabel("No scan run yet.")
+        self.cleanup_summary_label.setObjectName("targetSummary")
+
+        self.cleanup_table = QTableWidget(0, 5)
+        self.cleanup_table.setHorizontalHeaderLabels(
+            ["Remove", "File Type", "Type", "Files", "Total Size"]
+        )
+        self.cleanup_table.verticalHeader().setVisible(False)
+        self.cleanup_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.cleanup_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.cleanup_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.cleanup_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.cleanup_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.cleanup_table.setAlternatingRowColors(True)
+        self.cleanup_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.cleanup_table.setEditTriggers(QTableWidget.NoEditTriggers)
+
+        cleanup_layout.addWidget(cleanup_hint)
+        cleanup_layout.addLayout(cleanup_controls)
+        cleanup_layout.addWidget(self.cleanup_summary_label)
+        cleanup_layout.addWidget(self.cleanup_table, 1)
+
+        backup_restore_tab = QWidget()
+        backup_restore_layout = QVBoxLayout(backup_restore_tab)
+        backup_restore_layout.setContentsMargins(10, 10, 10, 10)
+        backup_restore_layout.setSpacing(10)
+
+        backup_restore_hint = QLabel(
+            "Back up the current target to a zip file, or copy/move it to another drive/folder."
+        )
+        backup_restore_hint.setObjectName("targetSummary")
+
+        zip_controls = QHBoxLayout()
+        self.backup_zip_path_input = QLineEdit()
+        self.backup_zip_path_input.setPlaceholderText("Backup zip path (for example: /Volumes/Backup/MyDrive.zip)")
+        self.backup_zip_browse_btn = QPushButton("Choose Zip Location")
+        self.backup_zip_browse_btn.clicked.connect(self.choose_backup_zip_path)
+        self.backup_zip_run_btn = QPushButton("Backup Target To Zip")
+        self.backup_zip_run_btn.clicked.connect(self.start_zip_backup)
+        zip_controls.addWidget(self.backup_zip_path_input, 1)
+        zip_controls.addWidget(self.backup_zip_browse_btn)
+        zip_controls.addWidget(self.backup_zip_run_btn)
+
+        transfer_controls = QHBoxLayout()
+        self.transfer_destination_input = QLineEdit()
+        self.transfer_destination_input.setPlaceholderText("Destination root folder or drive (a new folder named after target is created)")
+        self.transfer_destination_browse_btn = QPushButton("Choose Destination")
+        self.transfer_destination_browse_btn.clicked.connect(self.choose_transfer_destination)
+        self.transfer_mode_combo = QComboBox()
+        self.transfer_mode_combo.addItem("Copy", "copy")
+        self.transfer_mode_combo.addItem("Move", "move")
+        self.transfer_run_btn = QPushButton("Start Copy/Move")
+        self.transfer_run_btn.clicked.connect(self.start_copy_or_move)
+        transfer_controls.addWidget(self.transfer_destination_input, 1)
+        transfer_controls.addWidget(self.transfer_destination_browse_btn)
+        transfer_controls.addWidget(self.transfer_mode_combo)
+        transfer_controls.addWidget(self.transfer_run_btn)
+
+        self.backup_restore_summary_label = QLabel("No backup/restore job run yet.")
+        self.backup_restore_summary_label.setObjectName("targetSummary")
+
+        self.backup_restore_progress = QProgressBar()
+        self.backup_restore_progress.setRange(0, 1)
+        self.backup_restore_progress.setValue(0)
+        self.backup_restore_progress.setFormat("Idle")
+        self.backup_restore_progress.setTextVisible(True)
+
+        cancel_row = QHBoxLayout()
+        self.backup_restore_cancel_btn = QPushButton("Cancel Job")
+        self.backup_restore_cancel_btn.setEnabled(False)
+        self.backup_restore_cancel_btn.clicked.connect(self.cancel_backup_restore_job)
+        cancel_row.addStretch(1)
+        cancel_row.addWidget(self.backup_restore_cancel_btn)
+
+        backup_restore_layout.addWidget(backup_restore_hint)
+        backup_restore_layout.addLayout(zip_controls)
+        backup_restore_layout.addLayout(transfer_controls)
+        backup_restore_layout.addWidget(self.backup_restore_summary_label)
+        backup_restore_layout.addWidget(self.backup_restore_progress)
+        backup_restore_layout.addLayout(cancel_row)
+        backup_restore_layout.addStretch(1)
+
+        self._about_tab_index = self.tabs.addTab(about_tab, "About Folder/Drive")
+        self._directory_tab_index = self.tabs.addTab(browser_tab, "Music Browser")
+        self.tabs.addTab(album_art_tab, "Album Art")
+        self._music_compatibility_tab_index = self.tabs.addTab(
+            music_compatibility_tab, "Music Compatibility"
+        )
+        self._lyrics_manager_tab_index = self.tabs.addTab(lyrics_manager_tab, "Lyrics Manager")
+        self._file_rename_tab_index = self.tabs.addTab(file_rename_tab, "File Rename")
+        self._cleanup_tab_index = self.tabs.addTab(cleanup_tab, "File Cleanup")
+        self._backup_restore_tab_index = self.tabs.addTab(backup_restore_tab, "Backup/Restore")
+        self.tabs.setTabEnabled(self._directory_tab_index, False)
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+
+        self._build_help_pane()
+
+        content_row = QHBoxLayout()
+        content_row.setContentsMargins(0, 0, 0, 0)
+        content_row.setSpacing(10)
+        content_row.addWidget(self.tabs, 1)
+        content_row.addWidget(self.help_pane, 0)
+
+        layout.addLayout(content_row, 1)
+
+        self.setCentralWidget(root)
+        self._position_header_logo()
+        self.status_credit_label = QLabel("Developed by: Silent Sphinx @silent-sphinx")
+        self.statusBar().addPermanentWidget(self.status_credit_label)
+        self.statusBar().showMessage("Ready")
+
+    def _build_help_pane(self) -> None:
+        self.help_pane = QWidget()
+        self.help_pane.setObjectName("helpPane")
+        self.help_pane.setMinimumWidth(self._help_pane_width)
+        self.help_pane.setFixedWidth(self._help_pane_width)
+
+        help_layout = QVBoxLayout(self.help_pane)
+        help_layout.setContentsMargins(8, 8, 8, 8)
+        help_layout.setSpacing(8)
+
+        help_header_row = QHBoxLayout()
+        help_header_row.setContentsMargins(0, 0, 0, 0)
+        help_header_row.setSpacing(6)
+
+        self.help_title_label = QLabel("Help")
+        self.help_title_label.setObjectName("sectionLabel")
+
+        self.help_context_label = QLabel("")
+        self.help_context_label.setObjectName("targetSummary")
+
+        help_header_row.addWidget(self.help_title_label)
+        help_header_row.addStretch(1)
+
+        self.help_body_label = QLabel()
+        self.help_body_label.setObjectName("helpBody")
+        self.help_body_label.setWordWrap(True)
+        self.help_body_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.help_body_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        help_layout.addLayout(help_header_row)
+        help_layout.addWidget(self.help_context_label)
+        help_layout.addWidget(self.help_body_label, 1)
+
+        self._update_help_for_tab(self.tabs.currentIndex())
+
+    def _update_help_for_tab(self, index: int) -> None:
+        tab_name = ""
+        if 0 <= index < self.tabs.count():
+            tab_name = self.tabs.tabText(index)
+
+        help_by_tab = {
+            "About Folder/Drive": (
+                "Welcome to the Snowsky Echo Mini Toolbox, your one-stop shop for organizing and converting your music media. To start, select the location of your media by browsing or choosing one of the mounted drives at the top of the interface.\n\n"
+                "It is recommended to connect your microSD card directly to your computer using a USB reader, rather than plugging in the Snowsky Echo Mini itself, as the device uses a slower interface.\n\n"
+                "The 'About Drive/Folder' tool is useful for ensuring that your microSD card is compatible with your Echo Mini.\n\n"
+                "Filesystem Rules:\n"
+                "- Formatted as FAT/FAT32 or exFAT.\n"
+                "- Maximum drive size of 256GB.\n\n"
+                "Formatting a drive will erase all its contents; always back up your data BEFORE formatting. It is recommended to insert your microSD card into your Echo Mini and format it twice via the Settings menu."
+            ),
+            "Music Browser": (
+                "Inspect file metadata, rename files, and repair individual media.\n\n"
+                "Once you have selected your target directory, navigate through the folder structure to identify any files or folders you would like to edit.\n\n"
+                "Right-click on any media file to interact with it: Rename, Add/Fix Album Art, or Look up Lyrics.\n\n"
+                "After selecting a music file, you can view its metadata and properties on the right-hand side of the screen. Any field marked with a pencil icon can be modified."
+            ),
+            "Album Art": (
+                "Detect embedded artwork that may cause compatibility issues and convert it to a supported JPEG non-progressive format.\n\n"
+                "Recommended Workflow:\n"
+                "1) Click 'Scan Album Art Compatibility.'\n"
+                "2) Review the Status, Progressive, File Type, and Resolution columns.\n"
+                "3) Use 'Fix Incompatible Files' for batch repairs, or right-click individual files in the Directory Browser for targeted fixes.\n"
+                "4) Re-scan after repairs to confirm the results.\n\n"
+                "How to Interpret Results:\n"
+                "- Compatible: Artwork is already in a supported format.\n"
+                "- Incompatible: Art format or scan type requires conversion.\n"
+                "- Missing Artwork: No embedded image was found.\n\n"
+                "Tips:\n"
+                "- Always maintain a backup before performing large batch edits.\n"
+                "- If a file fails verification after writing, check the metadata tags and file permissions."
+            ),  
+            "Music Compatibility": (
+                "Evaluate every music file in the target directory against Echo Mini playback rules.\n\n"
+                "Recommended Workflow:\n"
+                "1) Run 'Scan Music Compatibility.'\n"
+                "2) Sort by Status and Reason to identify the largest problem groups first.\n"
+                "3) Use the search box to isolate specific formats, sampling rates, or failure reasons.\n"
+                "4) Convert or replace unsupported files, then re-run the scan to validate.\n\n"
+                "Status Guidance:\n"
+                "- Supported: The file is expected to play correctly.\n"
+                "- Unsupported: The format or attributes conflict with device rules.\n"
+                "- Unknown: Metadata was incomplete or inconclusive.\n"
+                "- Skipped: The file was not recognized as a valid audio candidate.\n\n"
+                "Best Practice:\n"
+                "Prioritize unsupported items with clear reason strings first, then review unknown results manually."
+            ),
+            "Lyrics Manager": (
+                "To add lyrics to your audio files, you will need a supplementary .lrc file; the Snowsky Echo Mini does not support embedded lyric data.\n\n"
+                "This tool supports lyrics in two ways:\n"
+                "- Extract existing embedded lyrics and convert them to .lrc format.\n"
+                "- Search for music online and download .lrc files in bulk.\n\n"
+                "Recommended Workflow:\n"
+                "1) Click 'Scan Lyrics' to audit embedded lyrics and matching .lrc sidecars.\n"
+                "2) If embedded lyrics exist, use 'Convert Embedded Lyrics To .lrc' to export sidecars.\n"
+                "3) Use 'Bulk Lookup' to fetch missing lyrics from LRCLIB using track metadata.\n"
+                "4) Review lookup results and run 'Apply Lookup Results' to write the .lrc files.\n\n"
+                "Operational Notes:\n"
+                "- Sidecar naming follows the 'song.ext -> song.lrc' convention in the same folder.\n"
+                "- Existing .lrc files may be overwritten when apply/export actions are executed.\n"
+                "- Accurate metadata (title, artist, album, duration) significantly improves lookup accuracy."
+            ),
+            "File Rename": (
+                "The File Rename Tool renames your files to follow a standardized format, e.g., 'TrackNumber. TrackTitle'.\n\n"
+                "It is highly recommended to back up your files and carefully review the proposed new names before applying changes.\n\n"
+                "Select a formatting option from the dropdown menu and scan to see which of your files currently match the anticipated format.\n\n"
+                "Metadata Numbering [TrackNo. TrackName]:\n"
+                "This setting uses your music file's metadata to set the TrackNo and TrackName as the filename (e.g., '01. Skyfall')."
+            ),
+            "File Cleanup": (
+                "Identify non-essential file categories and remove them to save space.\n\n"
+                "Recommended Workflow:\n"
+                "1) Run 'Scan File Types' to inventory all discovered categories.\n"
+                "2) Sort and inspect category counts and their total impact on storage size.\n"
+                "3) Select only the categories you are certain you want to remove.\n"
+                "4) Confirm removal and review the completion summary for any failures.\n\n"
+                "What to Watch:\n"
+                "- Hidden and sidecar files may include metadata you still require.\n"
+                "- Large removal sets should be backed up before proceeding.\n"
+                "- Permission errors usually indicate protected files or mount constraints.\n\n"
+                "Best Practice:\n"
+                "Run cleanup in phases, validating player behavior after each stage."
+            ),
+            "Backup/Restore": (
+                "Protect and migrate your library by converting your media into a ZIP file or migrating it to an alternative storage device.\n\n"
+                "Modes:\n"
+                "- Backup Target To Zip: Creates a compressed snapshot archive.\n"
+                "- Start Copy/Move: Clones or relocates the target library into a destination folder.\n\n"
+                "Recommended Workflow:\n"
+                "1) Carefully confirm the source target and destination paths.\n"
+                "2) Perform a backup before starting cleanup, rename, or migration operations.\n"
+                "3) Monitor progress and use 'Cancel Job' only when absolutely necessary.\n"
+                "4) Verify the destination content after completion before deleting any originals.\n\n"
+                "Important Notes:\n"
+                "- The 'Move' action is destructive to the source after a successful transfer.\n"
+                "- Canceling may leave partial data at the destination; review the folder before retrying."
+            ),
+        }
+
+        default_help = (
+            "This Help pane provides panel-specific guidance.\n\n"
+            "Open any tab to see detailed workflows, interpretation tips, and safe operating practices for that panel."
+        )
+        if tab_name:
+            self.help_context_label.setText(f"Tips for: {tab_name}")
+        else:
+            self.help_context_label.setText("Tips")
+        self.help_body_label.setText(help_by_tab.get(tab_name, default_help))
+
+    def _apply_charcoal_theme(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+
+        app.setStyleSheet(
+            """
+            QMainWindow, QWidget {
+                background-color: #262626;
+                color: #ECECEC;
+                font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', 'Noto Sans', sans-serif;
+                font-size: 13px;
+            }
+            QLabel#title {
+                font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', sans-serif;
+                font-size: 25px;
+                font-weight: 700;
+                color: #F4F4F4;
+                padding-bottom: 2px;
+            }
+            QLabel#subtitle {
+                color: #B5B5B5;
+                padding-bottom: 4px;
+            }
+            QLabel#sectionLabel {
+                font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', sans-serif;
+                color: #E3E3E3;
+                font-weight: 600;
+                padding-top: 2px;
+            }
+            QLabel#targetSummary {
+                color: #B5B5B5;
+            }
+            QWidget#helpPane {
+                background-color: #262626;
+                border: 1px solid #3C3C3C;
+                border-radius: 0px;
+            }
+            QLabel#helpBody {
+                color: #D7D7D7;
+                background-color: #262626;
+                border: none;
+                padding: 2px 2px 4px 2px;
+            }
+            QLabel#fileArtPreview {
+                background-color: #1F1F1F;
+                color: #AFAFAF;
+                border: 1px solid #434343;
+                border-radius: 0px;
+            }
+            QTabWidget::pane {
+                border: 1px solid #3C3C3C;
+                background-color: #262626;
+                border-radius: 0px;
+                margin-top: 6px;
+            }
+            QTabBar::tab {
+                background-color: #303030;
+                color: #DCDCDC;
+                font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', sans-serif;
+                border: 1px solid #3E3E3E;
+                border-bottom: none;
+                border-top-left-radius: 0px;
+                border-top-right-radius: 0px;
+                padding: 7px 12px;
+                margin-right: 4px;
+            }
+            QTabBar::tab:selected {
+                background-color: #3A3A3A;
+                color: #F4F4F4;
+            }
+            QTabBar::tab:hover {
+                background-color: #3A3A3A;
+            }
+            QLineEdit, QComboBox, QTableWidget, QPlainTextEdit {
+                background-color: #1F1F1F;
+                border: 1px solid #434343;
+                border-radius: 0px;
+                padding: 6px;
+                color: #F0F0F0;
+                font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', 'Noto Sans', sans-serif;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 1px solid #5A5A5A;
+            }
+            QComboBox::drop-down {
+                border: none;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1F1F1F;
+                color: #F0F0F0;
+                font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', 'Noto Sans', sans-serif;
+                selection-background-color: #4A4A4A;
+                selection-color: #FFFFFF;
+                border: 1px solid #434343;
+            }
+            QComboBox QAbstractItemView::item {
+                background-color: #1F1F1F;
+                color: #F0F0F0;
+                padding: 6px;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background-color: #565656;
+                color: #FFFFFF;
+            }
+            QComboBox QAbstractItemView::item:selected {
+                background-color: #4A4A4A;
+                color: #FFFFFF;
+            }
+            QTableView {
+                background-color: #1F1F1F;
+                color: #F0F0F0;
+                font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', 'Noto Sans', sans-serif;
+                selection-background-color: #4A4A4A;
+                selection-color: #FFFFFF;
+            }
+            QTreeView {
+                background-color: #1F1F1F;
+                color: #F0F0F0;
+                font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', 'Noto Sans', sans-serif;
+                border: 1px solid #434343;
+                border-radius: 0px;
+                padding: 4px;
+                selection-background-color: #4A4A4A;
+                selection-color: #FFFFFF;
+            }
+            QTreeView::item:hover {
+                background-color: #565656;
+                color: #FFFFFF;
+            }
+            QTableWidget {
+                gridline-color: #383838;
+            }
+            QTableCornerButton::section {
+                background-color: #333333;
+                border: 1px solid #444444;
+            }
+            QHeaderView::section {
+                background-color: #333333;
+                color: #E9E9E9;
+                font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', 'Noto Sans', sans-serif;
+                border: 1px solid #444444;
+                padding: 6px;
+            }
+            QToolTip {
+                background-color: #1F1F1F;
+                color: #F0F0F0;
+                border: 1px solid #434343;
+            }
+            QProgressBar {
+                background-color: #1F1F1F;
+                color: #EAEAEA;
+                border: 1px solid #434343;
+                border-radius: 0px;
+                text-align: center;
+                min-height: 18px;
+            }
+            QProgressBar::chunk {
+                background-color: #565656;
+                border-radius: 0px;
+            }
+            QPushButton {
+                background-color: #3A3A3A;
+                border: 1px solid #4B4B4B;
+                border-radius: 0px;
+                color: #F0F0F0;
+                padding: 7px 12px;
+                font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', sans-serif;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #4A4A4A;
+            }
+            QPushButton:pressed {
+                background-color: #2F2F2F;
+            }
+            QPushButton:disabled {
+                background-color: #242424;
+                border: 1px solid #353535;
+                color: #767676;
+            }
+            QPushButton:disabled:hover {
+                background-color: #242424;
+                border: 1px solid #353535;
+                color: #767676;
+            }
+            QPushButton:disabled:pressed {
+                background-color: #242424;
+                border: 1px solid #353535;
+                color: #767676;
+            }
+            QMessageBox {
+                background-color: #262626;
+            }
+            QMessageBox QLabel {
+                color: #ECECEC;
+            }
+            QStatusBar QLabel {
+                color: #BCBCBC;
+                font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', 'Noto Sans', sans-serif;
+            }
+            QStatusBar {
+                background-color: #212121;
+                color: #BCBCBC;
+            }
+            """
+        )
+
+    def browse_folder(self) -> None:
+        dialog = QFileDialog(self, "Select Folder", str(Path.home()))
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setOption(QFileDialog.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+
+        if not dialog.exec():
+            return
+
+        selected = dialog.selectedFiles()[0]
+        self.path_input.setText(selected)
+        self.show_info()
+        self.statusBar().showMessage("Folder selected")
+
+    def refresh_drives(self) -> None:
+        if self._drive_scan_thread is not None and self._drive_scan_thread.isRunning():
+            self.statusBar().showMessage("Drive refresh already running")
+            return
+
+        self.refresh_drives_btn.setEnabled(False)
+        self.unmount_drive_btn.setEnabled(False)
+        self.refresh_drives_btn.setText("Refreshing...")
+        self.drive_combo.clear()
+        self.drive_combo.addItem("Scanning removable drives...")
+        self.statusBar().showMessage("Scanning removable drives...")
+        self._update_directory_tab_access()
+
+        self._drive_scan_thread = QThread(self)
+        self._drive_scan_worker = DriveScanWorker()
+        self._drive_scan_worker.moveToThread(self._drive_scan_thread)
+
+        self._drive_scan_thread.started.connect(self._drive_scan_worker.run)
+        self._drive_scan_worker.finished.connect(self._on_drive_scan_finished)
+        self._drive_scan_worker.failed.connect(self._on_drive_scan_failed)
+
+        self._drive_scan_worker.finished.connect(self._drive_scan_thread.quit)
+        self._drive_scan_worker.failed.connect(self._drive_scan_thread.quit)
+        self._drive_scan_thread.finished.connect(self._drive_scan_worker.deleteLater)
+        self._drive_scan_thread.finished.connect(self._drive_scan_thread.deleteLater)
+        self._drive_scan_thread.finished.connect(self._clear_drive_scan_refs)
+
+        self._drive_scan_thread.start()
+
+    @Slot(object)
+    def _on_drive_scan_finished(self, options_obj) -> None:
+        options = options_obj if isinstance(options_obj, list) else []
+        self.drive_options = [item for item in options if isinstance(item, DriveOption)]
+
+        self.drive_combo.clear()
+
+        if self.drive_options:
+            self.drive_combo.addItem("Select removable drive", "")
+            for row, option in enumerate(self.drive_options):
+                self.drive_combo.addItem(option.label, option.path)
+            self.statusBar().showMessage(f"Found {len(self.drive_options)} removable drive(s)")
+        else:
+            self.drive_combo.addItem("No removable drives found")
+            self.statusBar().showMessage("No removable drives detected")
+
+        self._update_directory_tab_access()
+        self._update_unmount_drive_button_state()
+
+        self.refresh_drives_btn.setEnabled(True)
+        self.refresh_drives_btn.setText("Refresh Drives")
+
+    @Slot(str)
+    def _on_drive_scan_failed(self, error: str) -> None:
+        self.drive_options = []
+        self.drive_combo.clear()
+        self.drive_combo.addItem("Drive scan failed")
+        self.statusBar().showMessage(f"Drive detection failed: {error}", 5000)
+        self._update_directory_tab_access()
+        self._update_unmount_drive_button_state()
+        self.refresh_drives_btn.setEnabled(True)
+        self.refresh_drives_btn.setText("Refresh Drives")
+
+    @Slot()
+    def _clear_drive_scan_refs(self) -> None:
+        self._drive_scan_worker = None
+        self._drive_scan_thread = None
+
+    def _set_current_target_label(self, target: str) -> None:
+        if not target:
+            self.current_target_label.setText("Current target: none selected")
+            return
+        self.current_target_label.setText(f"Current target: {target}")
+
+    def _filesystem_looks_compatible(self, filesystem_value: str) -> bool:
+        normalized = filesystem_value.lower()
+        return "exfat" in normalized or "fat" in normalized
+
+    def _selected_drive_path(self) -> str | None:
+        selected = self.drive_combo.currentData()
+        if not isinstance(selected, str) or not selected:
+            return None
+        if any(option.path == selected for option in self.drive_options):
+            return selected
+        return None
+
+    def _selected_target_directory_path(self) -> str | None:
+        target = self.path_input.text().strip()
+        if not target:
+            return None
+
+        target_path = Path(target).expanduser()
+        if not target_path.exists() or not target_path.is_dir():
+            return None
+
+        try:
+            return str(target_path.resolve())
+        except Exception:
+            return str(target_path)
+
+    def _update_unmount_drive_button_state(self) -> None:
+        has_selected_drive = self._selected_drive_path() is not None
+        is_drive_scan_running = (
+            self._drive_scan_thread is not None and self._drive_scan_thread.isRunning()
+        )
+        self.unmount_drive_btn.setEnabled(has_selected_drive and not is_drive_scan_running)
+
+    def unmount_selected_drive(self) -> None:
+        selected_drive = self._selected_drive_path()
+        if not selected_drive:
+            QMessageBox.information(
+                self,
+                "No Drive Selected",
+                "Select a removable drive before unmounting.",
+            )
+            self._update_unmount_drive_button_state()
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Unmount Drive",
+            f"Unmount selected drive?\n\n{selected_drive}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        self.unmount_drive_btn.setEnabled(False)
+        self.unmount_drive_btn.setText("Unmounting...")
+        unmounted = self._attempt_unmount_drive(selected_drive)
+        if not unmounted:
+            self._update_unmount_drive_button_state()
+        self.unmount_drive_btn.setText("Unmount Drive")
+
+    def _attempt_unmount_drive(
+        self,
+        selected_drive: str,
+        *,
+        show_result_dialogs: bool = True,
+        refresh_drive_list: bool = True,
+    ) -> bool:
+        error_detail = ""
+        try:
+            if sys.platform != "darwin":
+                raise RuntimeError("Unmount drive is currently supported on macOS only.")
+
+            commands = [
+                ["diskutil", "unmount", selected_drive],
+                ["diskutil", "unmountDisk", selected_drive],
+            ]
+            unmounted = False
+
+            for command in commands:
+                result = subprocess.run(command, capture_output=True, text=True)
+                if result.returncode == 0:
+                    unmounted = True
+                    break
+                output = (result.stderr or result.stdout or "").strip()
+                if output:
+                    error_detail = output
+
+            if not unmounted:
+                raise RuntimeError(error_detail or "diskutil reported an error.")
+
+            if self.path_input.text().strip() == selected_drive:
+                self.path_input.clear()
+                self.show_info()
+
+            self.statusBar().showMessage(f"Drive unmounted: {selected_drive}", 5000)
+            if show_result_dialogs:
+                QMessageBox.information(
+                    self,
+                    "Drive Unmounted",
+                    f"Successfully unmounted:\n{selected_drive}",
+                )
+            if refresh_drive_list:
+                self.refresh_drives()
+            return True
+        except Exception as exc:
+            if show_result_dialogs:
+                QMessageBox.warning(
+                    self,
+                    "Unmount Failed",
+                    f"Unable to unmount drive:\n{exc}",
+                )
+            self.statusBar().showMessage("Unmount failed", 5000)
+            return False
+
+    def closeEvent(self, event) -> None:
+        selected_drive = self._selected_drive_path()
+        if not selected_drive:
+            event.accept()
+            return
+
+        choice = QMessageBox.question(
+            self,
+            "Exit Application",
+            (
+                "Would you like to unmount the selected removable drive before exiting?\n\n"
+                f"{selected_drive}"
+            ),
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+
+        if choice == QMessageBox.Cancel:
+            event.ignore()
+            return
+
+        if choice == QMessageBox.Yes:
+            self.unmount_drive_btn.setEnabled(False)
+            self.unmount_drive_btn.setText("Unmounting...")
+
+            unmounted = self._attempt_unmount_drive(
+                selected_drive,
+                show_result_dialogs=False,
+                refresh_drive_list=False,
+            )
+
+            self.unmount_drive_btn.setText("Unmount Drive")
+            self._update_unmount_drive_button_state()
+
+            if not unmounted:
+                continue_exit = QMessageBox.question(
+                    self,
+                    "Unmount Failed",
+                    "Unable to unmount the selected drive before exit. Exit anyway?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if continue_exit != QMessageBox.Yes:
+                    event.ignore()
+                    return
+
+        event.accept()
+
+    def _update_directory_tab_access(self) -> None:
+        if self._directory_tab_index < 0:
+            return
+
+        has_selected_drive = self._selected_drive_path() is not None
+        has_selected_directory = self._selected_target_directory_path() is not None
+        has_browser_target = has_selected_drive or has_selected_directory
+        self.tabs.setTabEnabled(self._directory_tab_index, has_browser_target)
+
+        if not has_browser_target and self.tabs.currentIndex() == self._directory_tab_index:
+            if self._about_tab_index >= 0:
+                self.tabs.setCurrentIndex(self._about_tab_index)
+
+    def _set_cleanup_idle(self, message: str) -> None:
+        self.cleanup_summary_label.setText(message)
+        self.cleanup_table.setRowCount(0)
+        self.cleanup_remove_btn.setEnabled(False)
+        self._cleanup_scan_target = None
+        self._cleanup_type_files = {}
+
+    def _set_file_rename_idle(self, message: str) -> None:
+        self.file_rename_summary_label.setText(message)
+        self.file_rename_table.setRowCount(0)
+        self.file_rename_apply_btn.setEnabled(False)
+        self._file_rename_scan_target = None
+
+    def _set_lyrics_manager_idle(self, message: str) -> None:
+        self.lyrics_manager_summary_label.setText(message)
+        self.lyrics_manager_progress.setRange(0, 1)
+        self.lyrics_manager_progress.setValue(0)
+        self.lyrics_manager_progress.setFormat("Idle")
+        self._configure_lyrics_manager_scan_table()
+        self.lyrics_manager_table.setRowCount(0)
+        self.lyrics_manager_scan_btn.setEnabled(True)
+        self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
+        self.lyrics_manager_export_lrc_btn.setEnabled(True)
+        self.lyrics_manager_apply_lookup_btn.setEnabled(False)
+        self._lyrics_manager_scan_target = None
+        self._lyrics_lookup_results = []
+
+    def _configure_lyrics_manager_scan_table(self) -> None:
+        self.lyrics_manager_table.setColumnCount(3)
+        self.lyrics_manager_table.setHorizontalHeaderLabels(
+            ["File", "Embedded", "Matching LRC File"]
+        )
+        header = self.lyrics_manager_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+
+    def _configure_lyrics_manager_lookup_table(self) -> None:
+        self.lyrics_manager_table.setColumnCount(5)
+        self.lyrics_manager_table.setHorizontalHeaderLabels(
+            ["File", "Lookup", "Source", "Apply", "Preview"]
+        )
+        header = self.lyrics_manager_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
+
+    def _set_backup_restore_idle(self, message: str) -> None:
+        self.backup_restore_summary_label.setText(message)
+        self.backup_restore_progress.setRange(0, 1)
+        self.backup_restore_progress.setValue(0)
+        self.backup_restore_progress.setFormat("Idle")
+
+    def _set_backup_restore_busy(self, busy: bool, operation_label: str = "") -> None:
+        self.backup_zip_browse_btn.setEnabled(not busy)
+        self.backup_zip_run_btn.setEnabled(not busy)
+        self.transfer_destination_browse_btn.setEnabled(not busy)
+        self.transfer_mode_combo.setEnabled(not busy)
+        self.transfer_run_btn.setEnabled(not busy)
+        self.backup_restore_cancel_btn.setEnabled(busy)
+        if busy and operation_label:
+            self.backup_restore_summary_label.setText(operation_label)
+            self.backup_restore_progress.setRange(0, 1)
+            self.backup_restore_progress.setValue(0)
+            self.backup_restore_progress.setFormat("Preparing...")
+
+    def _resolve_current_target_dir(self) -> Path | None:
+        target_text = self.path_input.text().strip()
+        if not target_text:
+            QMessageBox.information(
+                self,
+                "No Target",
+                "Choose a folder or drive target before starting backup/restore.",
+            )
+            return None
+
+        target_path = Path(target_text).expanduser()
+        if not target_path.exists() or not target_path.is_dir():
+            QMessageBox.warning(
+                self,
+                "Invalid Target",
+                "The selected target path is not a valid folder.",
+            )
+            return None
+
+        return target_path.resolve()
+
+    def _run_backup_restore_worker(self, worker: QObject, operation_label: str) -> None:
+        if self._backup_restore_thread is not None and self._backup_restore_thread.isRunning():
+            QMessageBox.information(self, "Job Running", "A backup/restore job is already running.")
+            return
+
+        self._backup_restore_active_operation = operation_label
+        self._set_backup_restore_busy(True, operation_label)
+
+        self._backup_restore_thread = QThread(self)
+        self._backup_restore_worker = worker
+        self._backup_restore_worker.moveToThread(self._backup_restore_thread)
+
+        self._backup_restore_thread.started.connect(self._backup_restore_worker.run)
+        self._backup_restore_worker.progress.connect(self._on_backup_restore_progress)
+        self._backup_restore_worker.failed.connect(self._on_backup_restore_failed)
+        self._backup_restore_worker.cancelled.connect(self._on_backup_restore_cancelled)
+
+        self._backup_restore_worker.finished.connect(self._backup_restore_thread.quit)
+        self._backup_restore_worker.failed.connect(self._backup_restore_thread.quit)
+        self._backup_restore_worker.cancelled.connect(self._backup_restore_thread.quit)
+        self._backup_restore_thread.finished.connect(self._backup_restore_worker.deleteLater)
+        self._backup_restore_thread.finished.connect(self._backup_restore_thread.deleteLater)
+        self._backup_restore_thread.finished.connect(self._clear_backup_restore_refs)
+
+        self._backup_restore_thread.start()
+
+    def choose_backup_zip_path(self) -> None:
+        target_dir = None
+        target_text = self.path_input.text().strip()
+        if target_text:
+            candidate = Path(target_text).expanduser()
+            if candidate.exists() and candidate.is_dir():
+                try:
+                    target_dir = candidate.resolve()
+                except Exception:
+                    target_dir = candidate
+
+        default_name = "target_backup.zip"
+        if target_dir is not None:
+            default_name = f"{target_dir.name}_backup.zip"
+
+        start_path = str(Path.home() / default_name)
+        selected, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Choose Zip Backup Destination",
+            start_path,
+            "Zip archives (*.zip)",
+        )
+        if selected:
+            self.backup_zip_path_input.setText(selected)
+
+    def choose_transfer_destination(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Copy/Move Destination",
+            str(Path.home()),
+        )
+        if selected:
+            self.transfer_destination_input.setText(selected)
+
+    def start_zip_backup(self) -> None:
+        source_path = self._resolve_current_target_dir()
+        if source_path is None:
+            return
+
+        zip_text = self.backup_zip_path_input.text().strip()
+        if not zip_text:
+            QMessageBox.information(
+                self,
+                "Zip Path Required",
+                "Choose where to save the backup zip before starting.",
+            )
+            return
+
+        zip_path = Path(zip_text).expanduser()
+        if zip_path.suffix.lower() != ".zip":
+            zip_path = zip_path.with_suffix(".zip")
+            self.backup_zip_path_input.setText(str(zip_path))
+
+        try:
+            source_resolved = source_path.resolve()
+            zip_parent_resolved = zip_path.parent.resolve()
+        except Exception:
+            source_resolved = source_path
+            zip_parent_resolved = zip_path.parent
+
+        if zip_parent_resolved == source_resolved or source_resolved in zip_parent_resolved.parents:
+            QMessageBox.warning(
+                self,
+                "Invalid Zip Destination",
+                "Choose a zip destination outside the source folder to avoid recursive backup data.",
+            )
+            return
+
+        if zip_path.exists():
+            overwrite = QMessageBox.question(
+                self,
+                "Overwrite Existing Zip",
+                f"{zip_path.name} already exists. Overwrite it?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if overwrite != QMessageBox.Yes:
+                return
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Zip Backup",
+            f"Create a zip backup of:\n{source_path}\n\nDestination:\n{zip_path}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        worker = ZipBackupWorker(source_path, zip_path)
+        worker.finished.connect(self._on_zip_backup_finished)
+        self._run_backup_restore_worker(worker, "Creating zip backup...")
+        self.statusBar().showMessage("Zip backup started")
+
+    def start_copy_or_move(self) -> None:
+        source_path = self._resolve_current_target_dir()
+        if source_path is None:
+            return
+
+        destination_root_text = self.transfer_destination_input.text().strip()
+        if not destination_root_text:
+            QMessageBox.information(
+                self,
+                "Destination Required",
+                "Choose a destination folder or drive before starting copy/move.",
+            )
+            return
+
+        destination_root = Path(destination_root_text).expanduser()
+        destination_target = destination_root / source_path.name
+        mode = str(self.transfer_mode_combo.currentData() or "copy").lower()
+        mode = "move" if mode == "move" else "copy"
+        mode_label = "Move" if mode == "move" else "Copy"
+
+        try:
+            source_resolved = source_path.resolve()
+            destination_target_resolved = destination_target.resolve(strict=False)
+        except Exception:
+            source_resolved = source_path
+            destination_target_resolved = destination_target
+
+        if destination_target_resolved == source_resolved:
+            QMessageBox.warning(
+                self,
+                "Invalid Destination",
+                "Destination resolves to the same folder as the source.",
+            )
+            return
+
+        if source_resolved in destination_target_resolved.parents:
+            QMessageBox.warning(
+                self,
+                "Invalid Destination",
+                "Destination cannot be inside the source folder.",
+            )
+            return
+
+        if destination_target.exists() and not destination_target.is_dir():
+            QMessageBox.warning(
+                self,
+                "Invalid Destination",
+                "Destination target exists but is not a folder.",
+            )
+            return
+
+        if destination_target.exists():
+            merge = QMessageBox.question(
+                self,
+                "Destination Already Exists",
+                f"{destination_target} already exists. Continue and merge into this folder?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if merge != QMessageBox.Yes:
+                return
+
+        confirm = QMessageBox.question(
+            self,
+            f"Confirm {mode_label}",
+            f"{mode_label} source folder:\n{source_path}\n\nTo destination:\n{destination_target}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        worker = FileTransferWorker(source_path, destination_target, mode)
+        worker.finished.connect(self._on_transfer_finished)
+        self._run_backup_restore_worker(worker, f"{mode_label} in progress...")
+        self.statusBar().showMessage(f"{mode_label} started")
+
+    def cancel_backup_restore_job(self) -> None:
+        if self._backup_restore_worker is None:
+            return
+
+        request_cancel = getattr(self._backup_restore_worker, "request_cancel", None)
+        if callable(request_cancel):
+            request_cancel()
+            self.backup_restore_summary_label.setText("Cancelling backup/restore job...")
+            self.statusBar().showMessage("Cancelling backup/restore job...")
+
+    @Slot(int, int, str)
+    def _on_backup_restore_progress(self, processed: int, total: int, current_item: str) -> None:
+        total_for_ui = max(total, 1)
+        self.backup_restore_progress.setRange(0, total_for_ui)
+        self.backup_restore_progress.setValue(min(processed, total_for_ui))
+        self.backup_restore_progress.setFormat(f"{processed}/{total}")
+        self.backup_restore_summary_label.setText(
+            f"{self._backup_restore_active_operation} {processed}/{total}: {current_item}"
+        )
+
+    @Slot(object)
+    def _on_zip_backup_finished(self, payload_obj) -> None:
+        payload = payload_obj if isinstance(payload_obj, dict) else {}
+        zip_path = str(payload.get("zip_path") or "")
+        processed = int(payload.get("processed") or 0)
+        total = int(payload.get("total") or 0)
+        skipped = int(payload.get("skipped") or 0)
+
+        self._set_backup_restore_busy(False)
+        self.backup_restore_progress.setRange(0, max(total, 1))
+        self.backup_restore_progress.setValue(max(total, 0))
+        self.backup_restore_progress.setFormat("Completed")
+        self.backup_restore_summary_label.setText(
+            f"Zip backup completed. Files archived: {processed}/{total}. Symlink files skipped: {skipped}."
+        )
+        self.statusBar().showMessage("Zip backup completed", 5000)
+        QMessageBox.information(
+            self,
+            "Zip Backup Completed",
+            f"Zip created at:\n{zip_path}\n\nFiles archived: {processed}/{total}\nSymlink files skipped: {skipped}",
+        )
+
+    @Slot(object)
+    def _on_transfer_finished(self, payload_obj) -> None:
+        payload = payload_obj if isinstance(payload_obj, dict) else {}
+        destination = str(payload.get("destination") or "")
+        processed = int(payload.get("processed") or 0)
+        total = int(payload.get("total") or 0)
+        skipped = int(payload.get("skipped") or 0)
+        mode = str(payload.get("mode") or "copy").lower()
+        mode_label = "Move" if mode == "move" else "Copy"
+
+        self._set_backup_restore_busy(False)
+        self.backup_restore_progress.setRange(0, max(total, 1))
+        self.backup_restore_progress.setValue(max(total, 0))
+        self.backup_restore_progress.setFormat("Completed")
+        self.backup_restore_summary_label.setText(
+            f"{mode_label} completed. Files processed: {processed}/{total}. Symlink files skipped: {skipped}."
+        )
+        self.statusBar().showMessage(f"{mode_label} completed", 5000)
+        QMessageBox.information(
+            self,
+            f"{mode_label} Completed",
+            f"Destination:\n{destination}\n\nFiles processed: {processed}/{total}\nSymlink files skipped: {skipped}",
+        )
+
+        if mode == "move":
+            self.path_input.setText(destination)
+            self.show_info()
+
+    @Slot(str)
+    def _on_backup_restore_failed(self, error: str) -> None:
+        self._set_backup_restore_busy(False)
+        self.backup_restore_progress.setRange(0, 1)
+        self.backup_restore_progress.setValue(0)
+        self.backup_restore_progress.setFormat("Failed")
+        self.backup_restore_summary_label.setText(f"Backup/restore failed: {error}")
+        self.statusBar().showMessage("Backup/restore failed", 5000)
+        QMessageBox.warning(self, "Backup/Restore Failed", error)
+
+    @Slot(object)
+    def _on_backup_restore_cancelled(self, payload_obj) -> None:
+        payload = payload_obj if isinstance(payload_obj, dict) else {}
+        processed = int(payload.get("processed") or 0)
+        total = int(payload.get("total") or 0)
+        self._set_backup_restore_busy(False)
+        self.backup_restore_progress.setRange(0, max(total, 1))
+        self.backup_restore_progress.setValue(min(processed, max(total, 1)))
+        self.backup_restore_progress.setFormat("Cancelled")
+        self.backup_restore_summary_label.setText(
+            f"Backup/restore cancelled after {processed}/{total} files processed."
+        )
+        self.statusBar().showMessage("Backup/restore job cancelled", 5000)
+
+    @Slot()
+    def _clear_backup_restore_refs(self) -> None:
+        self._backup_restore_worker = None
+        self._backup_restore_thread = None
+        self._backup_restore_active_operation = ""
+
+    def _metadata_value_to_text(self, value) -> str:
+        if value is None:
+            return ""
+
+        if hasattr(value, "text"):
+            try:
+                text_value = getattr(value, "text")
+                return self._metadata_value_to_text(text_value)
+            except Exception:
+                pass
+
+        if isinstance(value, bytes):
+            try:
+                return value.decode("utf-8", "ignore").strip()
+            except Exception:
+                return ""
+
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return ""
+            first_value = value[0]
+            if isinstance(first_value, tuple) and first_value:
+                first_value = first_value[0]
+            return self._metadata_value_to_text(first_value)
+
+        text = str(value).strip()
+        return text
+
+    def _extract_track_number(self, raw_value) -> str | None:
+        text = self._metadata_value_to_text(raw_value)
+        if not text:
+            return None
+
+        primary = text.split("/", 1)[0].strip()
+        match = re.search(r"\d+", primary or text)
+        if not match:
+            return None
+        return match.group(0)
+
+    def _format_track_number(self, track_number: str) -> str:
+        parsed = self._extract_track_number(track_number)
+        if not parsed:
+            return track_number
+        try:
+            return f"{int(parsed):02d}"
+        except Exception:
+            return parsed
+
+    def _extract_track_title(self, raw_value) -> str | None:
+        text = self._metadata_value_to_text(raw_value)
+        if not text:
+            return None
+        collapsed = " ".join(text.split()).strip()
+        return collapsed or None
+
+    def _safe_filename_component(self, name: str) -> str:
+        cleaned = name.strip()
+        cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", cleaned)
+        if os.path.sep:
+            cleaned = cleaned.replace(os.path.sep, "_")
+        if os.path.altsep:
+            cleaned = cleaned.replace(os.path.altsep, "_")
+        cleaned = " ".join(cleaned.split()).strip()
+        return cleaned
+
+    def _track_metadata_for_file(self, file_path: Path) -> tuple[str | None, str | None, bool]:
+        if mutagen is None:
+            return None, None, False
+
+        result: dict[str, object] = {
+            "track_number": None,
+            "track_title": None,
+        }
+
+        def _read_metadata() -> None:
+            track_raw = None
+            title_raw = None
+
+            try:
+                audio_easy = mutagen.File(file_path, easy=True)
+            except Exception:
+                audio_easy = None
+
+            easy_tags = getattr(audio_easy, "tags", None) if audio_easy else None
+            if easy_tags:
+                track_values = easy_tags.get("tracknumber")
+                title_values = easy_tags.get("title")
+                if track_values:
+                    track_raw = track_values[0]
+                if title_values:
+                    title_raw = title_values[0]
+
+            # Only fall back to full tag parsing when easy tags are missing fields.
+            if track_raw is None or title_raw is None:
+                try:
+                    audio_full = mutagen.File(file_path)
+                except Exception:
+                    audio_full = None
+
+                full_tags = getattr(audio_full, "tags", None) if audio_full else None
+                if full_tags:
+                    if track_raw is None:
+                        track_raw = (
+                            full_tags.get("TRCK")
+                            or full_tags.get("tracknumber")
+                            or full_tags.get("TRACKNUMBER")
+                            or full_tags.get("trkn")
+                        )
+                    if title_raw is None:
+                        title_raw = (
+                            full_tags.get("TIT2")
+                            or full_tags.get("title")
+                            or full_tags.get("TITLE")
+                            or full_tags.get("\xa9nam")
+                        )
+
+            result["track_number"] = self._extract_track_number(track_raw)
+            result["track_title"] = self._extract_track_title(title_raw)
+
+        worker = threading.Thread(target=_read_metadata, daemon=True)
+        worker.start()
+        worker.join(timeout=3.0)
+        if worker.is_alive():
+            return None, None, True
+
+        return (
+            result.get("track_number") if isinstance(result.get("track_number"), str) else None,
+            result.get("track_title") if isinstance(result.get("track_title"), str) else None,
+            False,
+        )
+
+    def scan_file_rename_suggestions(self) -> None:
+        if mutagen is None:
+            self._set_file_rename_idle("Mutagen unavailable; metadata rename scan cannot run.")
+            QMessageBox.warning(
+                self,
+                "Metadata Unavailable",
+                "Mutagen is required to read track metadata for rename suggestions.",
+            )
+            return
+
+        target = self.path_input.text().strip()
+        if not target:
+            self._set_file_rename_idle("Choose a target before scanning rename suggestions.")
+            QMessageBox.information(
+                self,
+                "No Target",
+                "Choose a folder or drive before scanning rename suggestions.",
+            )
+            return
+
+        target_path = Path(target).expanduser()
+        if not target_path.exists() or not target_path.is_dir():
+            self._set_file_rename_idle("Target path is invalid.")
+            QMessageBox.warning(
+                self,
+                "Invalid Target",
+                "The selected target path is not a valid folder.",
+            )
+            return
+
+        resolved_target = target_path.resolve()
+        _preset = str(self.file_rename_preset_combo.currentData() or "trackno_trackname")
+
+        suggestions: list[tuple[Path, Path, str, str, str]] = []
+        scanned_audio = 0
+        missing_metadata = 0
+        metadata_timeouts = 0
+        already_matching = 0
+        canceled = False
+        audio_files: list[Path] = []
+
+        progress = QProgressDialog("Discovering audio files...", "Cancel", 0, 0, self)
+        progress.setWindowTitle("File Rename")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+
+        for root_dir, _dir_names, file_names in os.walk(str(resolved_target)):
+            for file_name in file_names:
+                if file_name.startswith("."):
+                    continue
+
+                file_path = Path(root_dir) / file_name
+                if file_path.suffix.lower() not in AUDIO_FILE_EXTENSIONS:
+                    continue
+
+                audio_files.append(file_path)
+
+                if len(audio_files) % 50 == 0:
+                    progress.setLabelText(
+                        f"Discovering audio files... {len(audio_files)} found"
+                    )
+                    QApplication.processEvents()
+                    if progress.wasCanceled():
+                        canceled = True
+                        break
+
+            if canceled:
+                break
+
+        if canceled:
+            progress.close()
+            self.file_rename_summary_label.setText("Rename suggestion scan cancelled.")
+            return
+
+        total_audio_files = len(audio_files)
+        progress.setRange(0, max(total_audio_files, 1))
+        progress.setValue(0)
+
+        if total_audio_files == 0:
+            progress.close()
+            self.file_rename_table.setRowCount(0)
+            self.file_rename_apply_btn.setEnabled(False)
+            self._file_rename_scan_target = str(resolved_target)
+            self.file_rename_summary_label.setText("No audio files found in target.")
+            self.statusBar().showMessage("No audio files found for rename scan", 4000)
+            return
+
+        for index, file_path in enumerate(audio_files, start=1):
+            scanned_audio += 1
+            progress.setValue(index)
+
+            progress.setLabelText(
+                f"Scanning rename suggestions... {index}/{total_audio_files}: {file_path.name}"
+            )
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                canceled = True
+                break
+
+            track_no, track_title, timed_out = self._track_metadata_for_file(file_path)
+            if timed_out:
+                metadata_timeouts += 1
+                missing_metadata += 1
+                continue
+            if not track_no or not track_title:
+                missing_metadata += 1
+                continue
+
+            safe_title = self._safe_filename_component(track_title)
+            if not safe_title:
+                missing_metadata += 1
+                continue
+
+            formatted_track_no = self._format_track_number(track_no)
+            suggested_name = f"{formatted_track_no}. {safe_title}{file_path.suffix}"
+            if suggested_name == file_path.name:
+                already_matching += 1
+                continue
+
+            suggested_path = file_path.with_name(suggested_name)
+            suggestions.append(
+                (file_path, suggested_path, formatted_track_no, safe_title, "Name differs from preset")
+            )
+
+        progress.close()
+
+        if canceled:
+            self.file_rename_summary_label.setText("Rename suggestion scan cancelled.")
+            return
+
+        target_counts: dict[str, int] = {}
+        for _source_path, target_path_item, _track_no, _title, _reason in suggestions:
+            key = str(target_path_item).lower()
+            target_counts[key] = target_counts.get(key, 0) + 1
+
+        self.file_rename_table.setUpdatesEnabled(False)
+        try:
+            self.file_rename_table.setRowCount(len(suggestions))
+            for row_index, (source_path, target_path_item, track_no, track_title, base_reason) in enumerate(suggestions):
+                conflict_reason = ""
+                key = str(target_path_item).lower()
+                if target_counts.get(key, 0) > 1:
+                    conflict_reason = "Duplicate suggested target name"
+                elif target_path_item.exists() and target_path_item != source_path:
+                    conflict_reason = "Target name already exists"
+
+                reason_text = conflict_reason or base_reason
+
+                try:
+                    current_rel = source_path.relative_to(resolved_target).as_posix()
+                except Exception:
+                    current_rel = str(source_path)
+
+                try:
+                    suggested_rel = target_path_item.relative_to(resolved_target).as_posix()
+                except Exception:
+                    suggested_rel = str(target_path_item)
+
+                check_item = QTableWidgetItem()
+                check_item.setFlags(
+                    Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
+                )
+                if reason_text == "Target name already exists":
+                    check_item.setCheckState(Qt.Unchecked)
+                else:
+                    check_item.setCheckState(Qt.Checked)
+                check_item.setData(Qt.UserRole, (str(source_path), str(target_path_item)))
+
+                self.file_rename_table.setItem(row_index, 0, check_item)
+                self.file_rename_table.setItem(row_index, 1, QTableWidgetItem(current_rel))
+                self.file_rename_table.setItem(row_index, 2, QTableWidgetItem(suggested_rel))
+                self.file_rename_table.setItem(row_index, 3, QTableWidgetItem(track_no))
+                self.file_rename_table.setItem(row_index, 4, QTableWidgetItem(track_title))
+                self.file_rename_table.setItem(row_index, 5, QTableWidgetItem(reason_text))
+
+                if conflict_reason:
+                    reason_item = self.file_rename_table.item(row_index, 5)
+                    if reason_item is not None:
+                        reason_item.setBackground(QColor("#7A5E2C"))
+                        reason_item.setForeground(QColor("#FFF9E6"))
+        finally:
+            self.file_rename_table.setUpdatesEnabled(True)
+            self.file_rename_table.viewport().update()
+
+        self._file_rename_scan_target = str(resolved_target)
+        self.file_rename_apply_btn.setEnabled(len(suggestions) > 0)
+        self.file_rename_summary_label.setText(
+            f"Audio scanned: {scanned_audio} | Suggestions: {len(suggestions)} | "
+            f"Already matching: {already_matching} | Missing metadata: {missing_metadata} | "
+            f"Timed out: {metadata_timeouts}"
+        )
+        self.statusBar().showMessage("File rename suggestion scan completed", 4000)
+
+    def rename_selected_files(self) -> None:
+        if self._file_rename_scan_target is None or self.file_rename_table.rowCount() == 0:
+            QMessageBox.information(
+                self,
+                "No Suggestions",
+                "Scan rename suggestions before renaming files.",
+            )
+            return
+
+        target = self.path_input.text().strip()
+        try:
+            current_target = str(Path(target).expanduser().resolve())
+        except Exception:
+            current_target = ""
+
+        if current_target != self._file_rename_scan_target:
+            QMessageBox.information(
+                self,
+                "Target Changed",
+                "The target path changed since the last rename scan. Run Scan Rename Suggestions again.",
+            )
+            return
+
+        rename_pairs: list[tuple[Path, Path]] = []
+        for row in range(self.file_rename_table.rowCount()):
+            check_item = self.file_rename_table.item(row, 0)
+            if check_item is None or check_item.checkState() != Qt.Checked:
+                continue
+
+            pair_data = check_item.data(Qt.UserRole)
+            if not isinstance(pair_data, tuple) or len(pair_data) != 2:
+                continue
+
+            src, dst = pair_data
+            rename_pairs.append((Path(src), Path(dst)))
+
+        if not rename_pairs:
+            QMessageBox.information(
+                self,
+                "Nothing Selected",
+                "Select one or more suggested renames to apply.",
+            )
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Rename",
+            f"Rename {len(rename_pairs)} selected file(s)?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        progress = QProgressDialog("Renaming selected files...", "Cancel", 0, len(rename_pairs), self)
+        progress.setWindowTitle("File Rename")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setValue(0)
+
+        renamed = 0
+        lrc_renamed = 0
+        failed: list[tuple[str, str]] = []
+
+        for index, (source_path, target_path_item) in enumerate(rename_pairs, start=1):
+            if progress.wasCanceled():
+                break
+
+            progress.setLabelText(f"Renaming {index}/{len(rename_pairs)}: {source_path.name}")
+
+            if not source_path.exists():
+                failed.append((str(source_path), "Source file no longer exists"))
+            elif target_path_item.exists() and target_path_item != source_path:
+                failed.append((str(source_path), "Target name already exists"))
+            else:
+                source_lrc_path = source_path.with_suffix(".lrc")
+                target_lrc_path = target_path_item.with_suffix(".lrc")
+
+                if (
+                    source_lrc_path.exists()
+                    and target_lrc_path.exists()
+                    and target_lrc_path != source_lrc_path
+                ):
+                    failed.append((str(source_path), "Matching .lrc target already exists"))
+                    progress.setValue(index)
+                    QApplication.processEvents()
+                    continue
+
+                try:
+                    source_path.rename(target_path_item)
+
+                    if source_lrc_path.exists() and target_lrc_path != source_lrc_path:
+                        try:
+                            source_lrc_path.rename(target_lrc_path)
+                            lrc_renamed += 1
+                        except Exception as lrc_exc:
+                            rollback_reason = ""
+                            try:
+                                target_path_item.rename(source_path)
+                            except Exception as rollback_exc:
+                                rollback_reason = f"; rollback failed: {rollback_exc}"
+
+                            failed.append(
+                                (
+                                    str(source_path),
+                                    f"Renamed audio file but failed to rename matching .lrc: {lrc_exc}{rollback_reason}",
+                                )
+                            )
+                            progress.setValue(index)
+                            QApplication.processEvents()
+                            continue
+
+                    self._purge_cached_album_art_for_path(source_path)
+                    self._purge_cached_album_art_for_path(target_path_item)
+                    renamed += 1
+                except Exception as exc:
+                    failed.append((str(source_path), str(exc)))
+
+            progress.setValue(index)
+            QApplication.processEvents()
+
+        canceled = progress.wasCanceled()
+        progress.close()
+
+        failed_count = len(failed)
+        message_lines = [
+            f"Renamed files: {renamed}",
+            f"Renamed matching .lrc files: {lrc_renamed}",
+            f"Failed renames: {failed_count}",
+        ]
+        if canceled:
+            message_lines.append("Operation cancelled before all selected files were processed.")
+        if failed:
+            preview = "\n".join(
+                f"- {Path(path).name}: {reason}" for path, reason in failed[:5]
+            )
+            message_lines.append("\nSample failures:\n" + preview)
+
+        if failed_count:
+            QMessageBox.warning(self, "Rename Completed With Errors", "\n".join(message_lines))
+        else:
+            QMessageBox.information(self, "Rename Completed", "\n".join(message_lines))
+
+        self.scan_file_rename_suggestions()
+
+    def _cleanup_category_for_file(self, file_name: str, extension: str) -> str:
+        if file_name.startswith("."):
+            return "Hidden"
+        if extension in AUDIO_FILE_EXTENSIONS:
+            return "Audio"
+        if extension in IMAGE_FILE_EXTENSIONS:
+            return "Image"
+        if extension in VIDEO_FILE_EXTENSIONS:
+            return "Video"
+        if extension in DOCUMENT_FILE_EXTENSIONS:
+            return "Document"
+        if extension in ARCHIVE_FILE_EXTENSIONS:
+            return "Archive"
+        if extension in PLAYLIST_FILE_EXTENSIONS:
+            return "Playlist"
+        if extension in SUBTITLE_FILE_EXTENSIONS:
+            return "Subtitle"
+        if extension in EXECUTABLE_FILE_EXTENSIONS:
+            return "Executable"
+        return "Other"
+
+    def _cleanup_file_type_label(self, file_name: str, extension: str, category: str) -> str:
+        if category == "Hidden":
+            lowered = file_name.lower()
+            if lowered.startswith("._") and extension:
+                return f"._*{extension} (macOS sidecar)"
+            return file_name
+        if extension:
+            return extension
+        return "(no extension)"
+
+    def scan_file_cleanup_breakdown(self) -> None:
+        target = self.path_input.text().strip()
+        if not target:
+            self._set_cleanup_idle("Choose a target before scanning file types.")
+            QMessageBox.information(self, "No Target", "Choose a folder or drive before scanning file types.")
+            return
+
+        target_path = Path(target).expanduser()
+        if not target_path.exists() or not target_path.is_dir():
+            self._set_cleanup_idle("Target path is invalid.")
+            QMessageBox.warning(self, "Invalid Target", "The selected target path is not a valid folder.")
+            return
+
+        resolved_target = str(target_path.resolve())
+        progress = QProgressDialog("Scanning file types...", "Cancel", 0, 0, self)
+        progress.setWindowTitle("File Cleanup Scan")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+
+        stats_by_type: dict[str, dict[str, object]] = {}
+        files_by_type: dict[str, list[Path]] = {}
+        category_order = {category: index for index, category in enumerate(FILE_CLEANUP_CATEGORY_ORDER)}
+
+        scanned_files = 0
+        canceled = False
+        for root_dir, _dir_names, file_names in os.walk(resolved_target):
+            for file_name in file_names:
+                file_path = Path(root_dir) / file_name
+                extension = file_path.suffix.lower()
+                category = self._cleanup_category_for_file(file_name.lower(), extension)
+                file_type_label = self._cleanup_file_type_label(file_name, extension, category)
+                row_key = f"{category}|{file_type_label.lower()}"
+
+                try:
+                    file_size = file_path.stat().st_size
+                except Exception:
+                    file_size = 0
+
+                type_stats = stats_by_type.get(row_key)
+                if type_stats is None:
+                    type_stats = {
+                        "file_type": file_type_label,
+                        "type": category,
+                        "count": 0,
+                        "bytes": 0,
+                    }
+                    stats_by_type[row_key] = type_stats
+                    files_by_type[row_key] = []
+
+                type_stats["count"] = int(type_stats["count"]) + 1
+                type_stats["bytes"] = int(type_stats["bytes"]) + int(file_size)
+                files_by_type[row_key].append(file_path)
+
+                scanned_files += 1
+                if scanned_files % 400 == 0:
+                    progress.setLabelText(f"Scanning file types... {scanned_files} files")
+                    QApplication.processEvents()
+                    if progress.wasCanceled():
+                        canceled = True
+                        break
+
+            if canceled:
+                break
+
+        progress.close()
+        if canceled:
+            self.cleanup_summary_label.setText("File type scan cancelled.")
+            return
+
+        sorted_keys = sorted(
+            stats_by_type.keys(),
+            key=lambda key: (
+                category_order.get(str(stats_by_type[key]["type"]), 999),
+                str(stats_by_type[key]["file_type"]).lower(),
+            ),
+        )
+
+        self.cleanup_table.setUpdatesEnabled(False)
+        try:
+            self.cleanup_table.setRowCount(len(sorted_keys))
+            for row, row_key in enumerate(sorted_keys):
+                type_stats = stats_by_type[row_key]
+                count = int(type_stats["count"])
+                size_bytes = int(type_stats["bytes"])
+                file_type_text = str(type_stats["file_type"])
+                type_text = str(type_stats["type"])
+
+                check_item = QTableWidgetItem()
+                check_item.setFlags(
+                    Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
+                )
+                check_item.setCheckState(Qt.Unchecked)
+                check_item.setData(Qt.UserRole, row_key)
+
+                file_type_item = QTableWidgetItem(file_type_text)
+                if type_text == "Hidden":
+                    hidden_tip = (
+                        "Hidden files are not shown in Finder by default. "
+                        "Press Cmd+Shift+. to toggle hidden files."
+                    )
+                    if "macos sidecar" in file_type_text.lower():
+                        hidden_tip = (
+                            "These are macOS sidecar metadata files (._*). "
+                            "Finder usually hides them. Press Cmd+Shift+. to show hidden files."
+                        )
+                    file_type_item.setToolTip(hidden_tip)
+
+                self.cleanup_table.setItem(row, 0, check_item)
+                self.cleanup_table.setItem(row, 1, file_type_item)
+                self.cleanup_table.setItem(row, 2, QTableWidgetItem(type_text))
+                self.cleanup_table.setItem(row, 3, QTableWidgetItem(str(count)))
+                self.cleanup_table.setItem(row, 4, QTableWidgetItem(format_bytes(size_bytes)))
+        finally:
+            self.cleanup_table.setUpdatesEnabled(True)
+            self.cleanup_table.viewport().update()
+
+        self._cleanup_scan_target = resolved_target
+        self._cleanup_type_files = files_by_type
+
+        total_bytes = sum(int(stats_by_type[key]["bytes"]) for key in sorted_keys)
+        total_files = sum(int(stats_by_type[key]["count"]) for key in sorted_keys)
+        found_types = len(sorted_keys)
+        self.cleanup_summary_label.setText(
+            f"Scanned {total_files} files across {found_types} found file types | Total size: {format_bytes(total_bytes)}"
+        )
+        self.cleanup_remove_btn.setEnabled(total_files > 0)
+        self.statusBar().showMessage("File cleanup scan completed", 4000)
+
+    def remove_selected_file_types(self) -> None:
+        if not self._cleanup_scan_target or not self._cleanup_type_files:
+            QMessageBox.information(self, "No Scan Data", "Scan file types before removing categories.")
+            return
+
+        target = self.path_input.text().strip()
+        try:
+            current_target = str(Path(target).expanduser().resolve())
+        except Exception:
+            current_target = ""
+
+        if current_target != self._cleanup_scan_target:
+            QMessageBox.information(
+                self,
+                "Target Changed",
+                "The target path changed since the last cleanup scan. Run Scan File Types again.",
+            )
+            return
+
+        selected_type_keys: list[str] = []
+        selected_labels: list[str] = []
+        for row in range(self.cleanup_table.rowCount()):
+            check_item = self.cleanup_table.item(row, 0)
+            file_type_item = self.cleanup_table.item(row, 1)
+            category_item = self.cleanup_table.item(row, 2)
+            count_item = self.cleanup_table.item(row, 3)
+            if not check_item or not file_type_item or not category_item or not count_item:
+                continue
+            if check_item.flags() & Qt.ItemIsUserCheckable and check_item.checkState() == Qt.Checked:
+                if int(count_item.text() or "0") > 0:
+                    row_key = check_item.data(Qt.UserRole)
+                    if isinstance(row_key, str) and row_key:
+                        selected_type_keys.append(row_key)
+                        selected_labels.append(f"{category_item.text()} ({file_type_item.text()})")
+
+        if not selected_type_keys:
+            QMessageBox.information(self, "Nothing Selected", "Select one or more file types to remove.")
+            return
+
+        files_to_remove: list[Path] = []
+        for row_key in selected_type_keys:
+            files_to_remove.extend(self._cleanup_type_files.get(row_key, []))
+
+        if not files_to_remove:
+            QMessageBox.information(self, "Nothing To Remove", "No files found for selected file types.")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm File Removal",
+            f"Remove {len(files_to_remove)} files from selected types: {', '.join(selected_labels)}?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        progress = QProgressDialog("Removing selected file types...", "Cancel", 0, len(files_to_remove), self)
+        progress.setWindowTitle("File Cleanup")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setValue(0)
+
+        removed = 0
+        failed: list[tuple[str, str]] = []
+        for index, file_path in enumerate(files_to_remove, start=1):
+            if progress.wasCanceled():
+                break
+
+            progress.setLabelText(f"Removing {index}/{len(files_to_remove)}: {file_path.name}")
+            try:
+                file_path.unlink()
+                removed += 1
+            except Exception as exc:
+                failed.append((str(file_path), str(exc)))
+
+            progress.setValue(index)
+            QApplication.processEvents()
+
+        canceled = progress.wasCanceled()
+        progress.close()
+
+        failed_count = len(failed)
+        message_lines = [
+            f"Removed files: {removed}",
+            f"Failed removals: {failed_count}",
+        ]
+        if canceled:
+            message_lines.append("Operation cancelled before all files were processed.")
+        if failed:
+            preview = "\n".join(
+                f"- {Path(path).name}: {reason}" for path, reason in failed[:5]
+            )
+            message_lines.append("\nSample failures:\n" + preview)
+
+        if failed_count:
+            QMessageBox.warning(self, "Cleanup Completed With Errors", "\n".join(message_lines))
+        else:
+            QMessageBox.information(self, "Cleanup Completed", "\n".join(message_lines))
+
+        self.scan_file_cleanup_breakdown()
+
+    def refresh_directory_browser(self, target: str) -> None:
+        self._pending_dir_size_scan_target = None
+        self._cancel_directory_size_scan()
+        self.browser_proxy_model.set_directory_sizes_enabled(False)
+        self._dir_size_scan_target = None
+
+        if not target or not os.path.exists(target):
+            self.browser_root_label.setText("Root: no valid target selected")
+            self.browser_tree.setEnabled(False)
+            self.browser_proxy_model.clear_size_cache()
+            self.browser_proxy_model.invalidate()
+            self.browser_size_progress.hide()
+            self.browser_tree.setRootIndex(QModelIndex())
+            self._populate_file_properties([])
+            self._set_album_art_preview(None, "")
+            self.file_props_hint.setText("Select an audio file to view details.")
+            self._set_embedded_lyrics_text("Select an audio file to view embedded lyrics.", "")
+            self._show_audio_details_panel()
+            self._reset_album_art_results()
+            return
+
+        resolved = str(Path(target).expanduser().resolve())
+        self.browser_proxy_model.clear_size_cache()
+        self.browser_proxy_model.invalidate()
+        source_index = self.browser_model.setRootPath(resolved)
+        proxy_index = self.browser_proxy_model.mapFromSource(source_index)
+        self.browser_tree.setRootIndex(proxy_index)
+        self.browser_root_label.setText(f"Root: {resolved}")
+        self.browser_tree.setEnabled(True)
+        self.browser_size_progress.hide()
+        self._populate_file_properties([])
+        self._set_album_art_preview(None, "")
+        self.file_props_hint.setText("Select an audio file to view details.")
+        self._set_embedded_lyrics_text("Select an audio file to view embedded lyrics.", "")
+        self._show_audio_details_panel()
+        self._reset_album_art_results()
+
+        if self._directory_scan_armed and self.tabs.currentIndex() == self._directory_tab_index:
+            self._start_directory_size_scan(resolved)
+
+    @Slot(int)
+    def on_tab_changed(self, index: int) -> None:
+        self._update_help_for_tab(index)
+
+        if index != self._directory_tab_index:
+            return
+
+        selected_target = self._selected_target_directory_path() or self._selected_drive_path()
+        if selected_target is None:
+            QMessageBox.information(
+                self,
+                "Select Target First",
+                "Please select a removable drive or choose a valid folder before using Directory Browser.",
+            )
+            self.browser_root_label.setText("Root: choose a valid target first")
+            self.browser_tree.setEnabled(False)
+            self.browser_size_progress.hide()
+            if self._about_tab_index >= 0:
+                self.tabs.setCurrentIndex(self._about_tab_index)
+            return
+
+        self._directory_scan_armed = True
+
+        self.path_input.setText(selected_target)
+        self._set_current_target_label(selected_target)
+        self.refresh_directory_browser(selected_target)
+
+    def _start_directory_size_scan(self, resolved_root: str) -> None:
+        if (
+            self._dir_size_scan_target == resolved_root
+            and self.browser_proxy_model.directory_sizes_enabled
+            and self.browser_proxy_model.has_directory_size_cache()
+        ):
+            return
+
+        if self._dir_size_scan_thread is not None and self._dir_size_scan_thread.isRunning():
+            if self._dir_size_scan_target == resolved_root:
+                return
+            self._pending_dir_size_scan_target = resolved_root
+            self._cancel_directory_size_scan()
+            self.browser_size_progress.setRange(0, 1)
+            self.browser_size_progress.setValue(0)
+            self.browser_size_progress.setFormat("Switching folder size scan target...")
+            return
+
+        self.browser_proxy_model.set_directory_sizes_enabled(True)
+        self.browser_proxy_model.clear_size_cache()
+        self.browser_proxy_model.invalidate()
+
+        self.browser_size_progress.show()
+        self.browser_size_progress.setRange(0, 1)
+        self.browser_size_progress.setValue(0)
+        self.browser_size_progress.setFormat("Scanning folder sizes...")
+
+        self._dir_size_scan_target = resolved_root
+        self._dir_size_scan_thread = QThread(self)
+        self._dir_size_scan_worker = DirectorySizeScanWorker(resolved_root)
+        self._dir_size_scan_worker.moveToThread(self._dir_size_scan_thread)
+
+        self._dir_size_scan_thread.started.connect(self._dir_size_scan_worker.run)
+        self._dir_size_scan_worker.progress.connect(self._on_dir_size_scan_progress)
+        self._dir_size_scan_worker.finished.connect(self._on_dir_size_scan_finished)
+        self._dir_size_scan_worker.failed.connect(self._on_dir_size_scan_failed)
+        self._dir_size_scan_worker.cancelled.connect(self._on_dir_size_scan_cancelled)
+
+        self._dir_size_scan_worker.finished.connect(self._dir_size_scan_thread.quit)
+        self._dir_size_scan_worker.failed.connect(self._dir_size_scan_thread.quit)
+        self._dir_size_scan_worker.cancelled.connect(self._dir_size_scan_thread.quit)
+        self._dir_size_scan_thread.finished.connect(self._dir_size_scan_worker.deleteLater)
+        self._dir_size_scan_thread.finished.connect(self._dir_size_scan_thread.deleteLater)
+        self._dir_size_scan_thread.finished.connect(self._clear_dir_size_scan_refs)
+
+        self._dir_size_scan_thread.start()
+
+    def _cancel_directory_size_scan(self) -> None:
+        if self._dir_size_scan_worker is not None:
+            self._dir_size_scan_worker.request_cancel()
+
+    @Slot(int)
+    def _on_dir_size_scan_progress(self, scanned_dirs: int) -> None:
+        self.browser_size_progress.setValue((scanned_dirs // 250) % 2)
+        self.browser_size_progress.setFormat(f"Scanning folder sizes... {scanned_dirs} folders")
+
+    @Slot(str, dict)
+    def _on_dir_size_scan_finished(self, root_path: str, sizes: dict) -> None:
+        if root_path != self._dir_size_scan_target:
+            return
+
+        self.browser_proxy_model.set_directory_size_cache(sizes)
+        self.browser_proxy_model.set_directory_sizes_enabled(True)
+        self.browser_proxy_model.invalidate()
+
+        total_dirs = len(sizes)
+        self.browser_size_progress.setRange(0, 1)
+        self.browser_size_progress.setValue(1)
+        self.browser_size_progress.setFormat(f"Folder sizes ready ({total_dirs} folders)")
+        self.browser_size_progress.hide()
+        self.statusBar().showMessage(f"Folder size scan complete: {total_dirs} folders", 4000)
+
+    @Slot(str)
+    def _on_dir_size_scan_failed(self, error: str) -> None:
+        self.browser_proxy_model.set_directory_sizes_enabled(False)
+        self.browser_proxy_model.clear_size_cache()
+        self.browser_proxy_model.invalidate()
+        self.browser_size_progress.setRange(0, 1)
+        self.browser_size_progress.setValue(0)
+        self.browser_size_progress.setFormat("Folder size scan failed")
+        self.statusBar().showMessage(f"Folder size scan failed: {error}", 5000)
+
+    @Slot()
+    def _on_dir_size_scan_cancelled(self) -> None:
+        if self._pending_dir_size_scan_target is None:
+            self.browser_size_progress.setRange(0, 1)
+            self.browser_size_progress.setValue(0)
+            self.browser_size_progress.hide()
+
+    @Slot()
+    def _clear_dir_size_scan_refs(self) -> None:
+        self._dir_size_scan_worker = None
+        self._dir_size_scan_thread = None
+        pending_target = self._pending_dir_size_scan_target
+        self._pending_dir_size_scan_target = None
+        if pending_target:
+            self._start_directory_size_scan(pending_target)
+
+    def _browser_source_index(self, index):
+        if not index.isValid():
+            return index
+        if index.model() is self.browser_proxy_model:
+            return self.browser_proxy_model.mapToSource(index)
+        return index
+
+    def _reset_album_art_results(self) -> None:
+        self.album_art_summary_label.setText("No scan run yet.")
+        self.album_art_table.setRowCount(0)
+        self.album_art_progress.setRange(0, 1)
+        self.album_art_progress.setValue(0)
+        self.album_art_progress.setFormat("Idle")
+        self.album_art_fix_btn.setEnabled(False)
+        self._last_scan_target = None
+        self._last_incompatible_files = []
+
+    def _cached_embedded_album_art(
+        self,
+        file_path: Path,
+        stat_info: os.stat_result | None = None,
+    ) -> tuple[bytes | None, str]:
+        if stat_info is None:
+            stat_info = file_path.stat()
+
+        key = (str(file_path), stat_info.st_mtime_ns, stat_info.st_size)
+        cached = self._album_art_cache.get(key)
+        if cached is not None:
+            return cached
+
+        art = read_embedded_album_art(file_path)
+        self._album_art_cache[key] = art
+        self._album_art_cache.move_to_end(key)
+        if len(self._album_art_cache) > ALBUM_ART_CACHE_LIMIT:
+            self._album_art_cache.popitem(last=False)
+
+        return art
+
+    def _purge_cached_album_art_for_path(self, file_path: Path) -> None:
+        file_key = str(file_path)
+        stale_keys = [key for key in self._album_art_cache if key[0] == file_key]
+        for key in stale_keys:
+            self._album_art_cache.pop(key, None)
+
+    def _fix_album_art_core(self, file_path: Path) -> tuple[bool, str]:
+        try:
+            stat_info = file_path.stat()
+            art_bytes, art_mime = self._cached_embedded_album_art(file_path, stat_info)
+        except Exception as exc:
+            return False, f"Unable to read embedded art: {exc}"
+
+        if not art_bytes:
+            return False, "No embedded art"
+
+        if art_mime.lower() == "image/jpeg" and jpeg_scan_type(art_bytes) == "Non-progressive":
+            return True, "Already compatible"
+
+        converted_jpeg = to_non_progressive_jpeg(art_bytes)
+        if not converted_jpeg:
+            return False, "Unable to convert embedded art to JPEG"
+
+        ok, detail = write_embedded_album_art(file_path, converted_jpeg)
+        if not ok:
+            return False, detail
+
+        self._purge_cached_album_art_for_path(file_path)
+        try:
+            verified_stat = file_path.stat()
+            verified_art, verified_mime = self._cached_embedded_album_art(file_path, verified_stat)
+        except Exception as exc:
+            return False, f"Unable to verify file: {exc}"
+
+        compatible = (
+            bool(verified_art)
+            and verified_mime.lower() == "image/jpeg"
+            and jpeg_scan_type(verified_art) == "Non-progressive"
+        )
+        if not compatible:
+            return False, "Artwork was written but did not verify as JPEG non-progressive"
+
+        return True, "Fixed"
+
+    def on_browser_context_menu(self, pos) -> None:
+        index = self.browser_tree.indexAt(pos)
+        if not index.isValid():
+            return
+
+        self.browser_tree.setCurrentIndex(index)
+
+        source_index = self._browser_source_index(index)
+        path = self.browser_model.filePath(source_index)
+        is_dir = self.browser_model.isDir(source_index)
+        suffix = Path(path).suffix.lower()
+        is_audio_file = (
+            not is_dir
+            and suffix in AUDIO_FILE_EXTENSIONS
+        )
+
+        menu = QMenu(self.browser_tree)
+        rename_action = menu.addAction("Rename")
+        add_art_action = None
+        fix_action = None
+        lookup_add_lyrics_action = None
+        if is_audio_file:
+            add_art_action = menu.addAction("Add Album Art")
+            fix_action = menu.addAction("Fix Album Art")
+            lookup_add_lyrics_action = menu.addAction("Lookup/Add Lyrics")
+
+        selected_action = menu.exec(self.browser_tree.viewport().mapToGlobal(pos))
+        if selected_action == rename_action:
+            self.rename_browser_item(path)
+        if add_art_action is not None and selected_action == add_art_action:
+            self.add_album_art_for_file(path)
+        if fix_action is not None and selected_action == fix_action:
+            self.fix_album_art_for_file(path)
+        if lookup_add_lyrics_action is not None and selected_action == lookup_add_lyrics_action:
+            self.lookup_and_add_lyrics_for_file(path)
+
+    def rename_browser_item(self, path: str) -> None:
+        target_path = Path(path)
+        if not target_path.exists():
+            QMessageBox.warning(self, "Invalid Selection", "The selected item is not available.")
+            return
+
+        new_name, accepted = QInputDialog.getText(
+            self,
+            "Rename",
+            "New name:",
+            QLineEdit.Normal,
+            target_path.name,
+        )
+        if not accepted:
+            return
+
+        normalized_name = new_name.strip()
+        if not normalized_name:
+            QMessageBox.warning(self, "Invalid Name", "File name cannot be empty.")
+            return
+
+        if normalized_name in {".", ".."}:
+            QMessageBox.warning(self, "Invalid Name", "File name is not valid.")
+            return
+
+        if os.path.sep in normalized_name or (os.path.altsep and os.path.altsep in normalized_name):
+            QMessageBox.warning(self, "Invalid Name", "File name cannot include path separators.")
+            return
+
+        if target_path.is_file() and Path(normalized_name).suffix == "":
+            normalized_name = f"{normalized_name}{target_path.suffix}"
+
+        new_path = target_path.with_name(normalized_name)
+        if new_path == target_path:
+            return
+
+        if new_path.exists():
+            QMessageBox.warning(self, "Name In Use", "A file with that name already exists.")
+            return
+
+        try:
+            target_path.rename(new_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Rename Failed", f"Unable to rename item:\n{exc}")
+            return
+
+        self._purge_cached_album_art_for_path(target_path)
+        self._purge_cached_album_art_for_path(new_path)
+        self.statusBar().showMessage(f"Renamed: {target_path.name} -> {new_path.name}", 5000)
+
+        new_source_index = self.browser_model.index(str(new_path))
+        if not new_source_index.isValid():
+            return
+
+        new_proxy_index = self.browser_proxy_model.mapFromSource(new_source_index)
+        if not new_proxy_index.isValid():
+            return
+
+        self.browser_tree.setCurrentIndex(new_proxy_index)
+        self.browser_tree.scrollTo(new_proxy_index)
+        self.on_browser_item_clicked(new_proxy_index)
+
+    def fix_album_art_for_file(self, path: str) -> None:
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            QMessageBox.warning(
+                self,
+                "Scan In Progress",
+                "Wait for the current album art scan to complete before fixing a file.",
+            )
+            return
+
+        file_path = Path(path)
+        if not file_path.exists() or not file_path.is_file():
+            QMessageBox.warning(self, "Invalid File", "The selected file is not available.")
+            return
+
+        if file_path.suffix.lower() not in AUDIO_FILE_EXTENSIONS:
+            QMessageBox.information(self, "Not Audio", "Fix Album Art is only available for audio files.")
+            return
+
+        progress = QProgressDialog("Preparing fix...", "Cancel", 0, 6, self)
+        progress.setWindowTitle("Fix Album Art")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setValue(0)
+
+        def update_step(step: int, text: str) -> bool:
+            progress.setLabelText(text)
+            progress.setValue(step)
+            QApplication.processEvents()
+            return progress.wasCanceled()
+
+        if update_step(1, "Reading existing album art..."):
+            self.statusBar().showMessage("Album art fix cancelled")
+            return
+
+        try:
+            stat_info = file_path.stat()
+            art_bytes, art_mime = self._cached_embedded_album_art(file_path, stat_info)
+        except Exception as exc:
+            progress.close()
+            QMessageBox.warning(self, "Read Failed", f"Unable to read embedded art:\n{exc}")
+            return
+
+        if not art_bytes:
+            progress.close()
+            QMessageBox.information(self, "No Embedded Art", "The selected file has no embedded artwork.")
+            return
+
+        if art_mime.lower() == "image/jpeg" and jpeg_scan_type(art_bytes) == "Non-progressive":
+            progress.setValue(6)
+            QMessageBox.information(self, "Already Compatible", "Album art is already JPEG non-progressive.")
+            self.statusBar().showMessage("Album art is already compatible")
+            return
+
+        if update_step(2, "Converting artwork to JPEG..."):
+            self.statusBar().showMessage("Album art fix cancelled")
+            return
+
+        converted_jpeg = to_non_progressive_jpeg(art_bytes)
+        if not converted_jpeg:
+            progress.close()
+            QMessageBox.warning(
+                self,
+                "Conversion Failed",
+                "Unable to convert embedded art to JPEG.",
+            )
+            return
+
+        if update_step(3, "Writing updated artwork tags..."):
+            self.statusBar().showMessage("Album art fix cancelled")
+            return
+
+        ok, detail = write_embedded_album_art(file_path, converted_jpeg)
+        if not ok:
+            progress.close()
+            QMessageBox.warning(self, "Write Failed", detail)
+            return
+
+        if update_step(4, "Verifying compatibility..."):
+            self.statusBar().showMessage("Album art fix cancelled")
+            return
+
+        self._purge_cached_album_art_for_path(file_path)
+        try:
+            verified_stat = file_path.stat()
+            verified_art, verified_mime = self._cached_embedded_album_art(file_path, verified_stat)
+        except Exception as exc:
+            progress.close()
+            QMessageBox.warning(self, "Verification Failed", f"Unable to verify file:\n{exc}")
+            return
+
+        compatible = (
+            bool(verified_art)
+            and verified_mime.lower() == "image/jpeg"
+            and jpeg_scan_type(verified_art) == "Non-progressive"
+        )
+        if not compatible:
+            progress.close()
+            QMessageBox.warning(
+                self,
+                "Verification Failed",
+                "Artwork was written but did not verify as JPEG non-progressive.",
+            )
+            return
+
+        if update_step(5, "Refreshing file details..."):
+            self.statusBar().showMessage("Album art fix cancelled")
+            return
+
+        current_index = self.browser_tree.currentIndex()
+        current_source_index = self._browser_source_index(current_index)
+        if current_source_index.isValid() and self.browser_model.filePath(current_source_index) == str(file_path):
+            self.on_browser_item_clicked(current_index)
+
+        progress.setValue(6)
+        self.statusBar().showMessage(f"Album art fixed: {file_path.name}")
+        QMessageBox.information(
+            self,
+            "Album Art Fixed",
+            f"{file_path.name}\n\nArtwork is now JPEG and non-progressive.",
+        )
+
+    def add_album_art_for_file(self, path: str) -> None:
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            QMessageBox.warning(
+                self,
+                "Scan In Progress",
+                "Wait for the current album art scan to complete before adding artwork.",
+            )
+            return
+
+        file_path = Path(path)
+        if not file_path.exists() or not file_path.is_file():
+            QMessageBox.warning(self, "Invalid File", "The selected file is not available.")
+            return
+
+        if file_path.suffix.lower() not in AUDIO_FILE_EXTENSIONS:
+            QMessageBox.information(self, "Not Audio", "Add Album Art is only available for audio files.")
+            return
+
+        selected_image, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Choose Album Art Image",
+            str(file_path.parent),
+            "Images (*.jpg *.jpeg *.png *.webp *.bmp *.gif *.tif *.tiff *.heic *.heif)",
+        )
+        if not selected_image:
+            return
+
+        progress = QProgressDialog("Preparing artwork...", "Cancel", 0, 5, self)
+        progress.setWindowTitle("Add Album Art")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setValue(0)
+
+        def update_step(step: int, text: str) -> bool:
+            progress.setLabelText(text)
+            progress.setValue(step)
+            QApplication.processEvents()
+            return progress.wasCanceled()
+
+        if update_step(1, "Loading selected image..."):
+            self.statusBar().showMessage("Add album art cancelled")
+            return
+
+        image_path = Path(selected_image)
+        try:
+            source_image_bytes = image_path.read_bytes()
+        except Exception as exc:
+            progress.close()
+            QMessageBox.warning(self, "Read Failed", f"Unable to read selected image:\n{exc}")
+            return
+
+        if update_step(2, "Converting image to compatible JPEG..."):
+            self.statusBar().showMessage("Add album art cancelled")
+            return
+
+        converted_jpeg = to_non_progressive_jpeg(source_image_bytes)
+        if not converted_jpeg:
+            progress.close()
+            QMessageBox.warning(
+                self,
+                "Conversion Failed",
+                "Unable to convert selected image to JPEG.",
+            )
+            return
+
+        if update_step(3, "Writing embedded album art..."):
+            self.statusBar().showMessage("Add album art cancelled")
+            return
+
+        ok, detail = write_embedded_album_art(file_path, converted_jpeg)
+        if not ok:
+            progress.close()
+            QMessageBox.warning(self, "Write Failed", detail)
+            return
+
+        if update_step(4, "Verifying embedded artwork..."):
+            self.statusBar().showMessage("Add album art cancelled")
+            return
+
+        self._purge_cached_album_art_for_path(file_path)
+        try:
+            verified_stat = file_path.stat()
+            verified_art, verified_mime = self._cached_embedded_album_art(file_path, verified_stat)
+        except Exception as exc:
+            progress.close()
+            QMessageBox.warning(self, "Verification Failed", f"Unable to verify file:\n{exc}")
+            return
+
+        compatible = (
+            bool(verified_art)
+            and verified_mime.lower() == "image/jpeg"
+            and jpeg_scan_type(verified_art) == "Non-progressive"
+        )
+        if not compatible:
+            progress.close()
+            QMessageBox.warning(
+                self,
+                "Verification Failed",
+                "Artwork was written but did not verify as JPEG non-progressive.",
+            )
+            return
+
+        if update_step(5, "Refreshing file details..."):
+            self.statusBar().showMessage("Add album art cancelled")
+            return
+
+        current_index = self.browser_tree.currentIndex()
+        current_source_index = self._browser_source_index(current_index)
+        if current_source_index.isValid() and self.browser_model.filePath(current_source_index) == str(file_path):
+            self.on_browser_item_clicked(current_index)
+
+        self.statusBar().showMessage(f"Album art added: {file_path.name}", 5000)
+        QMessageBox.information(
+            self,
+            "Album Art Added",
+            f"{file_path.name}\n\nAlbum art has been embedded as JPEG non-progressive.",
+        )
+
+    def lookup_and_add_lyrics_for_file(self, path: str) -> None:
+        file_path = Path(path)
+        if not file_path.exists() or not file_path.is_file():
+            QMessageBox.warning(self, "Invalid File", "The selected file is not available.")
+            return
+
+        if file_path.suffix.lower() not in AUDIO_FILE_EXTENSIONS:
+            QMessageBox.information(self, "Not Audio", "Lookup/Add Lyrics is only available for audio files.")
+            return
+
+        progress = QProgressDialog("Preparing lyrics lookup...", "Cancel", 0, 3, self)
+        progress.setWindowTitle("Lookup/Add Lyrics")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setValue(0)
+
+        def update_step(step: int, text: str) -> bool:
+            progress.setLabelText(text)
+            progress.setValue(step)
+            QApplication.processEvents()
+            return progress.wasCanceled()
+
+        if update_step(1, "Reading file metadata..."):
+            self.statusBar().showMessage("Lookup/Add Lyrics cancelled", 3000)
+            return
+
+        metadata, metadata_error = self._lyrics_lookup_metadata_for_file(file_path)
+        if metadata_error:
+            progress.close()
+            QMessageBox.warning(
+                self,
+                "Metadata Read Failed",
+                f"Unable to read metadata for lyrics lookup:\n{metadata_error}",
+            )
+            return
+
+        title = str(metadata.get("title") or "").strip()
+        artist = str(metadata.get("artist") or "").strip()
+        album = str(metadata.get("album") or "").strip()
+        duration = int(metadata.get("duration") or 0)
+
+        if update_step(2, "Looking up lyrics in LRCLIB..."):
+            self.statusBar().showMessage("Lookup/Add Lyrics cancelled", 3000)
+            return
+
+        status, source, lyrics_text = self._lookup_lyrics_from_lrclib(
+            title=title,
+            artist=artist,
+            album=album,
+            duration=duration,
+        )
+
+        if status != "Found" or not lyrics_text.strip():
+            progress.close()
+            if status == "Not found":
+                QMessageBox.information(
+                    self,
+                    "Lyrics Not Found",
+                    (
+                        "No lyrics match found in LRCLIB for this file.\n\n"
+                        f"Track: {title or file_path.stem}\n"
+                        f"Artist: {artist or '(missing)'}\n"
+                        f"Album: {album or '(missing)'}"
+                    ),
+                )
+                return
+
+            if status == "Instrumental":
+                QMessageBox.information(
+                    self,
+                    "Instrumental Track",
+                    "LRCLIB reports this track as instrumental.",
+                )
+                return
+
+            QMessageBox.warning(
+                self,
+                "Lookup Failed",
+                f"Unable to find lyrics:\n{source}",
+            )
+            return
+
+        lrc_path = file_path.with_suffix(".lrc")
+        preview = self._lyrics_lookup_preview(lyrics_text)
+        overwrite_note = "Existing .lrc will be overwritten." if lrc_path.exists() else "A new .lrc file will be created."
+
+        confirm = QMessageBox.question(
+            self,
+            "Add Lyrics",
+            (
+                f"Found lyrics via {source}.\n\n"
+                f"Track: {title or file_path.stem}\n"
+                f"Artist: {artist or '(missing)'}\n"
+                f"Album: {album or '(missing)'}\n"
+                f"Preview: {preview or '(lyrics available)'}\n\n"
+                f"Output: {lrc_path.name}\n"
+                f"{overwrite_note}\n\n"
+                "Write lyrics now?"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if confirm != QMessageBox.Yes:
+            progress.close()
+            return
+
+        if update_step(3, "Writing .lrc file..."):
+            self.statusBar().showMessage("Lookup/Add Lyrics cancelled", 3000)
+            return
+
+        try:
+            output_text = lyrics_text if lyrics_text.endswith("\n") else lyrics_text + "\n"
+            lrc_path.write_text(output_text, encoding="utf-8")
+        except Exception as exc:
+            progress.close()
+            QMessageBox.warning(
+                self,
+                "Write Failed",
+                f"Unable to write .lrc file:\n{exc}",
+            )
+            return
+
+        progress.close()
+        self.statusBar().showMessage(f"Lyrics saved: {lrc_path.name}", 5000)
+        QMessageBox.information(
+            self,
+            "Lyrics Added",
+            f"Lyrics written to:\n{lrc_path}",
+        )
+
+    def scan_album_art_compatibility(self) -> None:
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            self.statusBar().showMessage("Album art scan is already running")
+            return
+
+        target = self.path_input.text().strip()
+        if not target:
+            self.album_art_summary_label.setText("Choose a global target before scanning.")
+            self.album_art_table.setRowCount(0)
+            self.album_art_progress.setRange(0, 1)
+            self.album_art_progress.setValue(0)
+            self.album_art_progress.setFormat("Idle")
+            return
+
+        target_path = Path(target).expanduser()
+        if not target_path.exists() or not target_path.is_dir():
+            self.album_art_summary_label.setText("Global target path is invalid.")
+            self.album_art_table.setRowCount(0)
+            self.album_art_progress.setRange(0, 1)
+            self.album_art_progress.setValue(0)
+            self.album_art_progress.setFormat("Idle")
+            return
+
+        self._last_scan_target = str(target_path.resolve())
+        self._last_incompatible_files = []
+        self.album_art_table.setRowCount(0)
+        self.album_art_summary_label.setText("Preparing scan...")
+        self.album_art_progress.setRange(0, 1)
+        self.album_art_progress.setValue(0)
+        self.album_art_progress.setFormat("Preparing scan...")
+        self.album_art_scan_btn.setEnabled(False)
+        self.album_art_fix_btn.setEnabled(False)
+        self._scan_thread = QThread(self)
+        self._scan_worker = AlbumArtScanWorker(target_path)
+        self._scan_worker.moveToThread(self._scan_thread)
+
+        self._scan_thread.started.connect(self._scan_worker.run)
+        self._scan_worker.progress.connect(self._on_album_art_scan_progress)
+        self._scan_worker.finished.connect(self._on_album_art_scan_finished)
+        self._scan_worker.failed.connect(self._on_album_art_scan_failed)
+
+        self._scan_worker.finished.connect(self._scan_thread.quit)
+        self._scan_worker.failed.connect(self._scan_thread.quit)
+        self._scan_thread.finished.connect(self._scan_worker.deleteLater)
+        self._scan_thread.finished.connect(self._scan_thread.deleteLater)
+        self._scan_thread.finished.connect(self._clear_scan_worker_refs)
+
+        self._scan_thread.start()
+
+    @Slot()
+    def _clear_scan_worker_refs(self) -> None:
+        self._scan_worker = None
+        self._scan_thread = None
+
+    @Slot(int, int, int, int, int)
+    def _on_album_art_scan_progress(
+        self,
+        scanned_audio: int,
+        total_audio: int,
+        compatible: int,
+        incompatible: int,
+        missing_artwork: int,
+    ) -> None:
+        total_for_ui = max(total_audio, 1)
+        self.album_art_progress.setRange(0, total_for_ui)
+        self.album_art_progress.setValue(min(scanned_audio, total_for_ui))
+
+        if total_audio > 0:
+            self.album_art_progress.setFormat(f"Scanning {scanned_audio}/{total_audio}")
+            self.album_art_summary_label.setText(
+                "Scanned audio files: "
+                f"{scanned_audio}/{total_audio} | Compatible: {compatible} | "
+                f"Incompatible: {incompatible} | Missing Artwork: {missing_artwork}"
+            )
+        else:
+            self.album_art_progress.setFormat("No audio files found")
+            self.album_art_summary_label.setText("No audio files found in target.")
+
+    @Slot(list, int, int, int, int)
+    def _on_album_art_scan_finished(
+        self,
+        rows: list[tuple[str, str, str, str, str]],
+        scanned_audio: int,
+        compatible: int,
+        incompatible: int,
+        missing_artwork: int,
+    ) -> None:
+        self.album_art_scan_btn.setEnabled(True)
+        self._last_incompatible_files = [
+            file_name for file_name, status, _progressive, _file_type, _resolution in rows if status == "Incompatible"
+        ]
+        self.album_art_fix_btn.setEnabled(True)
+
+        self.album_art_table.setUpdatesEnabled(False)
+        try:
+            self.album_art_table.setRowCount(len(rows))
+            for row_index, (file_name, status, progressive, file_type, resolution) in enumerate(rows):
+                self.album_art_table.setItem(row_index, 0, QTableWidgetItem(file_name))
+                self.album_art_table.setItem(row_index, 1, QTableWidgetItem(status))
+                self.album_art_table.setItem(row_index, 2, QTableWidgetItem(progressive))
+                self.album_art_table.setItem(row_index, 3, QTableWidgetItem(file_type))
+                self.album_art_table.setItem(row_index, 4, QTableWidgetItem(resolution))
+        finally:
+            self.album_art_table.setUpdatesEnabled(True)
+            self.album_art_table.viewport().update()
+
+        if scanned_audio == 0:
+            self.album_art_progress.setRange(0, 1)
+            self.album_art_progress.setValue(0)
+            self.album_art_progress.setFormat("Complete: no audio files found")
+            self.album_art_summary_label.setText("No audio files found in target.")
+        else:
+            self.album_art_progress.setRange(0, scanned_audio)
+            self.album_art_progress.setValue(scanned_audio)
+            self.album_art_progress.setFormat(
+                f"Complete: {compatible} compatible, {incompatible} incompatible, "
+                f"{missing_artwork} missing artwork"
+            )
+            self.album_art_summary_label.setText(
+                f"Scanned audio files: {scanned_audio} | Compatible: {compatible} | "
+                f"Incompatible: {incompatible} | Missing Artwork: {missing_artwork}"
+            )
+
+        self.statusBar().showMessage("Album art compatibility scan completed")
+
+    @Slot(str)
+    def _on_album_art_scan_failed(self, error: str) -> None:
+        self.album_art_scan_btn.setEnabled(True)
+        self.album_art_fix_btn.setEnabled(False)
+        self._last_incompatible_files = []
+        self.album_art_progress.setRange(0, 1)
+        self.album_art_progress.setValue(0)
+        self.album_art_progress.setFormat("Scan failed")
+        self.album_art_summary_label.setText(f"Album art scan failed: {error}")
+        self.statusBar().showMessage("Album art compatibility scan failed")
+
+    def scan_music_compatibility(self) -> None:
+        if (
+            self._music_compatibility_scan_thread is not None
+            and self._music_compatibility_scan_thread.isRunning()
+        ):
+            self.statusBar().showMessage("Music compatibility scan is already running")
+            return
+
+        target = self.path_input.text().strip()
+        if not target:
+            self.music_compatibility_summary_label.setText("Choose a target before scanning compatibility.")
+            self.music_compatibility_table.setRowCount(0)
+            self.music_compatibility_progress.setRange(0, 1)
+            self.music_compatibility_progress.setValue(0)
+            self.music_compatibility_progress.setFormat("Idle")
+            QMessageBox.information(
+                self,
+                "No Target",
+                "Choose a folder or drive before running music compatibility scan.",
+            )
+            return
+
+        target_path = Path(target).expanduser()
+        if not target_path.exists() or not target_path.is_dir():
+            self.music_compatibility_summary_label.setText("Target path is invalid.")
+            self.music_compatibility_table.setRowCount(0)
+            self.music_compatibility_progress.setRange(0, 1)
+            self.music_compatibility_progress.setValue(0)
+            self.music_compatibility_progress.setFormat("Idle")
+            QMessageBox.warning(
+                self,
+                "Invalid Target",
+                "The selected target path is not a valid folder.",
+            )
+            return
+
+        resolved_target = Path(target_path.resolve())
+        self.music_compatibility_table.setRowCount(0)
+        self.music_compatibility_summary_label.setText("Preparing compatibility scan...")
+        self.music_compatibility_progress.setRange(0, 1)
+        self.music_compatibility_progress.setValue(0)
+        self.music_compatibility_progress.setFormat("Preparing scan...")
+        self.music_compatibility_scan_btn.setEnabled(False)
+
+        self._music_compatibility_scan_thread = QThread(self)
+        self._music_compatibility_scan_worker = MusicCompatibilityScanWorker(resolved_target)
+        self._music_compatibility_scan_worker.moveToThread(self._music_compatibility_scan_thread)
+
+        self._music_compatibility_scan_thread.started.connect(self._music_compatibility_scan_worker.run)
+        self._music_compatibility_scan_worker.progress.connect(self._on_music_compatibility_scan_progress)
+        self._music_compatibility_scan_worker.finished.connect(self._on_music_compatibility_scan_finished)
+        self._music_compatibility_scan_worker.failed.connect(self._on_music_compatibility_scan_failed)
+
+        self._music_compatibility_scan_worker.finished.connect(self._music_compatibility_scan_thread.quit)
+        self._music_compatibility_scan_worker.failed.connect(self._music_compatibility_scan_thread.quit)
+        self._music_compatibility_scan_thread.finished.connect(
+            self._music_compatibility_scan_worker.deleteLater
+        )
+        self._music_compatibility_scan_thread.finished.connect(
+            self._music_compatibility_scan_thread.deleteLater
+        )
+        self._music_compatibility_scan_thread.finished.connect(self._clear_music_compatibility_scan_refs)
+
+        self._music_compatibility_scan_thread.start()
+
+    @Slot()
+    def _clear_music_compatibility_scan_refs(self) -> None:
+        self._music_compatibility_scan_worker = None
+        self._music_compatibility_scan_thread = None
+
+    @Slot(int, int, int, int, int, int)
+    def _on_music_compatibility_scan_progress(
+        self,
+        scanned: int,
+        total: int,
+        supported: int,
+        unsupported: int,
+        unknown: int,
+        skipped: int,
+    ) -> None:
+        total_for_ui = max(total, 1)
+        self.music_compatibility_progress.setRange(0, total_for_ui)
+        self.music_compatibility_progress.setValue(min(scanned, total_for_ui))
+
+        if total == 0:
+            self.music_compatibility_progress.setFormat("No files found")
+            self.music_compatibility_summary_label.setText("No files found in target.")
+            return
+
+        self.music_compatibility_progress.setFormat(f"Scanning {scanned}/{total}")
+        self.music_compatibility_summary_label.setText(
+            f"Scanned: {scanned}/{total} | Supported: {supported} | Unsupported: {unsupported} | "
+            f"Unknown: {unknown} | Skipped: {skipped}"
+        )
+
+    @Slot(str)
+    def _apply_music_compatibility_table_filter(self, query: str) -> None:
+        normalized_query = query.strip().lower()
+        filter_all = not normalized_query
+
+        for row in range(self.music_compatibility_table.rowCount()):
+            if filter_all:
+                self.music_compatibility_table.setRowHidden(row, False)
+                continue
+
+            row_matches = False
+            for col in range(self.music_compatibility_table.columnCount()):
+                item = self.music_compatibility_table.item(row, col)
+                if item is None:
+                    continue
+                if normalized_query in item.text().lower():
+                    row_matches = True
+                    break
+
+            self.music_compatibility_table.setRowHidden(row, not row_matches)
+
+    @Slot(list, int, int, int, int, int)
+    def _on_music_compatibility_scan_finished(
+        self,
+        rows: list[tuple[str, str, str, str, str, str, str, str, str]],
+        supported: int,
+        unsupported: int,
+        unknown: int,
+        skipped: int,
+        total_files: int,
+    ) -> None:
+        self.music_compatibility_scan_btn.setEnabled(True)
+
+        self.music_compatibility_table.setSortingEnabled(False)
+        self.music_compatibility_table.setUpdatesEnabled(False)
+        try:
+            self.music_compatibility_table.setRowCount(len(rows))
+            for row_index, row in enumerate(rows):
+                (
+                    file_name,
+                    extension,
+                    status,
+                    reason,
+                    sample_rate,
+                    bit_depth,
+                    block_size,
+                    dsd_profile,
+                    category,
+                ) = row
+
+                items = [
+                    QTableWidgetItem(file_name),
+                    QTableWidgetItem(extension),
+                    QTableWidgetItem(status),
+                    QTableWidgetItem(reason),
+                    QTableWidgetItem(sample_rate),
+                    QTableWidgetItem(bit_depth),
+                    QTableWidgetItem(block_size),
+                    QTableWidgetItem(dsd_profile),
+                ]
+
+                for col, item in enumerate(items):
+                    self.music_compatibility_table.setItem(row_index, col, item)
+
+                if category == "supported":
+                    status_bg = QColor("#2E7D32")
+                    status_fg = QColor("#F2FFF2")
+                elif category == "unsupported":
+                    status_bg = QColor("#7A2C2C")
+                    status_fg = QColor("#FFF0F0")
+                elif category == "unknown":
+                    status_bg = QColor("#7A5E2C")
+                    status_fg = QColor("#FFF9E6")
+                else:
+                    status_bg = QColor("#3C3C3C")
+                    status_fg = QColor("#E2E2E2")
+
+                status_item = self.music_compatibility_table.item(row_index, 2)
+                if status_item is not None:
+                    status_item.setBackground(status_bg)
+                    status_item.setForeground(status_fg)
+        finally:
+            self.music_compatibility_table.setUpdatesEnabled(True)
+            self.music_compatibility_table.setSortingEnabled(True)
+            self.music_compatibility_table.viewport().update()
+
+        self._apply_music_compatibility_table_filter(self.music_compatibility_search_input.text())
+
+        if total_files == 0:
+            self.music_compatibility_progress.setRange(0, 1)
+            self.music_compatibility_progress.setValue(0)
+            self.music_compatibility_progress.setFormat("Complete: no files found")
+            self.music_compatibility_summary_label.setText("No files found in target.")
+        else:
+            self.music_compatibility_progress.setRange(0, total_files)
+            self.music_compatibility_progress.setValue(total_files)
+            self.music_compatibility_progress.setFormat(
+                f"Complete: {supported} supported, {unsupported} unsupported, {unknown} unknown"
+            )
+            self.music_compatibility_summary_label.setText(
+                f"Files analyzed: {total_files} | Supported: {supported} | Unsupported: {unsupported} | "
+                f"Unknown: {unknown} | Skipped: {skipped}"
+            )
+
+        self.statusBar().showMessage("Music compatibility scan completed", 5000)
+
+    @Slot(str)
+    def _on_music_compatibility_scan_failed(self, error: str) -> None:
+        self.music_compatibility_scan_btn.setEnabled(True)
+        self.music_compatibility_progress.setRange(0, 1)
+        self.music_compatibility_progress.setValue(0)
+        self.music_compatibility_progress.setFormat("Scan failed")
+        self.music_compatibility_summary_label.setText(f"Compatibility scan failed: {error}")
+        self.statusBar().showMessage("Music compatibility scan failed", 5000)
+
+    def scan_embedded_lyrics(self) -> None:
+        target = self.path_input.text().strip()
+        if not target:
+            self._set_lyrics_manager_idle("Choose a target before scanning embedded lyrics.")
+            QMessageBox.information(
+                self,
+                "No Target",
+                "Choose a folder or drive before running embedded lyrics scan.",
+            )
+            return
+
+        target_path = Path(target).expanduser()
+        if not target_path.exists() or not target_path.is_dir():
+            self._set_lyrics_manager_idle("Target path is invalid.")
+            QMessageBox.warning(
+                self,
+                "Invalid Target",
+                "The selected target path is not a valid folder.",
+            )
+            return
+
+        resolved_target = target_path.resolve()
+        audio_files = self._collect_target_audio_files(resolved_target)
+        total_audio = len(audio_files)
+
+        self._configure_lyrics_manager_scan_table()
+        self._lyrics_lookup_results = []
+        self.lyrics_manager_table.setRowCount(0)
+        self.lyrics_manager_progress.setRange(0, max(total_audio, 1))
+        self.lyrics_manager_progress.setValue(0)
+        self.lyrics_manager_progress.setFormat("Preparing scan...")
+        self.lyrics_manager_scan_btn.setEnabled(False)
+        self.lyrics_manager_bulk_lookup_btn.setEnabled(False)
+        self.lyrics_manager_export_lrc_btn.setEnabled(False)
+        self.lyrics_manager_apply_lookup_btn.setEnabled(False)
+
+        if total_audio == 0:
+            self.lyrics_manager_progress.setRange(0, 1)
+            self.lyrics_manager_progress.setValue(0)
+            self.lyrics_manager_progress.setFormat("Complete: no audio files found")
+            self.lyrics_manager_summary_label.setText("No audio files found in target.")
+            self._lyrics_manager_scan_target = str(resolved_target)
+            self.lyrics_manager_scan_btn.setEnabled(True)
+            self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
+            self.lyrics_manager_export_lrc_btn.setEnabled(True)
+            return
+
+        with_lyrics = 0
+        without_lyrics = 0
+        error_count = 0
+        rows: list[tuple[str, str, str]] = []
+        matching_lrc = 0
+
+        try:
+            for index, file_path in enumerate(audio_files, start=1):
+                entries, error = self._embedded_lyrics_entries_for_file(file_path)
+                try:
+                    relative_path = file_path.relative_to(resolved_target).as_posix()
+                except Exception:
+                    relative_path = str(file_path)
+
+                lrc_exists = file_path.with_suffix(".lrc").exists()
+                lrc_status = "Yes" if lrc_exists else "No"
+                if lrc_exists:
+                    matching_lrc += 1
+
+                if error:
+                    error_count += 1
+                    rows.append((relative_path, "Error", lrc_status))
+                elif entries:
+                    with_lyrics += 1
+                    rows.append((relative_path, "Yes", lrc_status))
+                else:
+                    without_lyrics += 1
+                    rows.append((relative_path, "No", lrc_status))
+
+                self.lyrics_manager_progress.setValue(index)
+                self.lyrics_manager_progress.setFormat(f"Scanning {index}/{total_audio}")
+                if index % 25 == 0 or index == total_audio:
+                    self.lyrics_manager_summary_label.setText(
+                        f"Scanning: {index}/{total_audio} | With lyrics: {with_lyrics} | Without lyrics: {without_lyrics} | Errors: {error_count}"
+                    )
+                QApplication.processEvents()
+        finally:
+            self.lyrics_manager_scan_btn.setEnabled(True)
+            self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
+            self.lyrics_manager_export_lrc_btn.setEnabled(True)
+
+        self.lyrics_manager_table.setSortingEnabled(False)
+        self.lyrics_manager_table.setUpdatesEnabled(False)
+        try:
+            self.lyrics_manager_table.setRowCount(len(rows))
+            for row_index, (file_name, has_lyrics, lrc_status) in enumerate(rows):
+                self.lyrics_manager_table.setItem(row_index, 0, QTableWidgetItem(file_name))
+                self.lyrics_manager_table.setItem(row_index, 1, QTableWidgetItem(has_lyrics))
+                self.lyrics_manager_table.setItem(row_index, 2, QTableWidgetItem(lrc_status))
+
+                status_item = self.lyrics_manager_table.item(row_index, 1)
+                if status_item is None:
+                    continue
+
+                if has_lyrics == "Yes":
+                    status_item.setBackground(QColor("#2E7D32"))
+                    status_item.setForeground(QColor("#F2FFF2"))
+                elif has_lyrics == "No":
+                    status_item.setBackground(QColor("#3C3C3C"))
+                    status_item.setForeground(QColor("#E2E2E2"))
+                else:
+                    status_item.setBackground(QColor("#7A2C2C"))
+                    status_item.setForeground(QColor("#FFF0F0"))
+        finally:
+            self.lyrics_manager_table.setUpdatesEnabled(True)
+            self.lyrics_manager_table.setSortingEnabled(True)
+            self.lyrics_manager_table.viewport().update()
+
+        self._lyrics_manager_scan_target = str(resolved_target)
+        self.lyrics_manager_progress.setRange(0, total_audio)
+        self.lyrics_manager_progress.setValue(total_audio)
+        self.lyrics_manager_progress.setFormat(
+            f"Complete: {with_lyrics} with lyrics, {without_lyrics} without lyrics"
+        )
+        self.lyrics_manager_summary_label.setText(
+            f"Audio scanned: {total_audio} | Embedded: {with_lyrics} | Without embedded: {without_lyrics} | Matching LRC: {matching_lrc} | Errors: {error_count}"
+        )
+        self.statusBar().showMessage("Embedded lyrics scan completed", 5000)
+
+    def _collect_target_audio_files(self, target_root: Path) -> list[Path]:
+        audio_files: list[Path] = []
+        for root_dir, dir_names, file_names in os.walk(str(target_root)):
+            dir_names[:] = [name for name in dir_names if not name.startswith(".")]
+            for file_name in file_names:
+                if file_name.startswith("."):
+                    continue
+                file_path = Path(root_dir) / file_name
+                if file_path.suffix.lower() in AUDIO_FILE_EXTENSIONS:
+                    audio_files.append(file_path)
+        return audio_files
+
+    def _best_lrc_text_from_entries(self, entries: list[tuple[str, str]]) -> str:
+        if not entries:
+            return ""
+
+        def score(source: str) -> int:
+            normalized = source.lower()
+            if "uslt" in normalized:
+                return 0
+            if "unsyncedlyrics" in normalized or "tag lyrics" in normalized:
+                return 1
+            if "\xa9lyr" in normalized or "©lyr" in normalized:
+                return 2
+            if "sylt" in normalized:
+                return 3
+            return 4
+
+        ordered = sorted(entries, key=lambda item: (score(item[0]), item[0].lower()))
+        text = ordered[0][1].replace("\r\n", "\n").replace("\r", "\n").strip()
+        return text
+
+    def _lrclib_request_json(
+        self,
+        endpoint: str,
+        params: dict[str, str | int],
+    ) -> tuple[object | None, str | None, int]:
+        filtered_params: dict[str, str] = {}
+        for key, value in params.items():
+            if value is None:
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+            filtered_params[key] = text
+
+        base_url = f"https://lrclib.net{endpoint}"
+        query = urllib.parse.urlencode(filtered_params)
+        url = f"{base_url}?{query}" if query else base_url
+
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Snowsky-Echo-Mini-Toolbox/1.0",
+                "Accept": "application/json",
+            },
+        )
+
+        ssl_contexts: list[ssl.SSLContext] = []
+        certifi_bundle = ""
+        try:
+            certifi_module = __import__("certifi")
+            certifi_bundle = str(certifi_module.where())
+        except Exception:
+            certifi_bundle = ""
+
+        if certifi_bundle:
+            try:
+                ssl_contexts.append(ssl.create_default_context(cafile=certifi_bundle))
+            except Exception:
+                pass
+        try:
+            ssl_contexts.append(ssl.create_default_context())
+        except Exception:
+            pass
+
+        if not ssl_contexts:
+            return None, "Unable to initialize TLS context", 0
+
+        cert_error: str | None = None
+
+        for ssl_context in ssl_contexts:
+            try:
+                with urllib.request.urlopen(request, timeout=12, context=ssl_context) as response:
+                    payload = response.read()
+                    status = int(getattr(response, "status", 200))
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    return None, None, 404
+                try:
+                    error_payload = exc.read().decode("utf-8", "ignore").strip()
+                except Exception:
+                    error_payload = ""
+                return None, (error_payload or str(exc)), int(exc.code)
+            except urllib.error.URLError as exc:
+                reason = getattr(exc, "reason", None)
+                reason_text = str(reason or exc)
+                if "CERTIFICATE_VERIFY_FAILED" in reason_text:
+                    cert_error = reason_text
+                    continue
+                return None, str(exc), 0
+            except ssl.SSLError as exc:
+                if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                    cert_error = str(exc)
+                    continue
+                return None, str(exc), 0
+            except Exception as exc:
+                return None, str(exc), 0
+        else:
+            # Reached only if all contexts fail certificate verification.
+            detail = cert_error or "CERTIFICATE_VERIFY_FAILED"
+            return (
+                None,
+                (
+                    "TLS certificate verification failed while contacting lrclib.net. "
+                    "Install/update certificate bundles for your Python environment (for example, install certifi), "
+                    f"then retry. Details: {detail}"
+                ),
+                0,
+            )
+
+        try:
+            data = json.loads(payload.decode("utf-8", "ignore"))
+        except Exception as exc:
+            return None, f"Invalid API response: {exc}", status
+
+        return data, None, status
+
+    def _metadata_text_from_tags(self, tags, candidate_keys: list[str]) -> str:
+        if not tags:
+            return ""
+
+        getall = getattr(tags, "getall", None)
+        for key in candidate_keys:
+            try:
+                raw_value = list(getall(key)) if callable(getall) else tags.get(key)
+            except Exception:
+                raw_value = None
+
+            text = self._lyrics_value_to_text(raw_value).strip()
+            if not text:
+                continue
+
+            first_line = text.splitlines()[0].strip()
+            if first_line:
+                return first_line
+
+        return ""
+
+    def _lyrics_lookup_metadata_for_file(self, file_path: Path) -> tuple[dict[str, object], str | None]:
+        if mutagen is None:
+            return {}, "Mutagen is required for metadata lookup."
+
+        try:
+            audio = mutagen.File(file_path)
+        except Exception as exc:
+            return {}, str(exc)
+
+        if not audio:
+            return {}, "Unable to read metadata from audio file."
+
+        tags = getattr(audio, "tags", None)
+        title = self._metadata_text_from_tags(tags, ["title", "TIT2", "\xa9nam", "©nam"])
+        artist = self._metadata_text_from_tags(
+            tags,
+            ["artist", "albumartist", "TPE1", "TPE2", "\xa9ART", "©ART", "aART"],
+        )
+        album = self._metadata_text_from_tags(tags, ["album", "TALB", "\xa9alb", "©alb"])
+
+        # Easy tags provide consistent keys for many formats.
+        try:
+            easy_audio = mutagen.File(file_path, easy=True)
+        except Exception:
+            easy_audio = None
+
+        easy_tags = getattr(easy_audio, "tags", None) if easy_audio else None
+        if easy_tags:
+            easy_title = self._metadata_text_from_tags(easy_tags, ["title"])
+            easy_artist = self._metadata_text_from_tags(easy_tags, ["artist", "albumartist"])
+            easy_album = self._metadata_text_from_tags(easy_tags, ["album"])
+            if easy_title and not title:
+                title = easy_title
+            if easy_artist and not artist:
+                artist = easy_artist
+            if easy_album and not album:
+                album = easy_album
+
+        if not title:
+            title = file_path.stem.strip()
+
+        # Keep only primary artist token for more stable signature matching.
+        for separator in [";", "/", ","]:
+            if separator in artist:
+                artist = artist.split(separator, 1)[0].strip()
+
+        duration_seconds = 0
+        info = getattr(audio, "info", None)
+        if info is not None:
+            try:
+                duration_value = float(getattr(info, "length", 0.0) or 0.0)
+                duration_seconds = max(0, int(round(duration_value)))
+            except Exception:
+                duration_seconds = 0
+
+        metadata = {
+            "title": title.strip(),
+            "artist": artist.strip(),
+            "album": album.strip(),
+            "duration": duration_seconds,
+        }
+        return metadata, None
+
+    def _lyrics_text_from_lrclib_record(self, record: dict[str, object]) -> str:
+        synced = str(record.get("syncedLyrics") or "").strip()
+        if synced:
+            return synced
+        plain = str(record.get("plainLyrics") or "").strip()
+        return plain
+
+    def _select_best_lrclib_search_result(
+        self,
+        records: list[object],
+        title: str,
+        artist: str,
+        album: str,
+        duration: int,
+    ) -> dict[str, object] | None:
+        normalized_title = title.strip().lower()
+        normalized_artist = artist.strip().lower()
+        normalized_album = album.strip().lower()
+
+        def score(record_obj: object) -> int:
+            if not isinstance(record_obj, dict):
+                return -9999
+
+            track_name = str(record_obj.get("trackName") or "").strip().lower()
+            artist_name = str(record_obj.get("artistName") or "").strip().lower()
+            album_name = str(record_obj.get("albumName") or "").strip().lower()
+
+            total = 0
+            if normalized_title and track_name:
+                if track_name == normalized_title:
+                    total += 50
+                elif normalized_title in track_name or track_name in normalized_title:
+                    total += 25
+
+            if normalized_artist and artist_name:
+                if artist_name == normalized_artist:
+                    total += 45
+                elif normalized_artist in artist_name or artist_name in normalized_artist:
+                    total += 20
+
+            if normalized_album and album_name:
+                if album_name == normalized_album:
+                    total += 20
+                elif normalized_album in album_name or album_name in normalized_album:
+                    total += 10
+
+            try:
+                record_duration = int(record_obj.get("duration") or 0)
+            except Exception:
+                record_duration = 0
+
+            if duration > 0 and record_duration > 0:
+                delta = abs(record_duration - duration)
+                if delta <= 2:
+                    total += 35
+                elif delta <= 10:
+                    total += max(0, 20 - delta)
+
+            return total
+
+        ranked = sorted(records, key=score, reverse=True)
+        for record in ranked:
+            if isinstance(record, dict):
+                return record
+        return None
+
+    def _lookup_lyrics_from_lrclib(
+        self,
+        title: str,
+        artist: str,
+        album: str,
+        duration: int,
+    ) -> tuple[str, str, str]:
+        if not title:
+            return "Missing metadata", "Track title is missing", ""
+        if not artist:
+            return "Missing metadata", "Artist is missing", ""
+
+        if album and duration > 0:
+            signature_params = {
+                "track_name": title,
+                "artist_name": artist,
+                "album_name": album,
+                "duration": duration,
+            }
+
+            for endpoint, source_label in [
+                ("/api/get-cached", "get-cached"),
+                ("/api/get", "get"),
+            ]:
+                response, error, status = self._lrclib_request_json(endpoint, signature_params)
+                if error and status != 404:
+                    return "Error", f"{source_label}: {error}", ""
+                if not isinstance(response, dict):
+                    continue
+
+                lyrics_text = self._lyrics_text_from_lrclib_record(response)
+                if lyrics_text:
+                    return "Found", source_label, lyrics_text
+
+                if bool(response.get("instrumental")):
+                    return "Instrumental", source_label, ""
+
+        search_params: dict[str, str | int] = {
+            "track_name": title,
+            "artist_name": artist,
+        }
+        if album:
+            search_params["album_name"] = album
+
+        search_response, search_error, search_status = self._lrclib_request_json("/api/search", search_params)
+        if search_error and search_status != 404:
+            return "Error", f"search: {search_error}", ""
+
+        if isinstance(search_response, list) and search_response:
+            record = self._select_best_lrclib_search_result(
+                search_response,
+                title=title,
+                artist=artist,
+                album=album,
+                duration=duration,
+            )
+            if isinstance(record, dict):
+                lyrics_text = self._lyrics_text_from_lrclib_record(record)
+                if lyrics_text:
+                    return "Found", "search", lyrics_text
+                if bool(record.get("instrumental")):
+                    return "Instrumental", "search", ""
+
+        return "Not found", "No match in LRCLIB", ""
+
+    def _lyrics_lookup_preview(self, lyrics_text: str) -> str:
+        if not lyrics_text:
+            return ""
+
+        for line in lyrics_text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if len(stripped) > 96:
+                return stripped[:93] + "..."
+            return stripped
+        return ""
+
+    def _populate_lyrics_lookup_table(self) -> None:
+        self._configure_lyrics_manager_lookup_table()
+        self.lyrics_manager_table.setSortingEnabled(False)
+        self.lyrics_manager_table.setUpdatesEnabled(False)
+        try:
+            self.lyrics_manager_table.setRowCount(len(self._lyrics_lookup_results))
+            for row_index, row_data in enumerate(self._lyrics_lookup_results):
+                relative_path = str(row_data.get("relative_path") or "")
+                status = str(row_data.get("status") or "")
+                source = str(row_data.get("source") or "")
+                apply_status = str(row_data.get("apply_status") or "-")
+                preview = str(row_data.get("preview") or "")
+
+                self.lyrics_manager_table.setItem(row_index, 0, QTableWidgetItem(relative_path))
+                self.lyrics_manager_table.setItem(row_index, 1, QTableWidgetItem(status))
+                self.lyrics_manager_table.setItem(row_index, 2, QTableWidgetItem(source))
+                self.lyrics_manager_table.setItem(row_index, 3, QTableWidgetItem(apply_status))
+                self.lyrics_manager_table.setItem(row_index, 4, QTableWidgetItem(preview))
+
+                status_item = self.lyrics_manager_table.item(row_index, 1)
+                apply_item = self.lyrics_manager_table.item(row_index, 3)
+
+                if status_item is not None:
+                    if status == "Found":
+                        status_item.setBackground(QColor("#2E7D32"))
+                        status_item.setForeground(QColor("#F2FFF2"))
+                    elif status in {"Not found", "Instrumental"}:
+                        status_item.setBackground(QColor("#3C3C3C"))
+                        status_item.setForeground(QColor("#E2E2E2"))
+                    else:
+                        status_item.setBackground(QColor("#7A2C2C"))
+                        status_item.setForeground(QColor("#FFF0F0"))
+
+                if apply_item is not None:
+                    if apply_status == "Applied":
+                        apply_item.setBackground(QColor("#2E7D32"))
+                        apply_item.setForeground(QColor("#F2FFF2"))
+                    elif apply_status == "Error":
+                        apply_item.setBackground(QColor("#7A2C2C"))
+                        apply_item.setForeground(QColor("#FFF0F0"))
+        finally:
+            self.lyrics_manager_table.setUpdatesEnabled(True)
+            self.lyrics_manager_table.setSortingEnabled(True)
+            self.lyrics_manager_table.viewport().update()
+
+    def bulk_lookup_lyrics(self) -> None:
+        target = self.path_input.text().strip()
+        if not target:
+            self._set_lyrics_manager_idle("Choose a target before running bulk lookup.")
+            QMessageBox.information(
+                self,
+                "No Target",
+                "Choose a folder or drive before running Bulk Lookup.",
+            )
+            return
+
+        target_path = Path(target).expanduser()
+        if not target_path.exists() or not target_path.is_dir():
+            self._set_lyrics_manager_idle("Target path is invalid.")
+            QMessageBox.warning(
+                self,
+                "Invalid Target",
+                "The selected target path is not a valid folder.",
+            )
+            return
+
+        resolved_target = target_path.resolve()
+        audio_files = self._collect_target_audio_files(resolved_target)
+        total_audio = len(audio_files)
+
+        self._lyrics_lookup_results = []
+        self._configure_lyrics_manager_lookup_table()
+        self.lyrics_manager_table.setRowCount(0)
+        self.lyrics_manager_progress.setRange(0, max(total_audio, 1))
+        self.lyrics_manager_progress.setValue(0)
+        self.lyrics_manager_progress.setFormat("Preparing lookup...")
+        self.lyrics_manager_scan_btn.setEnabled(False)
+        self.lyrics_manager_bulk_lookup_btn.setEnabled(False)
+        self.lyrics_manager_export_lrc_btn.setEnabled(False)
+        self.lyrics_manager_apply_lookup_btn.setEnabled(False)
+
+        if total_audio == 0:
+            self.lyrics_manager_progress.setRange(0, 1)
+            self.lyrics_manager_progress.setValue(0)
+            self.lyrics_manager_progress.setFormat("Complete: no audio files found")
+            self.lyrics_manager_summary_label.setText("No audio files found in target.")
+            self.lyrics_manager_scan_btn.setEnabled(True)
+            self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
+            self.lyrics_manager_export_lrc_btn.setEnabled(True)
+            self._lyrics_manager_scan_target = str(resolved_target)
+            return
+
+        found_count = 0
+        not_found_count = 0
+        instrumental_count = 0
+        error_count = 0
+
+        try:
+            for index, file_path in enumerate(audio_files, start=1):
+                try:
+                    relative_path = file_path.relative_to(resolved_target).as_posix()
+                except Exception:
+                    relative_path = str(file_path)
+
+                metadata, metadata_error = self._lyrics_lookup_metadata_for_file(file_path)
+                if metadata_error:
+                    status = "Error"
+                    source = f"metadata: {metadata_error}"
+                    lyrics_text = ""
+                else:
+                    status, source, lyrics_text = self._lookup_lyrics_from_lrclib(
+                        title=str(metadata.get("title") or ""),
+                        artist=str(metadata.get("artist") or ""),
+                        album=str(metadata.get("album") or ""),
+                        duration=int(metadata.get("duration") or 0),
+                    )
+
+                preview = self._lyrics_lookup_preview(lyrics_text)
+                apply_status = "Ready" if lyrics_text else "-"
+
+                self._lyrics_lookup_results.append(
+                    {
+                        "file_path": str(file_path),
+                        "relative_path": relative_path,
+                        "status": status,
+                        "source": source,
+                        "preview": preview,
+                        "lyrics_text": lyrics_text,
+                        "apply_status": apply_status,
+                    }
+                )
+
+                if status == "Found":
+                    found_count += 1
+                elif status == "Not found":
+                    not_found_count += 1
+                elif status == "Instrumental":
+                    instrumental_count += 1
+                else:
+                    error_count += 1
+
+                self.lyrics_manager_progress.setValue(index)
+                self.lyrics_manager_progress.setFormat(f"Lookup {index}/{total_audio}")
+                if index % 10 == 0 or index == total_audio:
+                    self.lyrics_manager_summary_label.setText(
+                        f"Lookup: {index}/{total_audio} | Found: {found_count} | Not found: {not_found_count} | Instrumental: {instrumental_count} | Errors: {error_count}"
+                    )
+                QApplication.processEvents()
+        finally:
+            self.lyrics_manager_scan_btn.setEnabled(True)
+            self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
+            self.lyrics_manager_export_lrc_btn.setEnabled(True)
+
+        self._lyrics_manager_scan_target = str(resolved_target)
+        self._populate_lyrics_lookup_table()
+        self.lyrics_manager_apply_lookup_btn.setEnabled(found_count > 0)
+
+        self.lyrics_manager_progress.setRange(0, total_audio)
+        self.lyrics_manager_progress.setValue(total_audio)
+        self.lyrics_manager_progress.setFormat(f"Complete: {found_count} lyrics found")
+        self.lyrics_manager_summary_label.setText(
+            f"Bulk lookup complete | Audio scanned: {total_audio} | Found: {found_count} | Not found: {not_found_count} | Instrumental: {instrumental_count} | Errors: {error_count}"
+        )
+        self.statusBar().showMessage("Bulk lyrics lookup completed", 5000)
+
+    def apply_bulk_lookup_results(self) -> None:
+        ready_rows = [
+            row
+            for row in self._lyrics_lookup_results
+            if str(row.get("status") or "") == "Found"
+            and str(row.get("lyrics_text") or "").strip()
+        ]
+
+        if not ready_rows:
+            QMessageBox.information(
+                self,
+                "No Lookup Results",
+                "Run Bulk Lookup first, then apply found lyrics.",
+            )
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Apply Lookup Results",
+            (
+                "Write .lrc files for all lookup results marked Found?\n\n"
+                "Naming rule: song.ext -> song.lrc (same base name).\n"
+                "Existing .lrc files with matching names will be overwritten.\n\n"
+                f"Files ready to apply: {len(ready_rows)}"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        self.lyrics_manager_scan_btn.setEnabled(False)
+        self.lyrics_manager_bulk_lookup_btn.setEnabled(False)
+        self.lyrics_manager_export_lrc_btn.setEnabled(False)
+        self.lyrics_manager_apply_lookup_btn.setEnabled(False)
+
+        self.lyrics_manager_progress.setRange(0, len(ready_rows))
+        self.lyrics_manager_progress.setValue(0)
+        self.lyrics_manager_progress.setFormat("Applying lookup results...")
+
+        applied_count = 0
+        errors: list[tuple[str, str]] = []
+
+        try:
+            for index, row in enumerate(ready_rows, start=1):
+                relative_path = str(row.get("relative_path") or "")
+                file_path = Path(str(row.get("file_path") or ""))
+                lyrics_text = str(row.get("lyrics_text") or "").strip()
+
+                try:
+                    lrc_path = file_path.with_suffix(".lrc")
+                    output_text = lyrics_text if lyrics_text.endswith("\n") else lyrics_text + "\n"
+                    lrc_path.write_text(output_text, encoding="utf-8")
+                    row["apply_status"] = "Applied"
+                    applied_count += 1
+                except Exception as exc:
+                    row["apply_status"] = "Error"
+                    errors.append((relative_path or str(file_path), str(exc)))
+
+                self.lyrics_manager_progress.setValue(index)
+                self.lyrics_manager_progress.setFormat(f"Applying {index}/{len(ready_rows)}")
+                if index % 10 == 0 or index == len(ready_rows):
+                    self.lyrics_manager_summary_label.setText(
+                        f"Applying lookup results: {index}/{len(ready_rows)} | Applied: {applied_count} | Errors: {len(errors)}"
+                    )
+                QApplication.processEvents()
+        finally:
+            self.lyrics_manager_scan_btn.setEnabled(True)
+            self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
+            self.lyrics_manager_export_lrc_btn.setEnabled(True)
+            self.lyrics_manager_apply_lookup_btn.setEnabled(applied_count > 0)
+
+        self._populate_lyrics_lookup_table()
+        self.lyrics_manager_progress.setRange(0, len(ready_rows))
+        self.lyrics_manager_progress.setValue(len(ready_rows))
+        self.lyrics_manager_progress.setFormat(f"Complete: {applied_count} .lrc files written")
+        self.lyrics_manager_summary_label.setText(
+            f"Lookup apply complete | Applied: {applied_count} | Errors: {len(errors)}"
+        )
+
+        lines = [
+            f"Lookup results ready: {len(ready_rows)}",
+            f".lrc files written: {applied_count}",
+            f"Errors: {len(errors)}",
+        ]
+        if errors:
+            sample = "\n".join(f"- {name}: {reason}" for name, reason in errors[:5])
+            lines.append("\nSample errors:\n" + sample)
+
+        if errors:
+            QMessageBox.warning(self, "Apply Completed With Errors", "\n".join(lines))
+        else:
+            QMessageBox.information(self, "Apply Completed", "\n".join(lines))
+
+        self.statusBar().showMessage(f"Lookup apply complete: {applied_count} files", 5000)
+
+    def convert_embedded_lyrics_to_lrc(self) -> None:
+        target = self.path_input.text().strip()
+        if not target:
+            QMessageBox.information(
+                self,
+                "No Target",
+                "Choose a folder or drive before converting embedded lyrics to .lrc files.",
+            )
+            return
+
+        target_path = Path(target).expanduser()
+        if not target_path.exists() or not target_path.is_dir():
+            QMessageBox.warning(
+                self,
+                "Invalid Target",
+                "The selected target path is not a valid folder.",
+            )
+            return
+
+        resolved_target = target_path.resolve()
+        audio_files = self._collect_target_audio_files(resolved_target)
+        total_audio = len(audio_files)
+        if total_audio == 0:
+            QMessageBox.information(self, "No Audio Files", "No audio files found in target.")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Convert Embedded Lyrics To .lrc",
+            (
+                "Create .lrc files next to songs using embedded lyrics?\n\n"
+                "Naming rule: song.ext -> song.lrc (same base name).\n"
+                "Existing .lrc files with matching names will be overwritten.\n\n"
+                f"Audio files to scan: {total_audio}"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        self.lyrics_manager_scan_btn.setEnabled(False)
+        self.lyrics_manager_export_lrc_btn.setEnabled(False)
+        self.lyrics_manager_progress.setRange(0, total_audio)
+        self.lyrics_manager_progress.setValue(0)
+        self.lyrics_manager_progress.setFormat("Preparing conversion...")
+
+        exported = 0
+        skipped_no_lyrics = 0
+        errors: list[tuple[str, str]] = []
+        claimed_lrc_paths: dict[Path, Path] = {}
+
+        for index, file_path in enumerate(audio_files, start=1):
+            try:
+                relative_path = file_path.relative_to(resolved_target).as_posix()
+            except Exception:
+                relative_path = str(file_path)
+
+            self.lyrics_manager_progress.setValue(index)
+            self.lyrics_manager_progress.setFormat(f"Converting {index}/{total_audio}")
+            if index % 25 == 0 or index == total_audio:
+                self.lyrics_manager_summary_label.setText(
+                    f"Converting: {index}/{total_audio} | Exported: {exported} | No lyrics: {skipped_no_lyrics} | Errors: {len(errors)}"
+                )
+
+            QApplication.processEvents()
+
+            if self.lyrics_manager_progress.value() < index:
+                # Guard for unexpected progress resets from external UI state.
+                self.lyrics_manager_progress.setValue(index)
+
+            entries, error = self._embedded_lyrics_entries_for_file(file_path)
+            if error:
+                errors.append((relative_path, error))
+                continue
+
+            if not entries:
+                skipped_no_lyrics += 1
+                continue
+
+            lrc_path = file_path.with_suffix(".lrc")
+            existing_source = claimed_lrc_paths.get(lrc_path)
+            if existing_source is not None and existing_source != file_path:
+                errors.append(
+                    (
+                        relative_path,
+                        f"LRC name collision with {existing_source.name} -> {lrc_path.name}",
+                    )
+                )
+                continue
+            claimed_lrc_paths[lrc_path] = file_path
+
+            lrc_text = self._best_lrc_text_from_entries(entries)
+            if not lrc_text:
+                skipped_no_lyrics += 1
+                continue
+
+            try:
+                lrc_path.write_text(lrc_text + "\n", encoding="utf-8")
+                exported += 1
+            except Exception as exc:
+                errors.append((relative_path, str(exc)))
+
+        self.lyrics_manager_scan_btn.setEnabled(True)
+        self.lyrics_manager_export_lrc_btn.setEnabled(True)
+
+        self.lyrics_manager_summary_label.setText(
+            f"LRC conversion complete | Exported: {exported} | No lyrics: {skipped_no_lyrics} | Errors: {len(errors)}"
+        )
+        self.lyrics_manager_progress.setRange(0, total_audio)
+        self.lyrics_manager_progress.setValue(total_audio)
+        self.lyrics_manager_progress.setFormat(
+            f"Complete: {exported} .lrc files created"
+        )
+
+        message_lines = [
+            f"Audio files scanned: {total_audio}",
+            f".lrc files created: {exported}",
+            f"Skipped (no embedded lyrics): {skipped_no_lyrics}",
+            f"Errors: {len(errors)}",
+        ]
+        if errors:
+            preview = "\n".join(f"- {name}: {reason}" for name, reason in errors[:5])
+            message_lines.append("\nSample errors:\n" + preview)
+
+        if errors:
+            QMessageBox.warning(self, "LRC Conversion Completed With Errors", "\n".join(message_lines))
+        else:
+            QMessageBox.information(self, "LRC Conversion Completed", "\n".join(message_lines))
+
+        self.statusBar().showMessage(f"LRC conversion complete: {exported} files", 5000)
+
+    def fix_incompatible_files(self) -> None:
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            self.statusBar().showMessage("Wait for the current album art scan to complete")
+            return
+
+        if not self._last_scan_target:
+            QMessageBox.information(
+                self,
+                "No Completed Scan",
+                "Run Scan Album Art Compatibility first.",
+            )
+            return
+
+        if not self._last_incompatible_files:
+            QMessageBox.information(
+                self,
+                "Nothing To Fix",
+                "No incompatible files were found in the last completed scan.",
+            )
+            return
+
+        target_path = Path(self._last_scan_target)
+        files_to_fix: list[Path] = []
+        for file_name in self._last_incompatible_files:
+            candidate = Path(file_name)
+            if not candidate.is_absolute():
+                candidate = target_path / file_name
+            files_to_fix.append(candidate)
+
+        total_files = len(files_to_fix)
+        progress = QProgressDialog("Fixing incompatible files...", "Cancel", 0, total_files, self)
+        progress.setWindowTitle("Fix Incompatible Files")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setValue(0)
+
+        fixed_count = 0
+        already_compatible_count = 0
+        failed_files: list[tuple[str, str]] = []
+
+        for index, file_path in enumerate(files_to_fix, start=1):
+            if progress.wasCanceled():
+                break
+
+            progress.setLabelText(f"Fixing {index}/{total_files}: {file_path.name}")
+            progress.setValue(index - 1)
+            QApplication.processEvents()
+
+            ok, detail = self._fix_album_art_core(file_path)
+            if ok:
+                if detail == "Already compatible":
+                    already_compatible_count += 1
+                else:
+                    fixed_count += 1
+            else:
+                failed_files.append((str(file_path), detail))
+
+            progress.setValue(index)
+            QApplication.processEvents()
+
+        cancelled = progress.wasCanceled()
+        progress.close()
+
+        failure_count = len(failed_files)
+        message_lines = [
+            f"Fixed: {fixed_count}",
+            f"Already compatible: {already_compatible_count}",
+            f"Failed: {failure_count}",
+        ]
+        if cancelled:
+            message_lines.append("Cancelled before processing all files.")
+        if failed_files:
+            preview = "\n".join(f"- {Path(name).name}: {reason}" for name, reason in failed_files[:5])
+            message_lines.append("\nSample failures:\n" + preview)
+
+        if failure_count:
+            QMessageBox.warning(self, "Batch Fix Completed With Errors", "\n".join(message_lines))
+        else:
+            QMessageBox.information(self, "Batch Fix Completed", "\n".join(message_lines))
+
+        self.statusBar().showMessage(
+            f"Batch fix complete: {fixed_count} fixed, {already_compatible_count} already compatible, {failure_count} failed"
+        )
+
+        # Refresh compatibility results after applying fixes.
+        self.path_input.setText(self._last_scan_target)
+        self.scan_album_art_compatibility()
+
+    def _insert_file_properties_section_row(self, row_index: int, title: str, section_key: str) -> None:
+        section_item = QTableWidgetItem(title)
+        section_font = section_item.font()
+        section_font.setBold(True)
+        section_item.setFont(section_font)
+        section_item.setFlags(Qt.ItemIsEnabled)
+        section_item.setData(Qt.UserRole, f"section:{section_key}")
+        section_item.setBackground(QColor("#303030"))
+        section_item.setForeground(QColor("#E8E8E8"))
+        self.file_props_table.setItem(row_index, 0, section_item)
+        if section_key == "metadata":
+            add_btn = QPushButton("➕")
+            add_btn.setToolTip("Add metadata row")
+            add_btn.setFixedSize(28, 22)
+            add_btn.setStyleSheet("font-size: 12px; padding: 0px;")
+            add_btn.clicked.connect(self._on_add_metadata_row_clicked)
+
+            add_cell = QWidget(self.file_props_table)
+            add_layout = QHBoxLayout(add_cell)
+            add_layout.setContentsMargins(0, 0, 4, 0)
+            add_layout.setSpacing(0)
+            add_layout.addStretch(1)
+            add_layout.addWidget(add_btn, 0)
+            self.file_props_table.setCellWidget(row_index, 1, add_cell)
+        else:
+            self.file_props_table.setSpan(row_index, 0, 1, 2)
+        self.file_props_table.setRowHeight(row_index, 24)
+
+    def _set_editable_metadata_cell(self, row_index: int, value_text: str, metadata_key: str) -> None:
+        editor_container = QWidget(self.file_props_table)
+        editor_layout = QHBoxLayout(editor_container)
+        editor_layout.setContentsMargins(4, 0, 4, 0)
+        editor_layout.setSpacing(6)
+
+        editor = QLineEdit(value_text, editor_container)
+        editor.setToolTip("Editable metadata field. Press Enter to save.")
+        editor.setProperty("originalValue", value_text)
+        editor.editingFinished.connect(
+            lambda key=metadata_key, input_widget=editor: self._on_metadata_editor_finished(key, input_widget)
+        )
+
+        edit_icon = QLabel("✎", editor_container)
+        edit_icon.setAlignment(Qt.AlignCenter)
+        edit_icon.setFixedWidth(16)
+        edit_icon.setToolTip("Editable metadata field")
+        edit_icon.setStyleSheet("color: #B5B5B5;")
+
+        editor_layout.addWidget(editor, 1)
+        editor_layout.addWidget(edit_icon, 0)
+        self.file_props_table.setCellWidget(row_index, 1, editor_container)
+
+    def _populate_file_properties(
+        self,
+        rows: list[tuple[str, str] | tuple[str, str, str | None]],
+    ) -> None:
+        self._updating_file_props_table = True
+        self.file_props_table.blockSignals(True)
+        try:
+            self.file_props_table.clearSpans()
+            self.file_props_table.setRowCount(len(rows))
+            for row_index, row_data in enumerate(rows):
+                for column_index in (0, 1):
+                    existing_widget = self.file_props_table.cellWidget(row_index, column_index)
+                    if existing_widget is not None:
+                        self.file_props_table.removeCellWidget(row_index, column_index)
+                        existing_widget.deleteLater()
+
+                if len(row_data) == 2 and row_data[0] == "__SECTION__":
+                    section_title = row_data[1]
+                    section_key = section_title.strip().lower().replace(" ", "_")
+                    self._insert_file_properties_section_row(row_index, section_title, section_key)
+                    continue
+
+                if len(row_data) == 3:
+                    prop, value, metadata_key = row_data
+                else:
+                    prop, value = row_data
+                    metadata_key = None
+
+                prop_item = QTableWidgetItem(prop)
+                prop_item.setFlags(prop_item.flags() & ~Qt.ItemIsEditable)
+
+                if metadata_key:
+                    prop_item.setData(Qt.UserRole, f"metadata:{metadata_key}")
+                    self._set_editable_metadata_cell(row_index, value, metadata_key)
+                else:
+                    value_item = QTableWidgetItem(value)
+                    value_item.setFlags(value_item.flags() & ~Qt.ItemIsEditable)
+                    self.file_props_table.setItem(row_index, 1, value_item)
+
+                self.file_props_table.setItem(row_index, 0, prop_item)
+        finally:
+            self.file_props_table.blockSignals(False)
+            self._updating_file_props_table = False
+
+    def _metadata_input_to_values(self, text: str) -> list[str]:
+        if not text.strip():
+            return []
+
+        values: list[str] = []
+        for line in text.replace("\r", "\n").split("\n"):
+            for segment in line.split(";"):
+                normalized = segment.strip()
+                if normalized:
+                    values.append(normalized)
+        return values
+
+    def _save_audio_metadata_tag(self, file_path: Path, metadata_key: str, value_text: str) -> tuple[bool, str]:
+        if mutagen is None:
+            return False, "Mutagen is unavailable, so metadata cannot be saved."
+
+        try:
+            easy_audio = mutagen.File(file_path, easy=True)
+        except Exception as exc:
+            return False, f"Unable to open file metadata: {exc}"
+
+        if not easy_audio:
+            return False, "Unable to parse audio metadata for this file."
+
+        tags = getattr(easy_audio, "tags", None)
+        if tags is None:
+            try:
+                easy_audio.add_tags()
+            except Exception as exc:
+                return False, f"Unable to initialize tags: {exc}"
+            tags = getattr(easy_audio, "tags", None)
+            if tags is None:
+                return False, "Unable to initialize editable metadata tags."
+
+        values = self._metadata_input_to_values(value_text)
+        try:
+            if values:
+                tags[metadata_key] = values
+            else:
+                try:
+                    del tags[metadata_key]
+                except Exception:
+                    tags[metadata_key] = []
+            easy_audio.save()
+        except Exception as exc:
+            return False, f"Unable to save metadata field '{metadata_key}': {exc}"
+
+        return True, "Saved"
+
+    def _find_file_props_section_row(self, section_key: str) -> int:
+        marker = f"section:{section_key}"
+        for row in range(self.file_props_table.rowCount()):
+            item = self.file_props_table.item(row, 0)
+            if item is None:
+                continue
+            if item.data(Qt.UserRole) == marker:
+                return row
+        return -1
+
+    def _normalize_new_metadata_key(self, property_name: str) -> str:
+        text = property_name.strip()
+        if not text:
+            return ""
+
+        # First, allow matching existing metadata labels exactly.
+        lowered = text.casefold()
+        for row in range(self.file_props_table.rowCount()):
+            item = self.file_props_table.item(row, 0)
+            if item is None:
+                continue
+            marker = item.data(Qt.UserRole)
+            if not isinstance(marker, str) or not marker.startswith("metadata:"):
+                continue
+            metadata_key = marker.split(":", 1)[1]
+            if metadata_key.casefold() == lowered or item.text().casefold() == lowered:
+                return metadata_key
+
+        normalized = re.sub(r"[^a-z0-9_]", "", text.lower().replace(" ", "_"))
+        while "__" in normalized:
+            normalized = normalized.replace("__", "_")
+        return normalized.strip("_")
+
+    def _pending_new_metadata_row(self) -> int:
+        for row in range(self.file_props_table.rowCount()):
+            property_widget = self.file_props_table.cellWidget(row, 0)
+            if not isinstance(property_widget, QLineEdit):
+                continue
+
+            value_widget = self.file_props_table.cellWidget(row, 1)
+            if value_widget is None:
+                continue
+            save_buttons = value_widget.findChildren(QPushButton)
+            if any(button.text() == "Save" for button in save_buttons):
+                return row
+
+        return -1
+
+    def _add_new_metadata_entry_row(self) -> None:
+        pending_row = self._pending_new_metadata_row()
+        if pending_row >= 0:
+            pending_widget = self.file_props_table.cellWidget(pending_row, 0)
+            if isinstance(pending_widget, QLineEdit):
+                pending_widget.setFocus()
+            return
+
+        metadata_row = self._find_file_props_section_row("metadata")
+        if metadata_row < 0:
+            return
+
+        technical_row = self._find_file_props_section_row("technical_details")
+        insert_row = technical_row if technical_row > metadata_row else self.file_props_table.rowCount()
+
+        self.file_props_table.insertRow(insert_row)
+
+        property_editor = QLineEdit(self.file_props_table)
+        property_editor.setPlaceholderText("Property key (example: publisher)")
+        property_editor.setMaxLength(64)
+
+        value_editor = QLineEdit(self.file_props_table)
+        value_editor.setPlaceholderText("Value")
+
+        save_btn = QPushButton("Save", self.file_props_table)
+        save_btn.setFixedWidth(52)
+
+        value_cell = QWidget(self.file_props_table)
+        value_layout = QHBoxLayout(value_cell)
+        value_layout.setContentsMargins(4, 0, 4, 0)
+        value_layout.setSpacing(6)
+        value_layout.addWidget(value_editor, 1)
+        value_layout.addWidget(save_btn, 0)
+
+        self.file_props_table.setCellWidget(insert_row, 0, property_editor)
+        self.file_props_table.setCellWidget(insert_row, 1, value_cell)
+
+        def save_new_entry() -> None:
+            file_path = self._active_audio_metadata_path
+            if file_path is None or not file_path.exists() or not file_path.is_file():
+                QMessageBox.warning(self, "File Not Available", "The selected audio file is no longer available.")
+                return
+
+            metadata_key = self._normalize_new_metadata_key(property_editor.text())
+            if not metadata_key:
+                QMessageBox.warning(self, "Invalid Property", "Enter a metadata property name.")
+                property_editor.setFocus()
+                return
+
+            ok, message = self._save_audio_metadata_tag(file_path, metadata_key, value_editor.text())
+            if not ok:
+                lower_message = message.lower()
+                if "valid key" in lower_message or "unknown key" in lower_message:
+                    QMessageBox.warning(
+                        self,
+                        "Unsupported Property",
+                        (
+                            "That property key is not supported for this audio format.\n"
+                            "Try common keys such as title, artist, album, tracknumber, genre, or date.\n\n"
+                            f"Details: {message}"
+                        ),
+                    )
+                else:
+                    QMessageBox.warning(self, "Metadata Save Failed", message)
+                return
+
+            current_index = self.browser_tree.currentIndex()
+            if current_index.isValid():
+                self.on_browser_item_clicked(current_index)
+
+            self.statusBar().showMessage(f"Saved metadata: {metadata_key}", 3000)
+
+        save_btn.clicked.connect(save_new_entry)
+        property_editor.returnPressed.connect(save_new_entry)
+        value_editor.returnPressed.connect(save_new_entry)
+        property_editor.setFocus()
+
+    def _on_add_metadata_row_clicked(self) -> None:
+        if self._updating_file_props_table:
+            return
+        self._add_new_metadata_entry_row()
+
+    def _on_metadata_editor_finished(self, metadata_key: str, input_widget: QLineEdit) -> None:
+        if self._updating_file_props_table:
+            return
+
+        file_path = self._active_audio_metadata_path
+        if file_path is None:
+            return
+        if not file_path.exists() or not file_path.is_file():
+            QMessageBox.warning(self, "File Not Available", "The selected audio file is no longer available.")
+            return
+
+        current_value = input_widget.text()
+        original_value = str(input_widget.property("originalValue") or "")
+        if current_value == original_value:
+            return
+
+        ok, message = self._save_audio_metadata_tag(file_path, metadata_key, current_value)
+        if not ok:
+            QMessageBox.warning(self, "Metadata Save Failed", message)
+
+        current_index = self.browser_tree.currentIndex()
+        if current_index.isValid():
+            self.on_browser_item_clicked(current_index)
+
+        if ok:
+            self.statusBar().showMessage(f"Saved metadata: {metadata_key}", 3000)
+
+    def _set_embedded_lyrics_text(self, hint: str, lyrics_text: str) -> None:
+        self.file_lyrics_hint.setText(hint)
+        self.file_lyrics_text.setPlainText(lyrics_text)
+
+    def _show_audio_details_panel(self) -> None:
+        self.file_details_tabs.show()
+        self.lrc_preview_panel.hide()
+
+    def _show_lrc_preview_panel(self) -> None:
+        self.file_details_tabs.hide()
+        self.lrc_preview_panel.show()
+
+    def _decode_text_file_bytes(self, data: bytes) -> str:
+        for encoding in ["utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "latin-1"]:
+            try:
+                return data.decode(encoding)
+            except Exception:
+                continue
+        return data.decode("utf-8", errors="replace")
+
+    def _show_lrc_file_contents(self, file_path: Path) -> None:
+        self._show_lrc_preview_panel()
+        self.lrc_preview_hint.setText(str(file_path))
+
+        try:
+            raw = file_path.read_bytes()
+            content = self._decode_text_file_bytes(raw)
+        except Exception as exc:
+            self.lrc_preview_text.setPlainText("")
+            self.lrc_preview_hint.setText(f"Failed to read LRC file: {exc}")
+            return
+
+        self.lrc_preview_text.setPlainText(content)
+
+    def _lyrics_value_to_text(self, value) -> str:
+        if value is None:
+            return ""
+
+        if isinstance(value, str):
+            return value.strip()
+
+        if isinstance(value, bytes):
+            try:
+                return value.decode("utf-8", "ignore").strip()
+            except Exception:
+                return ""
+
+        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], (str, bytes)):
+            return self._lyrics_value_to_text(value[0])
+
+        if hasattr(value, "text"):
+            try:
+                return self._lyrics_value_to_text(getattr(value, "text"))
+            except Exception:
+                pass
+
+        if isinstance(value, (list, tuple, set)):
+            parts = [self._lyrics_value_to_text(item) for item in value]
+            parts = [part for part in parts if part]
+            return "\n".join(parts).strip()
+
+        return str(value).strip()
+
+    def _embedded_lyrics_entries_for_file(self, file_path: Path) -> tuple[list[tuple[str, str]], str | None]:
+        if mutagen is None:
+            return [], "Embedded lyrics cannot be read without mutagen."
+
+        try:
+            audio = mutagen.File(file_path)
+        except Exception as exc:
+            return [], str(exc)
+
+        tags = getattr(audio, "tags", None) if audio else None
+        if not tags:
+            return [], None
+
+        entries: list[tuple[str, str]] = []
+        seen_entries: set[tuple[str, str]] = set()
+
+        def add_entry(source: str, text: str) -> None:
+            normalized = "\n".join(line.rstrip() for line in text.splitlines()).strip()
+            if not normalized:
+                return
+            key = (source.lower(), normalized)
+            if key in seen_entries:
+                return
+            seen_entries.add(key)
+            entries.append((source, normalized))
+
+        getall = getattr(tags, "getall", None)
+        if callable(getall):
+            try:
+                uslt_frames = list(getall("USLT"))
+            except Exception:
+                uslt_frames = []
+
+            for index, frame in enumerate(uslt_frames, start=1):
+                text = self._lyrics_value_to_text(getattr(frame, "text", ""))
+                lang = str(getattr(frame, "lang", "") or "").strip().upper()
+                desc = str(getattr(frame, "desc", "") or "").strip()
+                detail_parts = [part for part in [lang, desc] if part]
+                label = "ID3 USLT"
+                if detail_parts:
+                    label += f" ({', '.join(detail_parts)})"
+                elif len(uslt_frames) > 1:
+                    label += f" #{index}"
+                add_entry(label, text)
+
+            try:
+                sylt_frames = list(getall("SYLT"))
+            except Exception:
+                sylt_frames = []
+
+            for index, frame in enumerate(sylt_frames, start=1):
+                text = self._lyrics_value_to_text(getattr(frame, "text", ""))
+                label = "ID3 SYLT"
+                if len(sylt_frames) > 1:
+                    label += f" #{index}"
+                add_entry(label, text)
+
+        candidate_keys = ["lyrics", "LYRICS", "unsyncedlyrics", "UNSYNCEDLYRICS", "\xa9lyr", "©lyr"]
+        for key in candidate_keys:
+            try:
+                raw_value = tags.getall(key) if callable(getall) else tags.get(key)
+            except Exception:
+                raw_value = None
+            text = self._lyrics_value_to_text(raw_value)
+            if text:
+                add_entry(f"Tag {key}", text)
+
+        try:
+            tag_keys = list(tags.keys())
+        except Exception:
+            tag_keys = []
+
+        for key in tag_keys:
+            key_text = str(key)
+            normalized_key = key_text.lower()
+            if "lyric" not in normalized_key or "lyricist" in normalized_key:
+                continue
+
+            try:
+                raw_value = tags.getall(key) if callable(getall) else tags.get(key)
+            except Exception:
+                raw_value = None
+
+            text = self._lyrics_value_to_text(raw_value)
+            if text:
+                add_entry(f"Tag {key_text}", text)
+
+        return entries, None
+
+    def _embedded_lyrics_for_file(self, file_path: Path) -> tuple[str, str]:
+        entries, error = self._embedded_lyrics_entries_for_file(file_path)
+        if error:
+            return "Unable to read embedded lyrics.", error
+
+        if not entries:
+            return "No embedded lyrics found.", ""
+
+        rendered_entries = [f"[{source}]\n{text}" for source, text in entries]
+        return f"Embedded lyrics entries: {len(entries)}", "\n\n".join(rendered_entries)
+
+    def _set_album_art_preview(self, art_bytes: bytes | None, art_mime: str) -> None:
+        # Only add preview rows when metadata rows already exist for a selected audio file.
+        if self.file_props_table.rowCount() == 0:
+            return
+
+        preview_row = self.file_props_table.rowCount()
+        self.file_props_table.insertRow(preview_row)
+        self.file_props_table.setItem(preview_row, 0, QTableWidgetItem("Album Art Preview"))
+
+        pixmap = QPixmap()
+        loaded = bool(art_bytes) and pixmap.loadFromData(art_bytes)
+        if not loaded or pixmap.isNull():
+            fallback = "No album art" if not art_bytes else f"Album art unavailable ({art_mime})"
+            self.file_props_table.setItem(preview_row, 1, QTableWidgetItem(fallback))
+            return
+
+        preview_widget = QLabel()
+        preview_widget.setAlignment(Qt.AlignCenter)
+        preview_widget.setObjectName("fileArtPreview")
+
+        # Keep preview compact while allowing the metadata table to fill the full pane height.
+        max_preview_side = 220
+        scaled = pixmap.scaled(
+            max_preview_side,
+            max_preview_side,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        preview_widget.setPixmap(scaled)
+
+        self.file_props_table.setCellWidget(preview_row, 1, preview_widget)
+        self.file_props_table.setRowHeight(preview_row, scaled.height() + 12)
+
+    def _format_duration(self, seconds: float) -> str:
+        if seconds <= 0:
+            return "0:00"
+        total_seconds = int(round(seconds))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes}:{secs:02d}"
+
+    def _normalize_metadata_value(self, value, depth: int = 0) -> str:
+        if value is None:
+            return ""
+
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+
+        if isinstance(value, (int, float)):
+            if isinstance(value, float):
+                return f"{value:.6g}"
+            return str(value)
+
+        if isinstance(value, bytes):
+            return f"{len(value)} bytes"
+
+        if hasattr(value, "mime") and hasattr(value, "data"):
+            mime = str(getattr(value, "mime", "image/unknown") or "image/unknown")
+            data = getattr(value, "data", b"")
+            size_text = format_bytes(len(data)) if isinstance(data, (bytes, bytearray)) else "Unknown size"
+            desc = str(getattr(value, "desc", "") or "").strip()
+            summary = f"{mime} | {size_text}"
+            if desc:
+                summary += f" | Description: {desc}"
+            return summary
+
+        if hasattr(value, "text"):
+            text_value = getattr(value, "text", None)
+            if text_value is not None:
+                return self._normalize_metadata_value(text_value, depth + 1)
+
+        if hasattr(value, "url"):
+            url_value = str(getattr(value, "url", "")).strip()
+            if url_value:
+                return url_value
+
+        if isinstance(value, dict):
+            if depth >= 2:
+                return str(value)
+            parts: list[str] = []
+            for key in sorted(value.keys(), key=lambda item: str(item).lower()):
+                normalized = self._normalize_metadata_value(value[key], depth + 1)
+                if not normalized:
+                    continue
+                parts.append(f"{key}={normalized}")
+            return "; ".join(parts)
+
+        if isinstance(value, (list, tuple, set)):
+            if depth >= 2:
+                return ", ".join(str(item) for item in value)
+            parts = [self._normalize_metadata_value(item, depth + 1) for item in value]
+            parts = [item for item in parts if item]
+            return "; ".join(parts)
+
+        text = str(value).strip()
+        if len(text) > 300:
+            return text[:297] + "..."
+        return text
+
+    def _metadata_label_for_key(self, key: str) -> str:
+        normalized = key.replace("_", " ").strip()
+        if not normalized:
+            return key
+        return normalized.title()
+
+    def _extract_mutagen_metadata_rows(self, file_path: Path) -> list[tuple[str, str]]:
+        if mutagen is None:
+            return [("Metadata Engine", "Mutagen unavailable")]
+
+        try:
+            audio = mutagen.File(file_path)
+        except Exception as exc:
+            return [("Metadata Engine", f"Mutagen read failed: {exc}")]
+
+        if not audio:
+            return [("Metadata Engine", "No parseable metadata")]
+
+        rows: list[tuple[str, str]] = []
+        rows.append(("Metadata Engine", "Mutagen"))
+        rows.append(("Container Type", audio.__class__.__name__))
+
+        info = getattr(audio, "info", None)
+        if info is not None:
+            info_attrs: dict[str, object] = {}
+            for attr_name in dir(info):
+                if attr_name.startswith("_"):
+                    continue
+                try:
+                    attr_value = getattr(info, attr_name)
+                except Exception:
+                    continue
+                if callable(attr_value) or attr_value is None:
+                    continue
+                info_attrs[attr_name] = attr_value
+
+            preferred_info = [
+                ("length", "Duration"),
+                ("bitrate", "Bitrate"),
+                ("sample_rate", "Sample Rate"),
+                ("channels", "Channels"),
+                ("bits_per_sample", "Bits Per Sample"),
+                ("codec", "Codec"),
+                ("codec_description", "Codec Description"),
+                ("bitrate_mode", "Bitrate Mode"),
+                ("encoder_info", "Encoder Info"),
+                ("encoder_settings", "Encoder Settings"),
+            ]
+            handled_attrs: set[str] = set()
+
+            for attr_name, label in preferred_info:
+                if attr_name not in info_attrs:
+                    continue
+                raw_value = info_attrs[attr_name]
+                handled_attrs.add(attr_name)
+
+                if attr_name == "length":
+                    try:
+                        seconds = float(raw_value)
+                        rows.append((label, f"{self._format_duration(seconds)} ({seconds:.3f} s)"))
+                    except Exception:
+                        rows.append((label, self._normalize_metadata_value(raw_value)))
+                    continue
+
+                if attr_name == "bitrate":
+                    try:
+                        bitrate = int(raw_value)
+                        kbps = bitrate / 1000.0
+                        rows.append((label, f"{kbps:.1f} kbps ({bitrate} bps)"))
+                    except Exception:
+                        rows.append((label, self._normalize_metadata_value(raw_value)))
+                    continue
+
+                if attr_name == "sample_rate":
+                    try:
+                        rows.append((label, f"{int(raw_value)} Hz"))
+                    except Exception:
+                        rows.append((label, self._normalize_metadata_value(raw_value)))
+                    continue
+
+                normalized = self._normalize_metadata_value(raw_value)
+                if normalized:
+                    rows.append((label, normalized))
+
+            for attr_name in sorted(info_attrs.keys(), key=lambda item: item.lower()):
+                if attr_name in handled_attrs:
+                    continue
+                normalized = self._normalize_metadata_value(info_attrs[attr_name])
+                if not normalized:
+                    continue
+                label = "Audio " + attr_name.replace("_", " ").title()
+                rows.append((label, normalized))
+
+        tags = getattr(audio, "tags", None)
+        if not tags:
+            rows.append(("Tags", "None found"))
+            return rows
+
+        tag_rows_added = 0
+        try:
+            tag_keys = sorted(tags.keys(), key=lambda item: str(item).lower())
+        except Exception:
+            tag_keys = []
+
+        for tag_key in tag_keys:
+            values: list[object] = []
+            getall = getattr(tags, "getall", None)
+            if callable(getall):
+                try:
+                    values = list(getall(tag_key))
+                except Exception:
+                    values = []
+
+            if not values:
+                try:
+                    raw_value = tags[tag_key]
+                except Exception:
+                    continue
+                if isinstance(raw_value, list):
+                    values = list(raw_value)
+                else:
+                    values = [raw_value]
+
+            if not values:
+                continue
+
+            for index, value in enumerate(values, start=1):
+                normalized = self._normalize_metadata_value(value)
+                if not normalized:
+                    continue
+
+                label = f"Tag {tag_key}"
+                if len(values) > 1:
+                    label += f" #{index}"
+                rows.append((label, normalized))
+                tag_rows_added += 1
+
+        if tag_rows_added == 0:
+            rows.append(("Tags", "None found"))
+
+        return rows
+
+    def _extract_editable_mutagen_rows(self, file_path: Path) -> list[tuple[str, str, str | None]]:
+        if mutagen is None:
+            return []
+
+        try:
+            easy_audio = mutagen.File(file_path, easy=True)
+        except Exception:
+            return []
+
+        if not easy_audio:
+            return []
+
+        tags = getattr(easy_audio, "tags", None)
+        if tags is None:
+            return []
+
+        rows: list[tuple[str, str, str | None]] = []
+        preferred_keys = [
+            "title",
+            "artist",
+            "album",
+            "albumartist",
+            "tracknumber",
+            "discnumber",
+            "date",
+            "genre",
+            "composer",
+            "comment",
+            "lyrics",
+        ]
+
+        existing_keys: list[str] = []
+        try:
+            existing_keys = [str(item) for item in tags.keys()]
+        except Exception:
+            existing_keys = []
+
+        existing_set = {key.lower(): key for key in existing_keys}
+        keys: list[str] = []
+        for preferred_key in preferred_keys:
+            keys.append(existing_set.get(preferred_key, preferred_key))
+
+        seen_lower = {item.lower() for item in keys}
+
+        for key in sorted(existing_keys, key=lambda item: item.lower()):
+            if key.lower() not in seen_lower:
+                keys.append(key)
+                seen_lower.add(key.lower())
+
+        for key in keys:
+            raw_values = tags.get(key, [])
+            if isinstance(raw_values, (list, tuple)):
+                values = [str(item).strip() for item in raw_values if str(item).strip()]
+            else:
+                single = str(raw_values).strip()
+                values = [single] if single else []
+
+            value_text = "; ".join(values)
+            rows.append((self._metadata_label_for_key(str(key)), value_text, str(key)))
+
+        return rows
+
+    def _audio_file_properties(self, path: str) -> tuple[list[tuple[str, str] | tuple[str, str, str | None]], bytes | None, str]:
+        file_path = Path(path)
+        stat_info = file_path.stat()
+        modified = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat_info.st_mtime))
+
+        art_bytes, art_mime = self._cached_embedded_album_art(file_path, stat_info)
+        if art_bytes:
+            art_size = format_bytes(len(art_bytes))
+            dims = image_size_from_bytes(art_bytes)
+            art_dimensions = f"{dims[0]} x {dims[1]}" if dims else "Unknown"
+            jpeg_type = jpeg_scan_type(art_bytes)
+            album_art_rows = [
+                ("Embedded Album Art", "Yes"),
+                ("Album Art MIME", art_mime),
+                ("Album Art Data Size", art_size),
+                ("Album Art Dimensions", art_dimensions),
+            ]
+            if jpeg_type != "Not JPEG":
+                album_art_rows.append(("Album Art JPEG Scan", jpeg_type))
+        else:
+            album_art_rows = [
+                ("Embedded Album Art", "No"),
+                ("Album Art Details", art_mime),
+            ]
+
+        editable_rows = self._extract_editable_mutagen_rows(file_path)
+
+        rows: list[tuple[str, str] | tuple[str, str, str | None]] = [
+            ("__SECTION__", "File"),
+            ("Name", file_path.name),
+            ("Path", str(file_path)),
+            ("Extension", file_path.suffix.lower() or "(none)"),
+            ("Size", format_bytes(stat_info.st_size)),
+            ("Last Modified", modified),
+            ("Readable", "Yes" if os.access(file_path, os.R_OK) else "No"),
+            ("Writable", "Yes" if os.access(file_path, os.W_OK) else "No"),
+        ]
+
+        rows.append(("__SECTION__", "Metadata"))
+        if editable_rows:
+            rows.extend(editable_rows)
+        else:
+            rows.append(("Tags", "No metadata tags available"))
+
+        rows.append(("__SECTION__", "Technical Details"))
+        rows.extend(self._extract_mutagen_metadata_rows(file_path))
+
+        rows.append(("__SECTION__", "Album Art"))
+        rows.extend(album_art_rows)
+        return rows, art_bytes, art_mime
+
+    def on_browser_item_clicked(self, index) -> None:
+        source_index = self._browser_source_index(index)
+        path = self.browser_model.filePath(source_index)
+        kind = "Folder" if self.browser_model.isDir(source_index) else "File"
+        self.statusBar().showMessage(f"{kind}: {path}")
+
+        self._show_audio_details_panel()
+
+        if self.browser_model.isDir(source_index):
+            self._active_audio_metadata_path = None
+            self._populate_file_properties([])
+            self._set_album_art_preview(None, "")
+            self.file_props_hint.setText("Select an audio file to view details.")
+            self._set_embedded_lyrics_text("Select an audio file to view embedded lyrics.", "")
+            return
+
+        suffix = Path(path).suffix.lower()
+        if suffix == ".lrc":
+            self._active_audio_metadata_path = None
+            self._show_lrc_file_contents(Path(path))
+            return
+
+        if suffix not in AUDIO_FILE_EXTENSIONS:
+            self._active_audio_metadata_path = None
+            self._populate_file_properties([])
+            self._set_album_art_preview(None, "")
+            self.file_props_hint.setText("Selected file is not an audio file.")
+            self._set_embedded_lyrics_text("Selected file is not an audio file.", "")
+            return
+
+        try:
+            props, art_bytes, art_mime = self._audio_file_properties(path)
+        except Exception as exc:
+            self._active_audio_metadata_path = None
+            self._populate_file_properties([])
+            self._set_album_art_preview(None, "")
+            self.file_props_hint.setText(f"Failed to read file properties: {exc}")
+            self._set_embedded_lyrics_text("Unable to read embedded lyrics.", str(exc))
+            return
+
+        self._active_audio_metadata_path = Path(path)
+        self.file_props_hint.setText("Edit metadata values in the table, or click + in Metadata to add a new property/value row.")
+        self._populate_file_properties(props)
+        self._set_album_art_preview(art_bytes, art_mime)
+
+        lyrics_hint, lyrics_text = self._embedded_lyrics_for_file(Path(path))
+        self._set_embedded_lyrics_text(lyrics_hint, lyrics_text)
+
+    def pick_drive(self, _index: int = -1) -> None:
+        if not self.drive_options:
+            self._update_directory_tab_access()
+            self._update_unmount_drive_button_state()
+            return
+
+        selected_path = self.drive_combo.currentData()
+        if not isinstance(selected_path, str) or not selected_path:
+            self._update_directory_tab_access()
+            self._update_unmount_drive_button_state()
+            return
+
+        self.path_input.setText(selected_path)
+        self._set_current_target_label(selected_path)
+        self._update_directory_tab_access()
+        self._update_unmount_drive_button_state()
+        self.show_info()
+        self.statusBar().showMessage(f"Drive selected: {selected_path}")
+
+    def show_info(self) -> None:
+        target = self.path_input.text().strip()
+        self._set_current_target_label(target)
+        self.refresh_directory_browser(target)
+        self._update_directory_tab_access()
+
+        resolved_target: str | None = None
+        if target:
+            target_path = Path(target).expanduser()
+            if target_path.exists() and target_path.is_dir():
+                resolved_target = str(target_path.resolve())
+
+        if self._cleanup_scan_target and resolved_target != self._cleanup_scan_target:
+            if resolved_target:
+                self._set_cleanup_idle("Target changed. Run Scan File Types for updated cleanup data.")
+            else:
+                self._set_cleanup_idle("Choose a valid target before scanning file types.")
+
+        if self._file_rename_scan_target and resolved_target != self._file_rename_scan_target:
+            if resolved_target:
+                self._set_file_rename_idle("Target changed. Run Scan Rename Suggestions for updated rename data.")
+            else:
+                self._set_file_rename_idle("Choose a valid target before scanning rename suggestions.")
+
+        if self._lyrics_manager_scan_target and resolved_target != self._lyrics_manager_scan_target:
+            if resolved_target:
+                self._set_lyrics_manager_idle("Target changed. Run Scan Embedded Lyrics for updated results.")
+            else:
+                self._set_lyrics_manager_idle("Choose a valid target before scanning embedded lyrics.")
+
+        if not target:
+            self.info_table.setRowCount(0)
+            self.statusBar().showMessage("Choose a folder or removable drive")
+            return
+
+        if not os.path.exists(target):
+            self.info_table.setRowCount(0)
+            self.statusBar().showMessage("Path does not exist")
+            return
+
+        try:
+            info = collect_target_info(target)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to inspect target:\n{exc}")
+            self.statusBar().showMessage("Failed to inspect target")
+            return
+
+        size_warning_threshold = 256 * 1024 * 1024 * 1024
+        total_capacity_bytes = None
+        try:
+            fs_stats = os.statvfs(target)
+            total_capacity_bytes = fs_stats.f_frsize * fs_stats.f_blocks
+        except Exception:
+            total_capacity_bytes = None
+
+        size_warning = bool(
+            total_capacity_bytes is not None and total_capacity_bytes > size_warning_threshold
+        )
+
+        self.info_table.setRowCount(len(info))
+        for row, (prop, value) in enumerate(info):
+            prop_item = QTableWidgetItem(prop)
+            value_item = QTableWidgetItem(str(value))
+
+            self.info_table.setItem(row, 0, prop_item)
+            self.info_table.setItem(row, 1, value_item)
+
+            if prop_item:
+                prop_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+            if prop.lower() == "filesystem" and not self._filesystem_looks_compatible(str(value)):
+                value_item.setText(
+                    f"{value} (Likely Compatibility Issue - It's recommended to use FAT/exFAT)"
+                )
+                prop_item.setBackground(QColor("#7A3B00"))
+                prop_item.setForeground(QColor("#FFF2CC"))
+                value_item.setBackground(QColor("#7A3B00"))
+                value_item.setForeground(QColor("#FFF2CC"))
+                warning_tip = "Backup your data, and reformat this drive as either FAT or exFAT"
+                prop_item.setToolTip(warning_tip)
+                value_item.setToolTip(warning_tip)
+
+            if prop.lower() == "total space" and size_warning:
+                value_item.setText(f"{value} (WARNING: Drive size over 256GB)")
+                prop_item.setBackground(QColor("#7A3B00"))
+                prop_item.setForeground(QColor("#FFF2CC"))
+                value_item.setBackground(QColor("#7A3B00"))
+                value_item.setForeground(QColor("#FFF2CC"))
+                warning_tip = "Large drive detected: capacities over 256GB may cause compatibility issues."
+                prop_item.setToolTip(warning_tip)
+                value_item.setToolTip(warning_tip)
+
+        self.statusBar().showMessage("Target information updated")
