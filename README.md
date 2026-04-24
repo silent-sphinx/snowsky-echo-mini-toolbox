@@ -30,6 +30,7 @@ An easy desktop app to prepare your music folders and USB drives for the Snowsky
   - Can fix incompatible album art in batch.
 - Music Compatibility:
   - Checks your audio files and shows SUPPORTED, UNSUPPORTED, UNKNOWN, or SKIPPED.
+  - Conversion includes speed profiles (Fast, Balanced, Smallest files) so you can trade encode time vs FLAC file size.
 - Lyrics Manager:
   - Scans embedded lyrics.
   - Can create .lrc lyric files and do LRCLIB bulk lookup.
