@@ -15,10 +15,11 @@ from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import QDir, QModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QPainter, QPalette, QPixmap
+from PySide6.QtGui import QColor, QPainter, QPalette, QPixmap, QRegion
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -56,7 +57,7 @@ from .album_art import (
     write_embedded_album_art,
 )
 from .constants import ALBUM_ART_CACHE_LIMIT, AUDIO_FILE_EXTENSIONS
-from .music_compatibility import MusicCompatibilityScanWorker
+from .music_compatibility import KNOWN_AUDIO_FORMATS, MusicCompatibilityScanWorker
 from .models import DriveOption
 from .system_info import collect_target_info, format_bytes, list_removable_drives
 
@@ -629,6 +630,356 @@ class FileTransferWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class MusicConversionWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal(object)
+
+    def __init__(
+        self,
+        target_path: Path,
+        candidates: list[dict[str, object]],
+        make_eq_compatible: bool,
+        compression_level: int,
+        dry_run: bool,
+        backup_root: Path | None,
+    ):
+        super().__init__()
+        self.target_path = target_path
+        self.candidates = candidates
+        self.make_eq_compatible = make_eq_compatible
+        self.compression_level = compression_level
+        self.dry_run = dry_run
+        self.backup_root = backup_root
+        self._cancel_requested = False
+        self._active_process: subprocess.Popen | None = None
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+        process = self._active_process
+        if process is not None:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
+    def _is_path_within_target(self, target_path: Path, candidate_path: Path) -> bool:
+        try:
+            candidate_path.relative_to(target_path)
+            return True
+        except ValueError:
+            return False
+
+    def _parse_optional_int(self, value) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def _resolve_sample_rate_for_eq_conversion(self, source_file: Path) -> int | None:
+        if mutagen is not None:
+            try:
+                audio = mutagen.File(source_file)
+            except Exception:
+                audio = None
+
+            info = getattr(audio, "info", None) if audio else None
+            if info is not None:
+                for attr_name in ("sample_rate", "samplerate"):
+                    value = getattr(info, attr_name, None)
+                    if value is None:
+                        continue
+                    try:
+                        return int(value)
+                    except Exception:
+                        continue
+
+        if shutil.which("ffprobe") is None:
+            return None
+
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=sample_rate",
+            "-of",
+            "json",
+            str(source_file),
+        ]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        except Exception:
+            return None
+
+        if result.returncode != 0:
+            return None
+
+        try:
+            payload = json.loads(result.stdout)
+        except Exception:
+            return None
+
+        streams = payload.get("streams") or []
+        if not streams:
+            return None
+
+        sample_rate = streams[0].get("sample_rate")
+        return self._parse_optional_int(sample_rate)
+
+    def _build_music_conversion_command(
+        self,
+        source_file: Path,
+        output_file: Path,
+        sample_rate: int | None,
+        bit_depth: int | None,
+    ) -> list[str]:
+        max_sample_rate = 192000
+        target_bit_depth = 16 if self.make_eq_compatible else 24
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(source_file),
+            "-map_metadata",
+            "0",
+            "-c:a",
+            "flac",
+            "-f",
+            "flac",
+            "-compression_level",
+            str(self.compression_level),
+            "-frame_size",
+            "4096",
+        ]
+
+        if sample_rate is not None and sample_rate > max_sample_rate:
+            command.extend(["-ar", str(max_sample_rate)])
+
+        if bit_depth is not None and bit_depth > target_bit_depth:
+            if target_bit_depth == 16:
+                command.extend(["-sample_fmt", "s16", "-bits_per_raw_sample", "16"])
+            else:
+                command.extend(["-sample_fmt", "s32", "-bits_per_raw_sample", "24"])
+        elif self.make_eq_compatible:
+            command.extend(["-sample_fmt", "s16", "-bits_per_raw_sample", "16"])
+
+        command.append(str(output_file))
+        return command
+
+    def _run_conversion_subprocess(self, command: list[str]) -> tuple[bool, str]:
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            return False, str(exc)
+
+        self._active_process = process
+        try:
+            while True:
+                if self._cancel_requested:
+                    try:
+                        process.terminate()
+                        process.wait(timeout=2)
+                    except Exception:
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                    return True, "Cancelled by user"
+
+                try:
+                    process.wait(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+
+            if process.returncode != 0:
+                return False, f"ffmpeg conversion failed (exit code {process.returncode})"
+
+            return False, ""
+        finally:
+            self._active_process = None
+
+    def _next_available_backup_path(self, base_path: Path) -> Path:
+        if not base_path.exists():
+            return base_path
+
+        stem = base_path.stem
+        suffix = base_path.suffix
+        parent = base_path.parent
+        counter = 1
+        while True:
+            candidate = parent / f"{stem}.bak{counter}{suffix}"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+    @Slot()
+    def run(self) -> None:
+        converted = 0
+        failed = 0
+        planned = 0
+        failures: list[str] = []
+        total = len(self.candidates)
+
+        try:
+            if self.backup_root is not None:
+                self.backup_root.mkdir(parents=True, exist_ok=True)
+
+            for index, candidate in enumerate(self.candidates, start=1):
+                if self._cancel_requested:
+                    self.cancelled.emit(
+                        {
+                            "converted": converted,
+                            "failed": failed,
+                            "planned": planned,
+                            "total": total,
+                            "failures": failures,
+                            "dry_run": self.dry_run,
+                        }
+                    )
+                    return
+
+                relative_file = str(candidate.get("relative_file") or "")
+                sample_rate = self._parse_optional_int(candidate.get("sample_rate"))
+                bit_depth = self._parse_optional_int(candidate.get("bit_depth"))
+
+                source_input_path = self.target_path / Path(relative_file)
+                detail_label = f"Processing {index}/{total}: {source_input_path.name}"
+                self.progress.emit(index - 1, total, detail_label)
+
+                if source_input_path.is_symlink():
+                    failed += 1
+                    failures.append(f"{relative_file}: symlinked files are not converted")
+                    self.progress.emit(index, total, detail_label)
+                    continue
+
+                source_path = source_input_path.resolve()
+                if not self._is_path_within_target(self.target_path, source_path):
+                    failed += 1
+                    failures.append(f"{relative_file}: resolves outside the selected target")
+                    self.progress.emit(index, total, detail_label)
+                    continue
+
+                if not source_path.exists() or not source_path.is_file():
+                    failed += 1
+                    failures.append(f"{relative_file}: file not found")
+                    self.progress.emit(index, total, detail_label)
+                    continue
+
+                if self.make_eq_compatible and sample_rate is None:
+                    sample_rate = self._resolve_sample_rate_for_eq_conversion(source_path)
+                    if sample_rate is None:
+                        failed += 1
+                        failures.append(
+                            f"{relative_file}: sample rate unavailable; cannot guarantee EQ compatibility"
+                        )
+                        self.progress.emit(index, total, detail_label)
+                        continue
+
+                if self.dry_run:
+                    planned += 1
+                    self.progress.emit(index, total, f"Would convert: {source_path.name}")
+                    continue
+
+                output_path = source_path.with_suffix(".flac")
+                temp_output_path = output_path.with_name(f".{output_path.stem}.tmp{output_path.suffix}")
+
+                if self.backup_root is not None:
+                    backup_target = self.backup_root / Path(relative_file)
+                    backup_target.parent.mkdir(parents=True, exist_ok=True)
+                    backup_target = self._next_available_backup_path(backup_target)
+                    try:
+                        shutil.copy2(str(source_path), str(backup_target))
+                    except Exception as exc:
+                        failed += 1
+                        failures.append(f"{relative_file}: backup failed: {exc}")
+                        self.progress.emit(index, total, detail_label)
+                        continue
+
+                command = self._build_music_conversion_command(
+                    source_path,
+                    temp_output_path,
+                    sample_rate,
+                    bit_depth,
+                )
+
+                was_cancelled, error_text = self._run_conversion_subprocess(command)
+                if was_cancelled:
+                    try:
+                        if temp_output_path.exists():
+                            temp_output_path.unlink()
+                    except Exception:
+                        pass
+                    self.cancelled.emit(
+                        {
+                            "converted": converted,
+                            "failed": failed,
+                            "planned": planned,
+                            "total": total,
+                            "failures": failures,
+                            "dry_run": self.dry_run,
+                        }
+                    )
+                    return
+
+                if error_text:
+                    failed += 1
+                    failures.append(f"{relative_file}: {error_text}")
+                    try:
+                        if temp_output_path.exists():
+                            temp_output_path.unlink()
+                    except Exception:
+                        pass
+                    self.progress.emit(index, total, detail_label)
+                    continue
+
+                try:
+                    if output_path.exists() and output_path != source_path:
+                        output_path.unlink()
+                    temp_output_path.replace(output_path)
+                    if source_path != output_path and source_path.exists():
+                        source_path.unlink()
+                    converted += 1
+                except Exception as exc:
+                    failed += 1
+                    failures.append(f"{relative_file}: {exc}")
+                    try:
+                        if temp_output_path.exists():
+                            temp_output_path.unlink()
+                    except Exception:
+                        pass
+
+                self.progress.emit(index, total, detail_label)
+
+            self.finished.emit(
+                {
+                    "converted": converted,
+                    "failed": failed,
+                    "planned": planned,
+                    "total": total,
+                    "failures": failures,
+                    "dry_run": self.dry_run,
+                    "backup_root": str(self.backup_root) if self.backup_root is not None else "",
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class BackupRestoreProgressDialog(QDialog):
     cancelRequested = Signal()
 
@@ -842,6 +1193,15 @@ class ToolboxWindow(QMainWindow):
         self._scan_worker: AlbumArtScanWorker | None = None
         self._music_compatibility_scan_thread: QThread | None = None
         self._music_compatibility_scan_worker: MusicCompatibilityScanWorker | None = None
+        self._music_compatibility_scan_target: Path | None = None
+        self._last_music_compatibility_scan_target: Path | None = None
+        self._last_music_compatibility_unsupported_count = 0
+        self._music_conversion_thread: QThread | None = None
+        self._music_conversion_worker: MusicConversionWorker | None = None
+        self._music_conversion_progress_dialog: QProgressDialog | None = None
+        self._music_conversion_busy = False
+        self._music_conversion_mode_label = ""
+        self._music_conversion_profile_label = ""
         self._drive_scan_thread: QThread | None = None
         self._drive_scan_worker: DriveScanWorker | None = None
         self._backup_restore_thread: QThread | None = None
@@ -1131,25 +1491,45 @@ class ToolboxWindow(QMainWindow):
         music_compatibility_layout.setContentsMargins(10, 10, 10, 10)
         music_compatibility_layout.setSpacing(10)
 
-        music_compatibility_hint = QLabel(
-            "Checks all files against Echo Mini music rules (supported, unsupported, unknown, skipped)."
-        )
-        music_compatibility_hint.setObjectName("targetSummary")
-
         music_compatibility_controls = QHBoxLayout()
         self.music_compatibility_scan_btn = QPushButton("Scan Music Compatibility")
         self.music_compatibility_scan_btn.clicked.connect(self.scan_music_compatibility)
         music_compatibility_controls.addWidget(self.music_compatibility_scan_btn)
-        music_compatibility_controls.addStretch(1)
+
+        self.music_compatibility_cancel_btn = QPushButton("Cancel Scan")
+        self.music_compatibility_cancel_btn.setEnabled(False)
+        self.music_compatibility_cancel_btn.clicked.connect(self.cancel_music_compatibility_scan)
+        music_compatibility_controls.addWidget(self.music_compatibility_cancel_btn)
+
+        self.music_compatibility_quick_filter_combo = QComboBox()
+        self.music_compatibility_quick_filter_combo.addItem("All", "all")
+        self.music_compatibility_quick_filter_combo.addItem("Unsupported", "unsupported")
+        self.music_compatibility_quick_filter_combo.addItem("Unknown", "unknown")
+        self.music_compatibility_quick_filter_combo.addItem("Supported", "supported")
+        self.music_compatibility_quick_filter_combo.addItem("Skipped", "skipped")
+        self.music_compatibility_quick_filter_combo.addItem("EQ Not Compatible", "eq_not_compatible")
+        self.music_compatibility_quick_filter_combo.addItem("Actionable For Convert", "actionable")
+        self.music_compatibility_quick_filter_combo.currentIndexChanged.connect(
+            lambda _index: self._apply_music_compatibility_table_filter(
+                self.music_compatibility_search_input.text()
+            )
+        )
+        music_compatibility_controls.addWidget(self.music_compatibility_quick_filter_combo)
 
         self.music_compatibility_search_input = QLineEdit()
         self.music_compatibility_search_input.setPlaceholderText(
-            "Search compatibility results (file, status, reason, extension, block size, DSD...)"
+            "Search compatibility results (file, status, reason, EQ compatibility, extension, block size, DSD...)"
         )
         self.music_compatibility_search_input.setClearButtonEnabled(True)
         self.music_compatibility_search_input.textChanged.connect(
             self._apply_music_compatibility_table_filter
         )
+        music_compatibility_controls.addWidget(self.music_compatibility_search_input, 1)
+
+        self.music_compatibility_convert_btn = QPushButton("Convert Incompatible Music")
+        self.music_compatibility_convert_btn.setEnabled(False)
+        self.music_compatibility_convert_btn.clicked.connect(self.open_music_conversion_dialog)
+        music_compatibility_controls.addWidget(self.music_compatibility_convert_btn)
 
         self.music_compatibility_summary_label = QLabel("No compatibility scan run yet.")
         self.music_compatibility_summary_label.setObjectName("targetSummary")
@@ -1160,7 +1540,7 @@ class ToolboxWindow(QMainWindow):
         self.music_compatibility_progress.setFormat("Idle")
         self.music_compatibility_progress.setTextVisible(True)
 
-        self.music_compatibility_table = QTableWidget(0, 8)
+        self.music_compatibility_table = QTableWidget(0, 9)
         self.music_compatibility_table.setHorizontalHeaderLabels(
             [
                 "File",
@@ -1171,21 +1551,25 @@ class ToolboxWindow(QMainWindow):
                 "Bit Depth",
                 "Block Size",
                 "DSD",
+                "EQ Compatibility",
             ]
         )
+        eq_header_item = self.music_compatibility_table.horizontalHeaderItem(8)
+        if eq_header_item is not None:
+            eq_header_item.setToolTip(
+                "Indicates equaliser compatibility only. The file can still play, but if marked not compatible the equaliser will be disabled."
+            )
         self.music_compatibility_table.verticalHeader().setVisible(False)
         self._configure_resizable_table_columns(
             self.music_compatibility_table,
-            [340, 110, 120, 260, 150, 100, 110, 90],
+            [320, 100, 120, 300, 140, 90, 100, 90, 140],
         )
         self.music_compatibility_table.setAlternatingRowColors(True)
         self.music_compatibility_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.music_compatibility_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.music_compatibility_table.setSortingEnabled(True)
 
-        music_compatibility_layout.addWidget(music_compatibility_hint)
         music_compatibility_layout.addLayout(music_compatibility_controls)
-        music_compatibility_layout.addWidget(self.music_compatibility_search_input)
         music_compatibility_layout.addWidget(self.music_compatibility_summary_label)
         music_compatibility_layout.addWidget(self.music_compatibility_progress)
         music_compatibility_layout.addWidget(self.music_compatibility_table, 1)
@@ -1644,6 +2028,7 @@ class ToolboxWindow(QMainWindow):
                 "Welcome to the Snowsky Echo Mini Toolbox, your one-stop shop for organizing and converting your music media. To start, select the location of your media by browsing or choosing one of the mounted drives at the top of the interface.\n\n"
                 "It is recommended to connect your microSD card directly to your computer using a USB reader, rather than plugging in the Snowsky Echo Mini itself, as the device uses a slower interface.\n\n"
                 "The 'About Drive/Folder' tool is useful for ensuring that your microSD card is compatible with your Echo Mini.\n\n"
+                "Please note that editing file metadata is likely to corrupt its record in you favourites.\n\n"
                 "Filesystem Rules:\n"
                 "- Formatted as FAT/FAT32 or exFAT.\n"
                 "- Maximum drive size of 256GB.\n\n"
@@ -1672,18 +2057,17 @@ class ToolboxWindow(QMainWindow):
             ),  
             "Music Compatibility": (
                 "Evaluate every music file in the target directory against Echo Mini playback rules.\n\n"
-                "Recommended Workflow:\n"
-                "1) Run 'Scan Music Compatibility.'\n"
-                "2) Sort by Status and Reason to identify the largest problem groups first.\n"
-                "3) Use the search box to isolate specific formats, sampling rates, or failure reasons.\n"
-                "4) Convert or replace unsupported files, then re-run the scan to validate.\n\n"
+                "It is recommended to connect your microSD card directly to your computer using a USB reader, rather than plugging in the Snowsky Echo Mini itself, as the device uses a slower interface.\n\n"
                 "Status Guidance:\n"
                 "- Supported: The file is expected to play correctly.\n"
                 "- Unsupported: The format or attributes conflict with device rules.\n"
                 "- Unknown: Metadata was incomplete or inconclusive.\n"
                 "- Skipped: The file was not recognized as a valid audio candidate.\n\n"
-                "Best Practice:\n"
-                "Prioritize unsupported items with clear reason strings first, then review unknown results manually."
+                "Compatibility Rules:\n"
+                "Equalizer Compatibility:\n"
+                "For files to be compatible with the internal equalizer they will need to meet additional constraints.\n"
+                "- >=16-bit depth\n"
+                "- >=192 kHz sample rate\n"
             ),
             "Lyrics Manager": (
                 "To add lyrics to your audio files, you will need a supplementary .lrc file; the Snowsky Echo Mini does not support embedded lyric data.\n\n"
@@ -4318,6 +4702,7 @@ class ToolboxWindow(QMainWindow):
                 "No Target",
                 "Choose a folder or drive before running music compatibility scan.",
             )
+            self.music_compatibility_convert_btn.setEnabled(False)
             return
 
         target_path = Path(target).expanduser()
@@ -4332,15 +4717,19 @@ class ToolboxWindow(QMainWindow):
                 "Invalid Target",
                 "The selected target path is not a valid folder.",
             )
+            self.music_compatibility_convert_btn.setEnabled(False)
             return
 
         resolved_target = Path(target_path.resolve())
+        self._music_compatibility_scan_target = resolved_target
         self.music_compatibility_table.setRowCount(0)
         self.music_compatibility_summary_label.setText("Preparing compatibility scan...")
         self.music_compatibility_progress.setRange(0, 1)
         self.music_compatibility_progress.setValue(0)
         self.music_compatibility_progress.setFormat("Preparing scan...")
         self.music_compatibility_scan_btn.setEnabled(False)
+        self.music_compatibility_cancel_btn.setEnabled(True)
+        self.music_compatibility_convert_btn.setEnabled(False)
 
         self._music_compatibility_scan_thread = QThread(self)
         self._music_compatibility_scan_worker = MusicCompatibilityScanWorker(resolved_target)
@@ -4349,9 +4738,11 @@ class ToolboxWindow(QMainWindow):
         self._music_compatibility_scan_thread.started.connect(self._music_compatibility_scan_worker.run)
         self._music_compatibility_scan_worker.progress.connect(self._on_music_compatibility_scan_progress)
         self._music_compatibility_scan_worker.finished.connect(self._on_music_compatibility_scan_finished)
+        self._music_compatibility_scan_worker.cancelled.connect(self._on_music_compatibility_scan_cancelled)
         self._music_compatibility_scan_worker.failed.connect(self._on_music_compatibility_scan_failed)
 
         self._music_compatibility_scan_worker.finished.connect(self._music_compatibility_scan_thread.quit)
+        self._music_compatibility_scan_worker.cancelled.connect(self._music_compatibility_scan_thread.quit)
         self._music_compatibility_scan_worker.failed.connect(self._music_compatibility_scan_thread.quit)
         self._music_compatibility_scan_thread.finished.connect(
             self._music_compatibility_scan_worker.deleteLater
@@ -4363,10 +4754,611 @@ class ToolboxWindow(QMainWindow):
 
         self._music_compatibility_scan_thread.start()
 
+    def cancel_music_compatibility_scan(self) -> None:
+        worker = self._music_compatibility_scan_worker
+        thread = self._music_compatibility_scan_thread
+        if worker is None or thread is None or not thread.isRunning():
+            return
+
+        worker.request_cancel()
+        self.music_compatibility_cancel_btn.setEnabled(False)
+        self.music_compatibility_progress.setFormat("Cancelling scan...")
+        self.statusBar().showMessage("Cancelling music compatibility scan...")
+
+    def _update_music_compatibility_convert_button_state(self) -> None:
+        target = self.path_input.text().strip()
+        if not target:
+            self.music_compatibility_convert_btn.setEnabled(False)
+            return
+
+        target_path = Path(target).expanduser()
+        if not target_path.exists() or not target_path.is_dir():
+            self.music_compatibility_convert_btn.setEnabled(False)
+            return
+
+        resolved_target = target_path.resolve()
+        has_actionable_results = self._last_music_compatibility_unsupported_count > 0
+        self.music_compatibility_convert_btn.setEnabled(
+            self._last_music_compatibility_scan_target == resolved_target
+            and has_actionable_results
+            and not self._music_conversion_busy
+        )
+
     @Slot()
     def _clear_music_compatibility_scan_refs(self) -> None:
         self._music_compatibility_scan_worker = None
         self._music_compatibility_scan_thread = None
+
+    @Slot(int, int, int, int, int, int)
+    def _on_music_compatibility_scan_cancelled(
+        self,
+        scanned: int,
+        total: int,
+        supported: int,
+        unsupported: int,
+        unknown: int,
+        skipped: int,
+    ) -> None:
+        self._music_compatibility_scan_target = None
+        self._last_music_compatibility_unsupported_count = 0
+        self.music_compatibility_scan_btn.setEnabled(True)
+        self.music_compatibility_cancel_btn.setEnabled(False)
+        self.music_compatibility_progress.setRange(0, max(total, 1))
+        self.music_compatibility_progress.setValue(min(scanned, max(total, 1)))
+        self.music_compatibility_progress.setFormat(
+            f"Scan cancelled at {scanned}/{total if total > 0 else 0}"
+        )
+        self.music_compatibility_summary_label.setText(
+            f"Scan cancelled | Scanned: {scanned}/{total} | Supported: {supported} | Unsupported: {unsupported} | "
+            f"Unknown: {unknown} | Skipped: {skipped}"
+        )
+        self.statusBar().showMessage("Music compatibility scan cancelled", 5000)
+        self._update_music_compatibility_convert_button_state()
+
+    def open_music_conversion_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setObjectName("musicConvertDialog")
+        dialog.setWindowTitle("Convert Incompatible Music")
+        dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setAttribute(Qt.WA_StyledBackground, True)
+        dialog.setMinimumWidth(560)
+        dialog.setStyleSheet(
+            """
+            QDialog#musicConvertDialog {
+                background-color: #262626;
+                color: #ECECEC;
+                border: 1px solid #3C3C3C;
+                border-radius: 0px;
+            }
+            QDialog#musicConvertDialog QLabel {
+                background-color: transparent;
+                color: #ECECEC;
+            }
+            QDialog#musicConvertDialog QCheckBox {
+                spacing: 8px;
+                color: #ECECEC;
+                padding: 2px 0px;
+            }
+            QDialog#musicConvertDialog QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+                border: 1px solid #4B4B4B;
+                border-radius: 0px;
+                background-color: #1F1F1F;
+            }
+            QDialog#musicConvertDialog QCheckBox::indicator:checked {
+                background-color: #565656;
+            }
+            """
+        )
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        title_label = QLabel("Convert Incompatible Music")
+        title_label.setObjectName("sectionLabel")
+
+        intro_label = QLabel(
+            "This tool converts your existing audio files into formats compatible with the Snowsky Echo Mini. In some cases, this process may reduce the audio quality to meet device limitations. If your original files are important, it’s recommended to back them up before proceeding."
+        )
+        intro_label.setWordWrap(True)
+
+        eq_checkbox = QCheckBox("Make files EQ compatible (optional)")
+
+        dry_run_checkbox = QCheckBox("Dry run only (preview changes, do not write files)")
+        backup_checkbox = QCheckBox("Back up originals before conversion")
+
+        speed_profile_label = QLabel("Speed profile")
+        speed_profile_label.setObjectName("targetSummary")
+
+        speed_profile_combo = QComboBox()
+        speed_profile_combo.addItem("Fast (recommended)", "fast")
+        speed_profile_combo.addItem("Balanced", "balanced")
+        speed_profile_combo.addItem("Smallest files", "smallest")
+        for profile_index in range(speed_profile_combo.count()):
+            profile_key = str(speed_profile_combo.itemData(profile_index))
+            profile_title, _compression_level, profile_help_text = self._conversion_profile_config(
+                profile_key
+            )
+            speed_profile_combo.setItemData(
+                profile_index,
+                f"{profile_title}: {profile_help_text}",
+                Qt.ToolTipRole,
+            )
+        speed_profile_combo.setCurrentIndex(0)
+
+        def _update_speed_profile_tooltip() -> None:
+            selected_index = speed_profile_combo.currentIndex()
+            selected_tooltip = speed_profile_combo.itemData(selected_index, Qt.ToolTipRole)
+            speed_profile_combo.setToolTip(str(selected_tooltip or ""))
+
+        mode_label = QLabel()
+        mode_label.setWordWrap(True)
+        mode_label.setObjectName("targetSummary")
+
+        quality_warning = QLabel(
+            "Warning: Making files EQ compatible degrades audio quality further."
+        )
+        quality_warning.setWordWrap(True)
+        quality_warning.setObjectName("targetSummary")
+
+        overwrite_warning = QLabel()
+        overwrite_warning.setWordWrap(True)
+        overwrite_warning.setObjectName("targetSummary")
+
+        backup_path_label = QLabel("Backup folder")
+        backup_path_label.setObjectName("targetSummary")
+
+        backup_path_input = QLineEdit()
+        backup_path_input.setPlaceholderText("Backup folder (optional unless backup is enabled)")
+        backup_path_browse_btn = QPushButton("Choose Backup Folder")
+
+        backup_path_row = QHBoxLayout()
+        backup_path_row.addWidget(backup_path_input, 1)
+        backup_path_row.addWidget(backup_path_browse_btn)
+
+        def _choose_backup_folder() -> None:
+            selected = QFileDialog.getExistingDirectory(
+                self,
+                "Choose Backup Folder",
+                str(Path.home()),
+            )
+            if selected:
+                backup_path_input.setText(selected)
+
+        backup_path_browse_btn.clicked.connect(_choose_backup_folder)
+
+        def _update_backup_controls() -> None:
+            backup_enabled = backup_checkbox.isChecked() and not dry_run_checkbox.isChecked()
+            backup_path_label.setVisible(backup_enabled)
+            backup_path_input.setVisible(backup_enabled)
+            backup_path_browse_btn.setVisible(backup_enabled)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        confirm_btn = QPushButton("Convert")
+        button_row.addWidget(cancel_btn)
+        button_row.addWidget(confirm_btn)
+
+        def _update_conversion_mode_text(eq_mode_enabled: bool) -> None:
+            if eq_mode_enabled:
+                mode_label.setText(
+                    "Highest quality supported EQ-compatible output."
+                )
+                overwrite_warning.setText(
+                    "Warning: This action will convert and overwrite files to the highest quality supported EQ-compatible output."
+                )
+                quality_warning.setVisible(True)
+            else:
+                mode_label.setText("Highest quality compatible FLAC output.")
+                overwrite_warning.setText(
+                    "Warning: This action will convert and overwrite files to the highest quality compatible FLAC."
+                )
+                quality_warning.setVisible(False)
+
+            if dry_run_checkbox.isChecked():
+                overwrite_warning.setText(
+                    "Dry run: no files will be changed. The operation will only preview what would be converted."
+                )
+
+        _update_conversion_mode_text(eq_checkbox.isChecked())
+        _update_speed_profile_tooltip()
+        _update_backup_controls()
+        eq_checkbox.toggled.connect(_update_conversion_mode_text)
+        dry_run_checkbox.toggled.connect(lambda _checked: _update_conversion_mode_text(eq_checkbox.isChecked()))
+        dry_run_checkbox.toggled.connect(lambda _checked: _update_backup_controls())
+        backup_checkbox.toggled.connect(lambda _checked: _update_backup_controls())
+        speed_profile_combo.currentIndexChanged.connect(lambda _index: _update_speed_profile_tooltip())
+        cancel_btn.clicked.connect(dialog.reject)
+
+        def _confirm_conversion_request() -> None:
+            selected_profile = str(speed_profile_combo.currentData())
+            profile_title, _compression_level, _profile_help_text = self._conversion_profile_config(
+                selected_profile
+            )
+
+            if eq_checkbox.isChecked():
+                confirm_text = (
+                    "This will convert and overwrite files to the highest quality supported EQ-compatible output.\n"
+                    "Making files EQ compatible will degrade audio quality further.\n\n"
+                    f"Speed profile: {profile_title}\n\n"
+                    "Do you want to continue?"
+                )
+            else:
+                confirm_text = (
+                    "This will convert and overwrite files to the highest quality compatible FLAC.\n\n"
+                    f"Speed profile: {profile_title}\n\n"
+                    "Do you want to continue?"
+                )
+
+            confirm = QMessageBox.warning(
+                self,
+                "Confirm Conversion",
+                confirm_text,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if confirm == QMessageBox.Yes:
+                backup_root: Path | None = None
+                if backup_checkbox.isChecked() and not dry_run_checkbox.isChecked():
+                    backup_text = backup_path_input.text().strip()
+                    if not backup_text:
+                        QMessageBox.warning(
+                            self,
+                            "Backup Folder Required",
+                            "Choose a backup folder or disable backup before starting conversion.",
+                        )
+                        return
+                    backup_candidate = Path(backup_text).expanduser()
+                    try:
+                        backup_root = backup_candidate.resolve()
+                    except Exception:
+                        backup_root = backup_candidate
+
+                dialog.accept()
+                self.convert_incompatible_music(
+                    eq_checkbox.isChecked(),
+                    selected_profile,
+                    dry_run=dry_run_checkbox.isChecked(),
+                    backup_root=backup_root,
+                )
+
+        confirm_btn.clicked.connect(_confirm_conversion_request)
+
+        layout.addWidget(title_label)
+        layout.addWidget(intro_label)
+        layout.addWidget(eq_checkbox)
+        layout.addWidget(dry_run_checkbox)
+        layout.addWidget(backup_checkbox)
+        layout.addWidget(backup_path_label)
+        layout.addLayout(backup_path_row)
+        layout.addWidget(speed_profile_label)
+        layout.addWidget(speed_profile_combo)
+        layout.addWidget(mode_label)
+        layout.addWidget(quality_warning)
+        layout.addWidget(overwrite_warning)
+        layout.addStretch(1)
+        layout.addLayout(button_row)
+
+        fixed_size = dialog.sizeHint()
+        dialog.setFixedSize(fixed_size)
+        dialog.setMask(QRegion(dialog.rect()))
+
+        dialog.exec()
+
+    def _set_conversion_ui_locked(self, locked: bool) -> None:
+        enabled = not locked
+
+        central_widget = self.centralWidget()
+        if central_widget is not None:
+            central_widget.setEnabled(enabled)
+
+        menu_bar = self.menuBar()
+        if menu_bar is not None:
+            menu_bar.setEnabled(enabled)
+
+    def _conversion_profile_config(self, profile_key: str) -> tuple[str, int, str]:
+        profile_map: dict[str, tuple[str, int, str]] = {
+            "fast": (
+                "Fast",
+                5,
+                "Faster conversion, larger FLAC files.",
+            ),
+            "balanced": (
+                "Balanced",
+                8,
+                "Good speed and compression balance.",
+            ),
+            "smallest": (
+                "Smallest files",
+                12,
+                "Slowest conversion, smallest FLAC files.",
+            ),
+        }
+        return profile_map.get(profile_key, profile_map["balanced"])
+
+    def _collect_music_conversion_candidates(
+        self,
+        make_eq_compatible: bool,
+        *,
+        include_unknown_for_eq: bool = True,
+    ) -> list[dict[str, object]]:
+        candidates: list[dict[str, object]] = []
+        for row in range(self.music_compatibility_table.rowCount()):
+            file_item = self.music_compatibility_table.item(row, 0)
+            status_item = self.music_compatibility_table.item(row, 2)
+            sample_rate_item = self.music_compatibility_table.item(row, 4)
+            bit_depth_item = self.music_compatibility_table.item(row, 5)
+            eq_item = self.music_compatibility_table.item(row, 8)
+
+            if file_item is None or status_item is None:
+                continue
+
+            status_text = status_item.text().strip().upper()
+            eq_text = eq_item.text().strip().lower() if eq_item is not None else ""
+
+            should_convert = status_text == "UNSUPPORTED"
+            eq_actionable_states = {"not compatible"}
+            if include_unknown_for_eq:
+                eq_actionable_states.add("unknown")
+
+            if make_eq_compatible and eq_text in eq_actionable_states:
+                should_convert = True
+
+            if not should_convert:
+                continue
+
+            candidates.append(
+                {
+                    "relative_file": file_item.text().strip(),
+                    "sample_rate": sample_rate_item.text().strip() if sample_rate_item else "",
+                    "bit_depth": bit_depth_item.text().strip() if bit_depth_item else "",
+                }
+            )
+
+        return candidates
+
+    def convert_incompatible_music(
+        self,
+        make_eq_compatible: bool,
+        speed_profile: str,
+        *,
+        dry_run: bool = False,
+        backup_root: Path | None = None,
+    ) -> None:
+        if shutil.which("ffmpeg") is None:
+            QMessageBox.warning(
+                self,
+                "ffmpeg Not Found",
+                "ffmpeg is required for conversion but was not found in PATH.",
+            )
+            return
+
+        profile_label, compression_level, _profile_help = self._conversion_profile_config(speed_profile)
+
+        target_text = self.path_input.text().strip()
+        if not target_text:
+            QMessageBox.information(
+                self,
+                "No Target",
+                "Choose a folder or drive target before conversion.",
+            )
+            return
+
+        target_path = Path(target_text).expanduser()
+        if not target_path.exists() or not target_path.is_dir():
+            QMessageBox.warning(
+                self,
+                "Invalid Target",
+                "The selected target path is not a valid folder.",
+            )
+            return
+        resolved_target_path = target_path.resolve()
+
+        if self._last_music_compatibility_scan_target is None:
+            QMessageBox.information(
+                self,
+                "Scan Required",
+                "Run Music Compatibility scan before conversion.",
+            )
+            return
+
+        if self._last_music_compatibility_scan_target != resolved_target_path:
+            QMessageBox.warning(
+                self,
+                "Target Changed",
+                "Target changed since last completed Music Compatibility scan. Run scan again before conversion.",
+            )
+            return
+
+        candidates = self._collect_music_conversion_candidates(make_eq_compatible)
+        if not candidates:
+            QMessageBox.information(
+                self,
+                "Nothing To Convert",
+                "No incompatible files matched the selected conversion mode.",
+            )
+            return
+
+        mode_label = "EQ-compatible" if make_eq_compatible else "FLAC"
+        self._music_conversion_mode_label = mode_label
+        self._music_conversion_profile_label = profile_label
+
+        progress_title = "Previewing incompatible music conversion..." if dry_run else (
+            f"Converting incompatible music to {mode_label} ({profile_label})..."
+        )
+
+        progress = QProgressDialog(
+            progress_title,
+            "Cancel",
+            0,
+            len(candidates),
+            self,
+        )
+        progress.setWindowTitle("Convert Incompatible Music")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.setWindowFlag(Qt.WindowCloseButtonHint, False)
+        progress.show()
+        QApplication.processEvents()
+
+        self._music_conversion_progress_dialog = progress
+        self._music_conversion_busy = True
+        self._set_conversion_ui_locked(True)
+        self._update_music_compatibility_convert_button_state()
+
+        self._music_conversion_thread = QThread(self)
+        self._music_conversion_worker = MusicConversionWorker(
+            resolved_target_path,
+            candidates,
+            make_eq_compatible,
+            compression_level,
+            dry_run,
+            backup_root,
+        )
+        self._music_conversion_worker.moveToThread(self._music_conversion_thread)
+
+        self._music_conversion_thread.started.connect(self._music_conversion_worker.run)
+        self._music_conversion_worker.progress.connect(self._on_music_conversion_progress)
+        self._music_conversion_worker.finished.connect(self._on_music_conversion_finished)
+        self._music_conversion_worker.cancelled.connect(self._on_music_conversion_cancelled)
+        self._music_conversion_worker.failed.connect(self._on_music_conversion_failed)
+
+        self._music_conversion_worker.finished.connect(self._music_conversion_thread.quit)
+        self._music_conversion_worker.cancelled.connect(self._music_conversion_thread.quit)
+        self._music_conversion_worker.failed.connect(self._music_conversion_thread.quit)
+        self._music_conversion_thread.finished.connect(self._music_conversion_worker.deleteLater)
+        self._music_conversion_thread.finished.connect(self._music_conversion_thread.deleteLater)
+        self._music_conversion_thread.finished.connect(self._clear_music_conversion_refs)
+
+        progress.canceled.connect(self.cancel_music_conversion)
+
+        self._music_conversion_thread.start()
+
+    def cancel_music_conversion(self) -> None:
+        worker = self._music_conversion_worker
+        if worker is None:
+            return
+        worker.request_cancel()
+        if self._music_conversion_progress_dialog is not None:
+            self._music_conversion_progress_dialog.setLabelText("Cancelling conversion...")
+
+    @Slot(int, int, str)
+    def _on_music_conversion_progress(self, processed: int, total: int, detail: str) -> None:
+        dialog = self._music_conversion_progress_dialog
+        if dialog is None:
+            return
+        dialog.setRange(0, max(total, 1))
+        dialog.setValue(min(processed, max(total, 1)))
+        dialog.setLabelText(detail)
+
+    @Slot(object)
+    def _on_music_conversion_finished(self, payload_obj) -> None:
+        payload = payload_obj if isinstance(payload_obj, dict) else {}
+        converted = int(payload.get("converted") or 0)
+        failed = int(payload.get("failed") or 0)
+        planned = int(payload.get("planned") or 0)
+        dry_run = bool(payload.get("dry_run"))
+        backup_root = str(payload.get("backup_root") or "")
+        failures = payload.get("failures") or []
+
+        self._set_conversion_ui_locked(False)
+        if self._music_conversion_progress_dialog is not None:
+            self._music_conversion_progress_dialog.close()
+            self._music_conversion_progress_dialog = None
+
+        self._music_conversion_busy = False
+        self._update_music_compatibility_convert_button_state()
+
+        if dry_run:
+            summary = (
+                f"Dry run complete. Files that would be converted: {planned}. Failed prechecks: {failed}."
+            )
+            self.statusBar().showMessage(summary, 5000)
+            if failed:
+                preview = "\n".join(str(item) for item in failures[:15])
+                QMessageBox.warning(
+                    self,
+                    "Dry Run Completed With Errors",
+                    f"{summary}\n\nFailures:\n{preview}",
+                )
+            else:
+                QMessageBox.information(self, "Dry Run Completed", summary)
+            return
+
+        summary = (
+            f"Conversion complete ({self._music_conversion_mode_label}, {self._music_conversion_profile_label}). "
+            f"Converted: {converted} | Failed: {failed}"
+        )
+        if backup_root:
+            summary += f"\nBackups saved to: {backup_root}"
+        self.statusBar().showMessage(summary.replace("\n", " | "), 5000)
+
+        if failed:
+            preview = "\n".join(str(item) for item in failures[:15])
+            QMessageBox.warning(
+                self,
+                "Conversion Completed With Errors",
+                f"{summary}\n\nFailures:\n{preview}",
+            )
+        else:
+            QMessageBox.information(self, "Conversion Completed", summary)
+
+        self.scan_music_compatibility()
+
+    @Slot(object)
+    def _on_music_conversion_cancelled(self, payload_obj) -> None:
+        payload = payload_obj if isinstance(payload_obj, dict) else {}
+        converted = int(payload.get("converted") or 0)
+        failed = int(payload.get("failed") or 0)
+        planned = int(payload.get("planned") or 0)
+        dry_run = bool(payload.get("dry_run"))
+        failures = payload.get("failures") or []
+
+        self._set_conversion_ui_locked(False)
+        if self._music_conversion_progress_dialog is not None:
+            self._music_conversion_progress_dialog.close()
+            self._music_conversion_progress_dialog = None
+
+        self._music_conversion_busy = False
+        self._update_music_compatibility_convert_button_state()
+
+        if dry_run:
+            message = f"Dry run cancelled. Planned: {planned} | Failed prechecks: {failed}"
+        else:
+            message = f"Conversion cancelled. Converted: {converted} | Failed: {failed}"
+
+        self.statusBar().showMessage(message, 5000)
+        if failures:
+            preview = "\n".join(str(item) for item in failures[:10])
+            QMessageBox.warning(
+                self,
+                "Conversion Cancelled",
+                f"{message}\n\nFailures:\n{preview}",
+            )
+
+    @Slot(str)
+    def _on_music_conversion_failed(self, error: str) -> None:
+        self._set_conversion_ui_locked(False)
+        if self._music_conversion_progress_dialog is not None:
+            self._music_conversion_progress_dialog.close()
+            self._music_conversion_progress_dialog = None
+
+        self._music_conversion_busy = False
+        self._update_music_compatibility_convert_button_state()
+        self.statusBar().showMessage(f"Conversion failed: {error}", 5000)
+        QMessageBox.warning(self, "Conversion Failed", error)
+
+    @Slot()
+    def _clear_music_conversion_refs(self) -> None:
+        self._music_conversion_worker = None
+        self._music_conversion_thread = None
 
     @Slot(int, int, int, int, int, int)
     def _on_music_compatibility_scan_progress(
@@ -4381,6 +5373,7 @@ class ToolboxWindow(QMainWindow):
         total_for_ui = max(total, 1)
         self.music_compatibility_progress.setRange(0, total_for_ui)
         self.music_compatibility_progress.setValue(min(scanned, total_for_ui))
+        self.music_compatibility_cancel_btn.setEnabled(True)
 
         if total == 0:
             self.music_compatibility_progress.setFormat("No files found")
@@ -4396,35 +5389,61 @@ class ToolboxWindow(QMainWindow):
     @Slot(str)
     def _apply_music_compatibility_table_filter(self, query: str) -> None:
         normalized_query = query.strip().lower()
+        quick_filter = str(self.music_compatibility_quick_filter_combo.currentData() or "all")
         filter_all = not normalized_query
 
         for row in range(self.music_compatibility_table.rowCount()):
-            if filter_all:
-                self.music_compatibility_table.setRowHidden(row, False)
-                continue
+            quick_filter_match = True
+            status_item = self.music_compatibility_table.item(row, 2)
+            eq_item = self.music_compatibility_table.item(row, 8)
+            status_text = status_item.text().strip().upper() if status_item is not None else ""
+            eq_text = eq_item.text().strip().lower() if eq_item is not None else ""
 
-            row_matches = False
-            for col in range(self.music_compatibility_table.columnCount()):
-                item = self.music_compatibility_table.item(row, col)
-                if item is None:
-                    continue
-                if normalized_query in item.text().lower():
-                    row_matches = True
-                    break
+            if quick_filter == "unsupported":
+                quick_filter_match = status_text == "UNSUPPORTED"
+            elif quick_filter == "unknown":
+                quick_filter_match = status_text == "UNKNOWN"
+            elif quick_filter == "supported":
+                quick_filter_match = status_text == "SUPPORTED"
+            elif quick_filter == "skipped":
+                quick_filter_match = status_text == "SKIPPED"
+            elif quick_filter == "eq_not_compatible":
+                quick_filter_match = eq_text == "not compatible"
+            elif quick_filter == "actionable":
+                quick_filter_match = status_text == "UNSUPPORTED" or eq_text in {
+                    "not compatible",
+                    "unknown",
+                }
 
-            self.music_compatibility_table.setRowHidden(row, not row_matches)
+            text_match = True
+            if not filter_all:
+                text_match = False
+                for col in range(self.music_compatibility_table.columnCount()):
+                    item = self.music_compatibility_table.item(row, col)
+                    if item is None:
+                        continue
+                    if normalized_query in item.text().lower():
+                        text_match = True
+                        break
+
+            self.music_compatibility_table.setRowHidden(row, not (quick_filter_match and text_match))
 
     @Slot(list, int, int, int, int, int)
     def _on_music_compatibility_scan_finished(
         self,
-        rows: list[tuple[str, str, str, str, str, str, str, str, str]],
+        rows: list[tuple[str, str, str, str, str, str, str, str, str, str]],
         supported: int,
         unsupported: int,
         unknown: int,
         skipped: int,
         total_files: int,
     ) -> None:
+        self._last_music_compatibility_scan_target = self._music_compatibility_scan_target
+        self._last_music_compatibility_unsupported_count = unsupported
+        self._music_compatibility_scan_target = None
         self.music_compatibility_scan_btn.setEnabled(True)
+        self.music_compatibility_cancel_btn.setEnabled(False)
+        self._update_music_compatibility_convert_button_state()
 
         self.music_compatibility_table.setSortingEnabled(False)
         self.music_compatibility_table.setUpdatesEnabled(False)
@@ -4440,6 +5459,7 @@ class ToolboxWindow(QMainWindow):
                     bit_depth,
                     block_size,
                     dsd_profile,
+                    eq_compatibility,
                     category,
                 ) = row
 
@@ -4452,7 +5472,11 @@ class ToolboxWindow(QMainWindow):
                     QTableWidgetItem(bit_depth),
                     QTableWidgetItem(block_size),
                     QTableWidgetItem(dsd_profile),
+                    QTableWidgetItem(eq_compatibility),
                 ]
+
+                reason_item = items[3]
+                reason_item.setToolTip(reason)
 
                 for col, item in enumerate(items):
                     self.music_compatibility_table.setItem(row_index, col, item)
@@ -4474,6 +5498,19 @@ class ToolboxWindow(QMainWindow):
                 if status_item is not None:
                     status_item.setBackground(status_bg)
                     status_item.setForeground(status_fg)
+
+                eq_item = self.music_compatibility_table.item(row_index, 8)
+                if eq_item is not None:
+                    eq_text = eq_item.text().strip().lower()
+                    if eq_text == "not compatible":
+                        eq_item.setBackground(QColor("#7A2C2C"))
+                        eq_item.setForeground(QColor("#FFF0F0"))
+                    elif eq_text == "compatible":
+                        eq_item.setBackground(QColor("#2E7D32"))
+                        eq_item.setForeground(QColor("#F2FFF2"))
+                    elif eq_text == "unknown":
+                        eq_item.setBackground(QColor("#7A5E2C"))
+                        eq_item.setForeground(QColor("#FFF9E6"))
         finally:
             self.music_compatibility_table.setUpdatesEnabled(True)
             self.music_compatibility_table.setSortingEnabled(True)
@@ -4501,7 +5538,11 @@ class ToolboxWindow(QMainWindow):
 
     @Slot(str)
     def _on_music_compatibility_scan_failed(self, error: str) -> None:
+        self._music_compatibility_scan_target = None
+        self._last_music_compatibility_unsupported_count = 0
         self.music_compatibility_scan_btn.setEnabled(True)
+        self.music_compatibility_cancel_btn.setEnabled(False)
+        self.music_compatibility_convert_btn.setEnabled(False)
         self.music_compatibility_progress.setRange(0, 1)
         self.music_compatibility_progress.setValue(0)
         self.music_compatibility_progress.setFormat("Scan failed")
@@ -6371,6 +7412,8 @@ class ToolboxWindow(QMainWindow):
             target_path = Path(target).expanduser()
             if target_path.exists() and target_path.is_dir():
                 resolved_target = str(target_path.resolve())
+
+        self._update_music_compatibility_convert_button_state()
 
         if self._cleanup_scan_target and resolved_target != self._cleanup_scan_target:
             if resolved_target:
