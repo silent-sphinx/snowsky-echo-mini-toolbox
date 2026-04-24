@@ -53,7 +53,7 @@ These are always marked **UNSUPPORTED**:
 
 ## Other Known Audio Extensions
 
-The checker recognizes these extensions as audio for scanning, but they are **not supported** and are marked **UNSUPPORTED** with the reason "Format not listed":
+The checker recognizes these extensions as audio for scanning, but they are **not supported** and are marked **UNSUPPORTED** with a reason that indicates the extension is recognized audio but not in the supported list:
 
 - `aac`
 - `aif`
