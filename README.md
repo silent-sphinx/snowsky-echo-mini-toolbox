@@ -59,7 +59,7 @@ Locate the Releases page for this project and select the correct installation fi
 
 ## Build from source
 
-This project is developed in Python, it's advised to use version 3.10.
+This project is developed in Python 3.12+, and using Python 3.12 is recommended.
 
 1. Ensure that ffmpeg is installed (for ffprobe)
 2. Clone the repository.
