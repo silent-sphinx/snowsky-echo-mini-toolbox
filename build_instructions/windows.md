@@ -1,13 +1,16 @@
-# Build for Windows (Always Bundle ffprobe)
+# Build Installer for Windows (Always Bundle ffprobe)
 
-These steps create a standalone Windows app and always include ffprobe in the build output.
+These steps create:
+
+- a standalone app folder (`dist\Snowsky Echo Mini Toolbox\...`)
+- a Windows installer (`dist\Snowsky-Echo-Mini-Toolbox-Windows-Setup.exe`)
 
 ## 1) Prepare build environment
 
 Open PowerShell in the project root:
 
 ```powershell
-cd "C:\path\to\Snowsky Echo Mini Toolbox"
+cd "C:\path\to\snowsky-echo-mini-toolbox"
 
 py -3.12 -m venv .venv-build
 .\.venv-build\Scripts\Activate.ps1
@@ -15,6 +18,12 @@ py -3.12 -m venv .venv-build
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 pip install pyinstaller pillow
+```
+
+Install Inno Setup (one-time):
+
+```powershell
+winget install --id JRSoftware.InnoSetup -e
 ```
 
 ## 2) Prepare bundled ffprobe files
@@ -66,7 +75,7 @@ if base:
 '@ | Set-Content -Encoding UTF8 pyi_ffprobe_path_hook.py
 ```
 
-## 3) Build executable
+## 3) Build executable folder (PyInstaller)
 
 ```powershell
 pyinstaller `
@@ -75,7 +84,6 @@ pyinstaller `
   --windowed `
   --noconfirm `
   --clean `
-  --collect-all PySide6 `
   --hidden-import certifi `
   --add-binary "build_assets\ffprobe.exe;." `
   --runtime-hook pyi_ffprobe_path_hook.py `
@@ -84,10 +92,47 @@ pyinstaller `
 
 Build output:
 
-- dist\Snowsky Echo Mini Toolbox\Snowsky Echo Mini Toolbox.exe
+- `dist\Snowsky Echo Mini Toolbox\Snowsky Echo Mini Toolbox.exe`
 
-## 4) Test executable
+## 4) Build installer (Inno Setup)
+
+Update app version in `build_instructions\windows_installer.iss` before release:
+
+```iss
+#define MyAppVersion "1.0.0"
+```
+
+Compile installer:
+
+```powershell
+$isccCandidates = @(
+  "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+  "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+  "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+)
+
+$iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $iscc) {
+    throw "ISCC.exe not found. Confirm Inno Setup is installed."
+}
+
+& $iscc ".\build_instructions\windows_installer.iss"
+```
+
+Installer output:
+
+- `dist\Snowsky-Echo-Mini-Toolbox-Windows-Setup.exe`
+
+## 5) Test
+
+Run the portable executable:
 
 ```powershell
 .\dist\"Snowsky Echo Mini Toolbox"\"Snowsky Echo Mini Toolbox.exe"
+```
+
+Run installer:
+
+```powershell
+.\dist\Snowsky-Echo-Mini-Toolbox-Windows-Setup.exe
 ```
