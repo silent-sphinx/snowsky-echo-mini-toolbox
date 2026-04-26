@@ -14,7 +14,7 @@ py -3.12 -m venv .venv-build
 
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-pip install pyinstaller
+pip install pyinstaller pillow
 ```
 
 ## 2) Prepare bundled ffprobe files
@@ -33,6 +33,23 @@ Copy ffprobe to local build assets:
 New-Item -ItemType Directory -Force build_assets | Out-Null
 $ffprobePath = (Get-Command ffprobe).Source
 Copy-Item $ffprobePath "build_assets\ffprobe.exe" -Force
+```
+
+Prepare app icon (Windows uses `.ico`):
+
+```powershell
+Copy-Item "assets\toolbox-logo.png" "build_assets\toolbox-logo.png" -Force
+
+@'
+from PIL import Image
+
+img = Image.open("build_assets/toolbox-logo.png").convert("RGBA")
+img.save(
+  "build_assets/toolbox-logo.ico",
+  format="ICO",
+  sizes=[(16,16), (24,24), (32,32), (48,48), (64,64), (128,128), (256,256)],
+)
+'@ | .\.venv-build\Scripts\python.exe -
 ```
 
 Create runtime hook so bundled ffprobe is available on PATH:
@@ -54,6 +71,7 @@ if base:
 ```powershell
 pyinstaller `
   --name "Snowsky Echo Mini Toolbox" `
+  --icon "build_assets\toolbox-logo.ico" `
   --windowed `
   --noconfirm `
   --clean `

@@ -1,116 +1,78 @@
 # Snowsky Echo Mini Toolbox
 
-[![Python 3.12](https://img.shields.io/badge/python-3.12%2B-3776AB)](https://www.python.org/)
-[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-0A7E07)](#requirements)
-[![UI](https://img.shields.io/badge/UI-PySide6-41CD52)](https://doc.qt.io/qtforpython-6/)
-![Status](https://img.shields.io/badge/status-active%20development-2ea44f)
-
-An easy desktop app to prepare your music folders and USB drives for the Snowsky Echo Mini.
+Desktop toolbox for checking and maintaining music folders and removable drives used with the Snowsky Echo Mini.
 
 ![Overview](Overview.png)
 
-## Table of Contents
+## What The App Does
 
-- [Snowsky Echo Mini Toolbox](#snowsky-echo-mini-toolbox)
-  - [Table of Contents](#table-of-contents)
-  - [Main Features](#main-features)
-  - [Requirements](#requirements)
-  - [Important Notes](#important-notes)
-  - [Installation](#installation)
-  - [Build from source](#build-from-source)
-  - [Compatibility Rules](#compatibility-rules)
-  - [Contributing](#contributing)
+The current launcher opens a PySide6 desktop app with these tabs:
 
-## Main Features
-
-- About Folder/Drive:
-  - Shows drive or folder info like free space, file system, and permissions.
-- Album Art:
-  - Finds files with missing or incompatible album art.
-  - Can fix incompatible album art in batch.
-- Music Compatibility:
-  - Checks your audio files and shows SUPPORTED, UNSUPPORTED, UNKNOWN, or SKIPPED.
-  - Conversion includes speed profiles (Fast, Balanced, Smallest files) so you can trade encode time vs FLAC file size.
-- Lyrics Manager:
-  - Scans embedded lyrics.
-  - Can create .lrc lyric files and do LRCLIB bulk lookup.
-- File Rename:
-  - Suggests cleaner file names from metadata before you apply changes.
-- File Cleanup:
-  - Groups files by type so you can remove unwanted categories safely.
-- Backup/Restore:
-  - Creates ZIP backups, or copy/move your library to another location.
-- Directory Browser:
-  - Lets you inspect files and run right-click actions for single-file fixes.
-
-## Requirements
-
-- Python 3.12+
-- macOS, Linux, or Windows
-
-## Important Notes
-
-- This program has the ability to modify your Snowsky Echo Mini Library, ALWAYS check to see if the program is making the intended changes on your data, before applying.
-- Make use of the backup tools to protect your library from inadvertant changes.
+- About Folder/Drive: shows target path details (filesystem, disk usage, permissions, modified time, top-level file/folder counts)
+- Album Art: scans embedded artwork, marks files as Compatible/Incompatible/Missing, and can rewrite incompatible embedded art as JPEG non-progressive
+- Music Compatibility: scans files and classifies them as SUPPORTED, UNSUPPORTED, UNKNOWN, or SKIPPED, with reason and metadata columns
+- File Cleanup: scans file-type breakdown (Audio, Image, Video, Document, Archive, Playlist, Subtitle, Executable, Hidden, Other) and removes selected categories
+- Directory Browser: enabled when a removable drive is selected, shows folder sizes, presents rich metadata, and includes right-click Fix Album Art
 
 ## Installation
 
-Locate the Releases page for this project and select the correct installation file for your system architecture.
+### Requirements
 
-## Build from source
+- Python 3.10+
+- macOS, Linux, or Windows
 
-This project is developed in Python 3.12+, and using Python 3.12 is recommended.
+### Setup
 
-1. Ensure that ffmpeg is installed (for ffprobe)
-2. Clone the repository.
-3. Create and activate a virtual environment.
-4. Install dependencies.
-
-macOS and Linux:
+1. Clone or download this repository.
+1. Create and activate a virtual environment:
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
+```
+
+1. Install dependencies:
+
+```bash
 pip install -r requirements.txt
 ```
 
-Windows PowerShell:
+Dependencies listed in requirements.txt:
 
-```powershell
-py -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+- mutagen
+- pydub
+- PySide6
 
-Start the app:
+## Run
+
+Start the GUI:
 
 ```bash
 python3 main.py
 ```
 
-Start with a pre-selected target path:
+Optional: start with an initial target path pre-filled:
 
 ```bash
 python3 main.py --path /path/to/folder-or-drive
 ```
 
-## Compatibility Rules
+Short flag:
 
-Full technical rules are in [COMPATIBILITY.md](COMPATIBILITY.md).
+```bash
+python3 main.py -p /path/to/folder-or-drive
+```
 
-## Contributing
+## Audio Compatibility Rules
 
-Contributions are welcome.
+The scanner validates formats using the rules in [COMPATIBILITY.md](COMPATIBILITY.md).
 
-Basic flow:
+Quick summary:
 
-1. Open an issue describing the change or bug.
-1. Create a focused branch.
-1. Keep pull requests small and include test or validation steps.
-1. Update documentation when behavior changes.
+- Always supported lossy: MP3, OGG, M4A, WMA
+- PCM formats (WAV, FLAC, APE): must be <= 192000 Hz and <= 24-bit
+- FLAC also checks max block size
+- DSD formats (DSF, DFF): supports DSD64, DSD128, DSD256
+- Known unsupported audio formats are reported as UNSUPPORTED
+- Non-audio files are SKIPPED
 
-If you add a new tab or workflow, include:
-
-- What users will see and do
-- How errors are handled
-- Any dependency or platform notes
