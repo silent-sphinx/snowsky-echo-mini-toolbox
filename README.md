@@ -1,78 +1,131 @@
 # Snowsky Echo Mini Toolbox
 
-Desktop toolbox for checking and maintaining music folders and removable drives used with the Snowsky Echo Mini.
+[![Python 3.12](https://img.shields.io/badge/python-3.12%2B-3776AB)](https://www.python.org/)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-0A7E07)](#requirements)
+[![UI](https://img.shields.io/badge/UI-PySide6-41CD52)](https://doc.qt.io/qtforpython-6/)
+![Status](https://img.shields.io/badge/status-active%20development-2ea44f)
+
+An easy desktop app to prepare your music folders and USB drives for the Snowsky Echo Mini.
 
 ![Overview](Overview.png)
 
-## What The App Does
+## Table of Contents
 
-The current launcher opens a PySide6 desktop app with these tabs:
+- [Snowsky Echo Mini Toolbox](#snowsky-echo-mini-toolbox)
+  - [Table of Contents](#table-of-contents)
+  - [Main Features](#main-features)
+  - [Requirements](#requirements)
+  - [Important Notes](#important-notes)
+  - [Installation](#installation)
+  - [Build from source](#build-from-source)
+  - [Compatibility Rules](#compatibility-rules)
+  - [Contributing](#contributing)
 
-- About Folder/Drive: shows target path details (filesystem, disk usage, permissions, modified time, top-level file/folder counts)
-- Album Art: scans embedded artwork, marks files as Compatible/Incompatible/Missing, and can rewrite incompatible embedded art as JPEG non-progressive
-- Music Compatibility: scans files and classifies them as SUPPORTED, UNSUPPORTED, UNKNOWN, or SKIPPED, with reason and metadata columns
-- File Cleanup: scans file-type breakdown (Audio, Image, Video, Document, Archive, Playlist, Subtitle, Executable, Hidden, Other) and removes selected categories
-- Directory Browser: enabled when a removable drive is selected, shows folder sizes, presents rich metadata, and includes right-click Fix Album Art
+## Main Features
+
+- Music Compatibility:
+  - Checks if your media is compatible with the Snowsky Echo Mini.
+  - Automatically convert your incompatible media to a compatible audio format.
+- About Folder/Drive:
+  - Identify drive incompatibility issues
+- Album Art:
+  - Finds files with missing or incompatible album art.
+  - Convert incompatible media automatically
+- Lyrics Manager:
+  - Scans embedded lyrics.
+  - Can create .lrc lyric files and do LRCLIB bulk lookup.
+- File Rename:
+  - Suggests cleaner file names from metadata before you apply changes.
+- File Cleanup:
+  - Groups files by type so you can remove unwanted categories safely.
+- Backup/Restore:
+  - Creates ZIP backups, or copy/move your library to another location.
+
+## Requirements
+
+- Python 3.12
+- ffmpeg and ffprobe (bundled in releases)
+- Linux Qt/XCB runtime libraries (Linux)
+
+## Important Notes
+
+- This program has the ability to modify your Snowsky Echo Mini Library, ALWAYS check to see if the program is making the intended changes on your data, before applying.
+- Make use of the backup tools to protect your library from inadvertant changes.
 
 ## Installation
 
-### Requirements
+Locate the Releases page for this project and select the correct installation file for your system architecture.
 
-- Python 3.10+
-- macOS, Linux, or Windows
+### Required Dependencies (Linux Only)
 
-### Setup
+```bash
+sudo apt-get update && sudo apt-get install -y python3.12 python3.12-venv python3-pip ffmpeg libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1
+```
 
-1. Clone or download this repository.
-1. Create and activate a virtual environment:
+### Supported Operating Systems
+
+Only the following operating systems have an official release, follow 'build from source' instructions for running SMTB on different system architectures.
+
+| Operating System | Architecture | Format |
+| ---- | ---- | ---- |
+| Windows | 32-bit & 64-bit | Installation (.exe) |
+| Linux   | x86-64 (64-bit) | .tar.gz & .deb |
+| MacOS | ARM64 (Apple Silicon) | .dmg |
+
+## Build from source
+
+This project is developed in Python 3.12+, and using Python 3.12 is recommended.
+
+1. Ensure that ffmpeg is installed (for ffprobe)
+2. Clone the repository.
+3. Create and activate a virtual environment.
+4. Install dependencies.
+
+macOS and Linux:
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-```
-
-1. Install dependencies:
-
-```bash
 pip install -r requirements.txt
 ```
 
-Dependencies listed in requirements.txt:
+Windows PowerShell:
 
-- mutagen
-- pydub
-- PySide6
+```powershell
+py -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
 
-## Run
-
-Start the GUI:
+Start the app:
 
 ```bash
 python3 main.py
 ```
 
-Optional: start with an initial target path pre-filled:
+Start with a pre-selected target path:
 
 ```bash
 python3 main.py --path /path/to/folder-or-drive
 ```
 
-Short flag:
+## Compatibility Rules
 
-```bash
-python3 main.py -p /path/to/folder-or-drive
-```
+Full technical rules are in [COMPATIBILITY.md](COMPATIBILITY.md).
 
-## Audio Compatibility Rules
+## Contributing
 
-The scanner validates formats using the rules in [COMPATIBILITY.md](COMPATIBILITY.md).
+Contributions are welcome.
 
-Quick summary:
+Basic flow:
 
-- Always supported lossy: MP3, OGG, M4A, WMA
-- PCM formats (WAV, FLAC, APE): must be <= 192000 Hz and <= 24-bit
-- FLAC also checks max block size
-- DSD formats (DSF, DFF): supports DSD64, DSD128, DSD256
-- Known unsupported audio formats are reported as UNSUPPORTED
-- Non-audio files are SKIPPED
+1. Open an issue describing the change or bug.
+1. Create a focused branch.
+1. Keep pull requests small and include test or validation steps.
+1. Update documentation when behavior changes.
 
+If you add a new tab or workflow, include:
+
+- What users will see and do
+- How errors are handled
+- Any dependency or platform notes
