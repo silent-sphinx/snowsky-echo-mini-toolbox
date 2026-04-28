@@ -34,6 +34,28 @@ cp "$(which ffprobe)" build_assets/ffprobe
 chmod +x build_assets/ffprobe
 ```
 
+Prepare app icon (macOS requires .icns):
+
+```bash
+cp -f assets/toolbox-logo.png build_assets/toolbox-logo.png
+
+rm -rf build_assets/toolbox-logo.iconset
+mkdir -p build_assets/toolbox-logo.iconset
+
+sips -z 16 16   build_assets/toolbox-logo.png --out build_assets/toolbox-logo.iconset/icon_16x16.png
+sips -z 32 32   build_assets/toolbox-logo.png --out build_assets/toolbox-logo.iconset/icon_16x16@2x.png
+sips -z 32 32   build_assets/toolbox-logo.png --out build_assets/toolbox-logo.iconset/icon_32x32.png
+sips -z 64 64   build_assets/toolbox-logo.png --out build_assets/toolbox-logo.iconset/icon_32x32@2x.png
+sips -z 128 128 build_assets/toolbox-logo.png --out build_assets/toolbox-logo.iconset/icon_128x128.png
+sips -z 256 256 build_assets/toolbox-logo.png --out build_assets/toolbox-logo.iconset/icon_128x128@2x.png
+sips -z 256 256 build_assets/toolbox-logo.png --out build_assets/toolbox-logo.iconset/icon_256x256.png
+sips -z 512 512 build_assets/toolbox-logo.png --out build_assets/toolbox-logo.iconset/icon_256x256@2x.png
+sips -z 512 512 build_assets/toolbox-logo.png --out build_assets/toolbox-logo.iconset/icon_512x512.png
+sips -z 1024 1024 build_assets/toolbox-logo.png --out build_assets/toolbox-logo.iconset/icon_512x512@2x.png
+
+iconutil -c icns build_assets/toolbox-logo.iconset -o build_assets/toolbox-logo.icns
+```
+
 Create runtime hook so bundled ffprobe is available on PATH:
 
 ```bash
@@ -53,6 +75,7 @@ PY
 ```bash
 pyinstaller \
   --name "Snowsky Echo Mini Toolbox" \
+  --icon "build_assets/toolbox-logo.icns" \
   --windowed \
   --noconfirm \
   --clean \
