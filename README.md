@@ -23,14 +23,14 @@ An easy desktop app to prepare your music folders and USB drives for the Snowsky
 
 ## Main Features
 
+- Music Compatibility:
+  - Checks if your media is compatible with the Snowsky Echo Mini.
+  - Automatically convert your incompatible media to a compatible audio format.
 - About Folder/Drive:
-  - Shows drive or folder info like free space, file system, and permissions.
+  - Identify drive incompatibility issues
 - Album Art:
   - Finds files with missing or incompatible album art.
-  - Can fix incompatible album art in batch.
-- Music Compatibility:
-  - Checks your audio files and shows SUPPORTED, UNSUPPORTED, UNKNOWN, or SKIPPED.
-  - Conversion includes speed profiles (Fast, Balanced, Smallest files) so you can trade encode time vs FLAC file size.
+  - Convert incompatible media automatically
 - Lyrics Manager:
   - Scans embedded lyrics.
   - Can create .lrc lyric files and do LRCLIB bulk lookup.
@@ -40,13 +40,12 @@ An easy desktop app to prepare your music folders and USB drives for the Snowsky
   - Groups files by type so you can remove unwanted categories safely.
 - Backup/Restore:
   - Creates ZIP backups, or copy/move your library to another location.
-- Directory Browser:
-  - Lets you inspect files and run right-click actions for single-file fixes.
 
 ## Requirements
 
-- Python 3.12+
-- macOS, Linux, or Windows
+- Python 3.12
+- ffmpeg and ffprobe (bundled in releases)
+- Linux Qt/XCB runtime libraries (Linux)
 
 ## Important Notes
 
@@ -56,6 +55,22 @@ An easy desktop app to prepare your music folders and USB drives for the Snowsky
 ## Installation
 
 Locate the Releases page for this project and select the correct installation file for your system architecture.
+
+### Required Dependencies (Linux Only)
+
+```bash
+sudo apt-get update && sudo apt-get install -y python3.12 python3.12-venv python3-pip ffmpeg libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1
+```
+
+### Supported Operating Systems
+
+Only the following operating systems have an official release, follow 'build from source' instructions for running SMTB on different system architectures.
+
+| Operating System | Architecture | Format |
+| ---- | ---- | ---- |
+| Windows | 32-bit & 64-bit | Installation (.exe) |
+| Linux   | x86-64 (64-bit) | .tar.gz & .deb |
+| MacOS | ARM64 (Apple Silicon) | .dmg |
 
 ## Build from source
 
