@@ -60,6 +60,9 @@ if [ ! -f "$BUILT_EXE" ]; then
   exit 1
 fi
 
+# Copy app icon into the dist directory so it is included in all packages
+cp assets/toolbox-logo.png "dist/Snowsky Echo Mini Toolbox/toolbox-logo.png"
+
 # Package as .tar.gz
 tar -czf "dist/Snowsky-Echo-Mini-Toolbox-Linux-x86_64.tar.gz" \
   -C dist "Snowsky Echo Mini Toolbox"

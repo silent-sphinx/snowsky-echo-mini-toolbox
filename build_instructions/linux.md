@@ -89,6 +89,14 @@ Build output directory:
 
 ## 5) Package as .tar.gz
 
+Copy the app icon into the output directory so it is included in all packages:
+
+```bash
+cp assets/toolbox-logo.png "dist/Snowsky Echo Mini Toolbox/toolbox-logo.png"
+```
+
+Then create the archive:
+
 ```bash
 tar -czf "dist/Snowsky-Echo-Mini-Toolbox-Linux-x86_64.tar.gz" \
   -C dist "Snowsky Echo Mini Toolbox"

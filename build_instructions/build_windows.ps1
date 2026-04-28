@@ -47,7 +47,7 @@ Remove-Item '.\dist\Snowsky-Echo-Mini-Toolbox-Windows-Setup.exe' -Force -ErrorAc
 Remove-Item '.\build_instructions\dist_tmp' -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force '.\build_instructions\dist_tmp' | Out-Null
 
-pyinstaller --name "Snowsky Echo Mini Toolbox" --icon build_assets\toolbox-logo.ico --windowed --noconfirm --clean --hidden-import certifi --add-binary "build_assets\ffprobe.exe;." --runtime-hook pyi_ffprobe_path_hook.py main.py
+pyinstaller --name "Snowsky Echo Mini Toolbox" --icon build_assets\toolbox-logo.ico --windowed --noconfirm --clean --collect-all PySide6 --hidden-import certifi --add-binary "build_assets\ffprobe.exe;." --runtime-hook pyi_ffprobe_path_hook.py main.py
 
 if ($LASTEXITCODE -ne 0) {
   throw "PyInstaller failed with exit code $LASTEXITCODE"
