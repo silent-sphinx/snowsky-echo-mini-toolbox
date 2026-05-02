@@ -2,86 +2,24 @@
 
 This document describes exactly how the media compatibility checker evaluates audio files for the Snowsky Echo Mini.
 
-## Supported Formats
+## Audio Compatibility Table
 
-### Lossy (always supported)
+| Audio Format | File Extensions | Supported? | Sample Rate | Bit Depth | Supported Codecs | Unsupported Codecs | Comments |
+| ------------ | --------------- | ---------- | ----------- | --------- | ---------------- | ------------------ | -------- |
+| Free Lossless Audio Codec | .flac | OFFICIALLY SUPPORTED | ≤ 192 kHz | ≤ 24 bits | | | |
+| Waveform Audio File Format | .wav | OFFICIALLY SUPPORTED | ≤ 192 kHz | ≤ 24 bits | | | |
+| APE (Monkey's Audio) | .ape | OFFICIALLY SUPPORTED | ≤ 192 kHz | ≤ 24 bits | | | |
+| Direct Stream Digital | .dsf, .dff | OFFICIALLY SUPPORTED | DSD64, DSD128, or DSD256 | | | | |
+| MP3 | .mp3 | OFFICIALLY SUPPORTED | | | | | |
+| OGG | .ogg | OFFICIALLY SUPPORTED | | | | | |
+| M4A | .m4a, .m4b, .m4p | OFFICIALLY SUPPORTED | | | AAC, AAC-LC, HE-AAC, ALAC | FLAC, DTS, AC-3/EC-3 | |
+| MP3 | .wma | OFFICIALLY SUPPORTED | | | | | |
+| Super Audio CD | .scad, .iso | OFFICIALLY UNSUPPORTED | | | | | |
+| Digital Theater Systems | .dts, .dtshd | OFFICIALLY UNSUPPORTED | | | | | |
+| OPUS | .opus | UNSUPPORTED | | | | | .opus files don't appear in the player |
+| Audio Interchange File Format | .aiff | UNSUPPORTED | | | | | .aiff files don't appear in the player |
+| WavPack | .aiff | UNSUPPORTED | | | | | .wv files don't appear in the player |
 
-These formats are always marked **SUPPORTED** without sample-rate or bit-depth validation:
+## EQ Adjustment Requirements
 
-- `mp3`
-- `ogg`
-- `m4a`
-- `wma`
-
-### PCM (validated)
-
-These formats are supported only when they meet the PCM limits below:
-
-- `wav`
-- `flac`
-- `ape`
-
-**PCM limits**:
-
-- **Sample rate**: must be $\le 192{,}000$ Hz (192 kHz)
-- **Bit depth**: must be $\le 24$ bits
-
-If either value exceeds the limits, the file is **UNSUPPORTED**. If required metadata is missing, the file is **UNKNOWN** even though the extension is supported.
-
-### DSD (validated)
-
-These formats are supported only when their DSD rates match an allowed multiple:
-
-- `dsf`
-- `dff`
-
-**DSD limits**:
-
-- The sample rate must map to one of **DSD64**, **DSD128**, or **DSD256**.
-- Mapping is calculated by comparing the sample rate to base frequencies of **44.1 kHz** or **48 kHz** and finding a ratio that is within 0.5 of an allowed DSD multiple.
-- If no allowed multiple is recognized or if the mapped multiple is higher than DSD256, the file is **UNSUPPORTED**.
-- If the sample rate is missing, the file is **UNKNOWN**.
-
-## Explicitly Unsupported Formats
-
-These are always marked **UNSUPPORTED**:
-
-- `dts`
-- `dtshd`
-- `sacd`
-- `iso`
-
-## Other Known Audio Extensions
-
-The checker recognizes these extensions as audio for scanning, but they are **not supported** and are marked **UNSUPPORTED** with a reason that indicates the extension is recognized audio but not in the supported list:
-
-- `aac`
-- `aif`
-- `aifc`
-- `aiff`
-- `alac`
-- `m4b`
-- `m4p`
-- `mka`
-- `mp1`
-- `mp2`
-- `opus`
-- `oga`
-- `wv`
-
-## File Scanning Rules
-
-- The tool scans files recursively under the target directory.
-- Files starting with a dot (for example `.DS_Store` or `._Track.flac`) are ignored.
-- Files with no extension are **UNSUPPORTED**.
-- Files with extensions outside the known audio lists are counted as skipped and are not evaluated.
-
-## Metadata Sources and Limitations
-
-The checker relies on metadata to evaluate PCM and DSD limits:
-
-- **Primary**: `mutagen` (recommended, most accurate)
-- **WAV fallback**: Python `wave` module (WAV only)
-- **Secondary**: `ffprobe` (if available)
-
-If metadata cannot be read, PCM/DSD files are marked **UNKNOWN**. Lossy formats do not require metadata to be supported.
+* Built-in support for EQ adjustment of audio sources up to 16bit/192K

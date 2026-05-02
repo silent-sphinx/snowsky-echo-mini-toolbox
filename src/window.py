@@ -13,9 +13,10 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from pathlib import Path
+import traceback
 
-from PySide6.QtCore import QDir, QModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QPainter, QPalette, QPixmap, QRegion
+from PySide6.QtCore import QDir, QModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot, QTimer
+from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPen, QPixmap, QRegion
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -38,15 +39,20 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QScrollArea,
+    QProxyStyle,
+    QStyledItemDelegate,
     QSplitter,
     QSizePolicy,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QStyleOptionViewItem,
     QTreeView,
     QVBoxLayout,
     QWidget,
 )
+from PySide6.QtWidgets import QStyle
+from PySide6.QtCore import QEvent
 
 from .album_art import (
     AlbumArtScanWorker,
@@ -57,13 +63,13 @@ from .album_art import (
     write_embedded_album_art,
 )
 from .constants import ALBUM_ART_CACHE_LIMIT, AUDIO_FILE_EXTENSIONS
-from .music_compatibility import KNOWN_AUDIO_FORMATS, MusicCompatibilityScanWorker
+from .music_compatibility import KNOWN_AUDIO_FORMATS, MusicCompatibilityScanWorker, _ffprobe_audio_info
 from .models import DriveOption
 from .system_info import collect_target_info, format_bytes, list_removable_drives
 
 try:
     import mutagen
-except Exception:
+except ImportError:
     mutagen = None
 
 
@@ -171,12 +177,35 @@ FILE_CLEANUP_CATEGORY_ORDER = [
 
 class FileBrowserProxyModel(QSortFilterProxyModel):
     """Adds recursive directory size values and stable numeric sorting for the Size column."""
+    selection_changed = Signal(int)
 
     def __init__(self, source_model: QFileSystemModel, parent=None):
         super().__init__(parent)
         self.setSourceModel(source_model)
         self._directory_size_cache: dict[str, int] = {}
         self._directory_sizes_enabled = False
+        self._checked_paths: set[str] = set()
+        self._show_music_only = False
+
+    def clear_checked_paths(self) -> None:
+        self._checked_paths.clear()
+        self.selection_changed.emit(0)
+
+    def _selected_files_count(self) -> int:
+        count = 0
+        try:
+            for p in self._checked_paths:
+                try:
+                    if os.path.isfile(p):
+                        count += 1
+                except Exception:
+                    continue
+        except Exception:
+            return 0
+        return count
+
+    def checked_paths(self) -> set[str]:
+        return set(self._checked_paths)
 
     @property
     def directory_sizes_enabled(self) -> bool:
@@ -252,6 +281,14 @@ class FileBrowserProxyModel(QSortFilterProxyModel):
         if not index.isValid():
             return super().data(index, role)
 
+        if role == Qt.CheckStateRole and index.column() == 0:
+            source_model = self.sourceModel()
+            if source_model is None:
+                return Qt.Unchecked
+            source_index = self.mapToSource(index)
+            path = source_model.filePath(source_index)
+            return Qt.Checked if path in self._checked_paths else Qt.Unchecked
+
         source_index = self.mapToSource(index)
         if index.column() == 1:
             source_model = self.sourceModel()
@@ -275,12 +312,300 @@ class FileBrowserProxyModel(QSortFilterProxyModel):
 
         return super().data(index, role)
 
+    def flags(self, index):
+        base_flags = super().flags(index)
+        if index.isValid() and index.column() == 0:
+            return base_flags | Qt.ItemIsUserCheckable
+        return base_flags
+
+    def setData(self, index, value, role=Qt.EditRole):
+        if role == Qt.CheckStateRole and index.isValid() and index.column() == 0:
+            source_model = self.sourceModel()
+            if source_model is None:
+                return False
+
+            source_index = self.mapToSource(index)
+            path = source_model.filePath(source_index)
+            # Ignore macOS AppleDouble sidecar files that start with '._'
+            if Path(path).name.startswith("._"):
+                return False
+            if not path:
+                return False
+
+            checked = value == Qt.Checked
+            affected_paths: set[str] = {path}
+
+            if source_model.isDir(source_index):
+                # Cascade selection to all descendant files and folders under
+                # this directory. Include every filesystem child found by
+                # walking the source tree so folder selection covers contents
+                # even if nodes are collapsed or filtered in the view.
+                for root, dir_names, file_names in os.walk(path):
+                    for dir_name in dir_names:
+                        candidate = str(Path(root) / dir_name)
+                        if Path(candidate).name.startswith("._"):
+                            continue
+                        try:
+                            src_idx = source_model.index(candidate)
+                        except Exception:
+                            src_idx = QModelIndex()
+                        if not src_idx.isValid():
+                            continue
+                        affected_paths.add(candidate)
+
+                    for file_name in file_names:
+                        candidate = str(Path(root) / file_name)
+                        if Path(candidate).name.startswith("._"):
+                            continue
+                        try:
+                            src_idx = source_model.index(candidate)
+                        except Exception:
+                            src_idx = QModelIndex()
+                        if not src_idx.isValid():
+                            continue
+                        affected_paths.add(candidate)
+
+            if checked:
+                self._checked_paths.update(affected_paths)
+            else:
+                self._checked_paths.difference_update(affected_paths)
+
+            self.dataChanged.emit(index, index, [Qt.CheckStateRole])
+            # Emit only the number of selected files (exclude directories)
+            self.selection_changed.emit(self._selected_files_count())
+            self.invalidate()
+            return True
+
+        return super().setData(index, value, role)
+
     def lessThan(self, left, right) -> bool:
         if left.column() == 1 and right.column() == 1:
             left_size = self._size_value_for_source_index(left)
             right_size = self._size_value_for_source_index(right)
             return int(left_size or 0) < int(right_size or 0)
         return super().lessThan(left, right)
+
+    def set_show_music_files_only(self, enabled: bool) -> None:
+        self._show_music_only = bool(enabled)
+        try:
+            self.invalidate()
+            self.invalidateFilter()
+        except Exception:
+            pass
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # type: ignore[override]
+        source_model = self.sourceModel()
+        if source_model is None:
+            return False
+
+        idx = source_model.index(source_row, 0, source_parent)
+        if not idx.isValid():
+            return False
+
+        # Exclude macOS AppleDouble sidecar files that start with '._'
+        try:
+            name = source_model.fileName(idx)
+            if isinstance(name, str) and name.startswith("._"):
+                return False
+        except Exception:
+            pass
+
+        if not self._show_music_only:
+            return super().filterAcceptsRow(source_row, source_parent)
+
+        try:
+            if source_model.isDir(idx):
+                return True
+        except Exception:
+            return False
+
+        path = source_model.filePath(idx)
+        suffix = Path(path).suffix.lower()
+        return suffix in AUDIO_FILE_EXTENSIONS
+
+
+class BrowserCheckStyle(QProxyStyle):
+    def drawPrimitive(self, element, option, painter, widget=None):
+        if element == QStyle.PE_IndicatorItemViewItemCheck:
+            rect = option.rect.adjusted(1, 1, -1, -1)
+            checked = bool(option.state & QStyle.State_On)
+            partial = bool(option.state & QStyle.State_NoChange)
+
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(QPen(QColor("#FFFFFF"), 1))
+            painter.setBrush(QColor("#FFFFFF") if checked else QColor("#1F1F1F"))
+            painter.drawRect(rect)
+
+            if checked or partial:
+                painter.setPen(QPen(QColor("#1F1F1F"), 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                start_x = rect.left() + rect.width() * 0.22
+                start_y = rect.top() + rect.height() * 0.54
+                mid_x = rect.left() + rect.width() * 0.42
+                mid_y = rect.bottom() - rect.height() * 0.22
+                end_x = rect.right() - rect.width() * 0.18
+                end_y = rect.top() + rect.height() * 0.24
+                painter.drawLine(int(start_x), int(start_y), int(mid_x), int(mid_y))
+                painter.drawLine(int(mid_x), int(mid_y), int(end_x), int(end_y))
+
+            painter.restore()
+            return
+
+        super().drawPrimitive(element, option, painter, widget)
+
+
+class BrowserCheckDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        if not (index.flags() & Qt.ItemIsUserCheckable):
+            super().paint(painter, option, index)
+            return
+
+        check_state = index.data(Qt.CheckStateRole)
+        if check_state not in (Qt.Checked, Qt.PartiallyChecked, Qt.Unchecked):
+            check_state = Qt.Unchecked
+
+        painter.save()
+
+        style_option = QStyleOptionViewItem(option)
+        self.initStyleOption(style_option, index)
+        style_option.features &= ~QStyleOptionViewItem.HasCheckIndicator
+        style_option.checkState = Qt.Unchecked
+        style_option.icon = QIcon()
+        style_option.text = ""
+
+        widget = option.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawPrimitive(QStyle.PE_PanelItemViewItem, style_option, painter, widget)
+
+        box_size = min(14, max(12, option.rect.height() - 6))
+        box_x = option.rect.left() + 6
+        box_y = option.rect.top() + max(0, (option.rect.height() - box_size) // 2)
+        indicator_rect = option.rect.adjusted(0, 0, 0, 0)
+        indicator_rect.setRect(box_x, box_y, box_size, box_size)
+
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        box_rect = indicator_rect.adjusted(0, 0, -1, -1)
+        painter.setPen(QPen(QColor("#FFFFFF"), 1))
+        painter.setBrush(QColor("#1F1F1F"))
+        painter.drawRect(box_rect)
+
+        icon_rect = option.rect.adjusted(0, 0, 0, 0)
+        icon_size = 16
+        icon_x = box_rect.right() + 8
+        icon_y = option.rect.top() + max(0, (option.rect.height() - icon_size) // 2)
+        icon_rect.setRect(icon_x, icon_y, icon_size, icon_size)
+
+        if check_state == Qt.Checked:
+            painter.setPen(QPen(QColor("#FFFFFF"), 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            start_x = box_rect.left() + box_rect.width() * 0.20
+            start_y = box_rect.top() + box_rect.height() * 0.54
+            mid_x = box_rect.left() + box_rect.width() * 0.42
+            mid_y = box_rect.bottom() - box_rect.height() * 0.22
+            end_x = box_rect.right() - box_rect.width() * 0.16
+            end_y = box_rect.top() + box_rect.height() * 0.24
+            painter.drawLine(int(start_x), int(start_y), int(mid_x), int(mid_y))
+            painter.drawLine(int(mid_x), int(mid_y), int(end_x), int(end_y))
+        elif check_state == Qt.PartiallyChecked:
+            painter.setPen(QPen(QColor("#FFFFFF"), 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            center_y = box_rect.center().y()
+            painter.drawLine(
+                int(box_rect.left() + box_rect.width() * 0.18),
+                int(center_y),
+                int(box_rect.right() - box_rect.width() * 0.18),
+                int(center_y),
+            )
+
+        icon = index.data(Qt.DecorationRole)
+        if hasattr(icon, "isNull") and not icon.isNull():
+            icon.paint(painter, icon_rect, Qt.AlignCenter, QIcon.Normal, QIcon.On if check_state == Qt.Checked else QIcon.Off)
+
+        text_rect = option.rect.adjusted(0, 0, 0, 0)
+        text_rect.setLeft(icon_rect.right() + 12)
+        text_rect.setRight(option.rect.right() - 6)
+        text_option = QStyleOptionViewItem(style_option)
+        text_option.rect = text_rect
+        text_option.icon = QIcon()
+        text_option.text = str(index.data(Qt.DisplayRole) or "")
+        text_option.features &= ~QStyleOptionViewItem.HasDecoration
+        text_option.features &= ~QStyleOptionViewItem.HasCheckIndicator
+        style.drawItemText(
+            painter,
+            text_rect,
+            text_option.displayAlignment,
+            text_option.palette,
+            bool(text_option.state & QStyle.State_Enabled),
+            text_option.text,
+            QPalette.ColorRole.Text,
+        )
+
+        painter.restore()
+        return
+
+    # Delegate does custom painting only; checkbox mouse handling is
+    # managed by the view's mouseReleaseEvent to ensure indentation and
+    # hit-testing are consistent across items.
+
+
+class BrowserTreeView(QTreeView):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._check_anchor_index = QModelIndex()
+
+    def _toggle_index_range(self, start_index, end_index, check_state) -> None:
+        model = self.model()
+        if model is None:
+            return
+
+        current_index = start_index
+        safety_limit = 0
+        while current_index.isValid() and safety_limit < 100000:
+            model.setData(current_index, check_state, Qt.CheckStateRole)
+            if current_index == end_index:
+                return
+            next_index = self.indexBelow(current_index)
+            if not next_index.isValid() or next_index == current_index:
+                break
+            current_index = next_index
+            safety_limit += 1
+
+        current_index = end_index
+        safety_limit = 0
+        while current_index.isValid() and safety_limit < 100000:
+            model.setData(current_index, check_state, Qt.CheckStateRole)
+            if current_index == start_index:
+                return
+            next_index = self.indexBelow(current_index)
+            if not next_index.isValid() or next_index == current_index:
+                break
+            current_index = next_index
+            safety_limit += 1
+
+    def mouseReleaseEvent(self, event):
+        index = self.indexAt(event.pos())
+        if index.isValid() and index.column() == 0:
+            row_rect = self.visualRect(index)
+            # Account for tree indentation so the clickable checkbox area
+            # is positioned where the delegate actually draws it. Without
+            # this, clicks on the first column text (for shallow items)
+            # can be mistaken for checkbox clicks.
+            box_size = min(14, max(12, row_rect.height() - 6))
+            box_x = row_rect.left() + 6
+            box_y = row_rect.top() + max(0, (row_rect.height() - box_size) // 2)
+            box_rect = row_rect.adjusted(0, 0, 0, 0)
+            box_rect.setRect(box_x, box_y, box_size, box_size)
+            if box_rect.contains(event.pos()) and (index.flags() & Qt.ItemIsUserCheckable):
+                current_state = index.data(Qt.CheckStateRole)
+                next_state = Qt.Unchecked if current_state == Qt.Checked else Qt.Checked
+                if event.modifiers() & Qt.ShiftModifier and self._check_anchor_index.isValid():
+                    self._toggle_index_range(self._check_anchor_index, index, next_state)
+                else:
+                    self.model().setData(index, next_state, Qt.CheckStateRole)
+                self._check_anchor_index = index
+                event.accept()
+                return
+
+        super().mouseReleaseEvent(event)
 
 
 class DirectorySizeScanWorker(QObject):
@@ -1182,6 +1507,85 @@ def apply_charcoal_palette(app: QApplication) -> None:
     app.setPalette(palette)
 
 
+class BulkMetadataEditDialog(QDialog):
+    """Dialog for bulk editing metadata of selected audio files."""
+
+    def __init__(self, selected_paths: list[str], parent=None):
+        super().__init__(parent)
+        self.selected_paths = selected_paths
+        self.parent_window = parent
+        self._init_ui()
+        self.setWindowTitle("Bulk Edit Metadata")
+        self.setMinimumWidth(400)
+
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        info_label = QLabel(f"Editing metadata for {len(self.selected_paths)} file(s)")
+        info_label.setObjectName("targetSummary")
+        layout.addWidget(info_label)
+
+        # Create form fields
+        self.artist_input = QLineEdit()
+        self.artist_input.setPlaceholderText("Leave empty to skip")
+        layout.addWidget(QLabel("Artist:"))
+        layout.addWidget(self.artist_input)
+
+        self.album_input = QLineEdit()
+        self.album_input.setPlaceholderText("Leave empty to skip")
+        layout.addWidget(QLabel("Album:"))
+        layout.addWidget(self.album_input)
+
+        self.title_input = QLineEdit()
+        self.title_input.setPlaceholderText("Leave empty to skip")
+        layout.addWidget(QLabel("Title:"))
+        layout.addWidget(self.title_input)
+
+        self.date_input = QLineEdit()
+        self.date_input.setPlaceholderText("Leave empty to skip (format: YYYY or YYYY-MM-DD)")
+        layout.addWidget(QLabel("Date:"))
+        layout.addWidget(self.date_input)
+
+        self.genre_input = QLineEdit()
+        self.genre_input.setPlaceholderText("Leave empty to skip")
+        layout.addWidget(QLabel("Genre:"))
+        layout.addWidget(self.genre_input)
+
+        layout.addStretch()
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        update_btn = QPushButton("Update")
+        update_btn.clicked.connect(self._on_update)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addStretch()
+        button_layout.addWidget(update_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+
+    def _on_update(self) -> None:
+        metadata = {
+            "artist": self.artist_input.text() or None,
+            "album": self.album_input.text() or None,
+            "title": self.title_input.text() or None,
+            "date": self.date_input.text() or None,
+            "genre": self.genre_input.text() or None,
+        }
+        
+        # Remove None values
+        metadata = {k: v for k, v in metadata.items() if v is not None}
+        
+        if not metadata:
+            QMessageBox.warning(self, "No Changes", "Please fill in at least one field.")
+            return
+        
+        self.parent_window._bulk_update_metadata(self.selected_paths, metadata)
+        self.accept()
+
+
 class ToolboxWindow(QMainWindow):
     def __init__(self, initial_path: str | None = None):
         super().__init__()
@@ -1240,7 +1644,9 @@ class ToolboxWindow(QMainWindow):
 
         self._build_ui()
         self._apply_charcoal_theme()
-        self.refresh_drives()
+        # Defer drive refresh until the event loop is running to avoid
+        # accessing widgets before their native C++ wrappers are fully initialized.
+        QTimer.singleShot(0, self.refresh_drives)
 
         if initial_path:
             self.path_input.setText(str(Path(initial_path).expanduser()))
@@ -1337,6 +1743,7 @@ class ToolboxWindow(QMainWindow):
         layout = QVBoxLayout(root)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
+        # print("[DIAGNOSTIC] _build_ui after layout created")
 
         self.title_label = QLabel("Snowsky Echo Mini Toolbox")
         self.title_label.setObjectName("title")
@@ -1413,6 +1820,7 @@ class ToolboxWindow(QMainWindow):
         drive_row.addWidget(self.drive_combo, 1)
         drive_row.addWidget(self.refresh_drives_btn)
         drive_row.addWidget(self.unmount_drive_btn)
+        
 
         self.current_target_label = QLabel("Current target: none selected")
         self.current_target_label.setObjectName("targetSummary")
@@ -1422,6 +1830,7 @@ class ToolboxWindow(QMainWindow):
         layout.addWidget(self.current_target_label)
 
         self.tabs = QTabWidget()
+        
 
         about_tab = QWidget()
         about_layout = QVBoxLayout(about_tab)
@@ -1429,7 +1838,9 @@ class ToolboxWindow(QMainWindow):
         about_layout.setSpacing(10)
 
         self.path_input.returnPressed.connect(self.show_info)
-        self.path_input.editingFinished.connect(self.show_info)
+        # Only trigger a full refresh if the path text actually changed when editing finishes.
+        self._last_path_input_text = self.path_input.text().strip()
+        self.path_input.editingFinished.connect(self._on_path_input_editing_finished)
 
         self.info_table = QTableWidget(0, 2)
         self.info_table.setHorizontalHeaderLabels(["Property", "Value"])
@@ -1445,11 +1856,6 @@ class ToolboxWindow(QMainWindow):
         album_art_layout = QVBoxLayout(album_art_tab)
         album_art_layout.setContentsMargins(10, 10, 10, 10)
         album_art_layout.setSpacing(10)
-
-        album_art_hint = QLabel(
-            "Compatibility rule: embedded artwork must be JPEG and non-progressive."
-        )
-        album_art_hint.setObjectName("targetSummary")
 
         album_art_controls = QHBoxLayout()
         self.album_art_scan_btn = QPushButton("Scan Album Art Compatibility")
@@ -1480,7 +1886,6 @@ class ToolboxWindow(QMainWindow):
         self.album_art_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.album_art_table.setEditTriggers(QTableWidget.NoEditTriggers)
 
-        album_art_layout.addWidget(album_art_hint)
         album_art_layout.addLayout(album_art_controls)
         album_art_layout.addWidget(self.album_art_summary_label)
         album_art_layout.addWidget(self.album_art_progress)
@@ -1540,11 +1945,12 @@ class ToolboxWindow(QMainWindow):
         self.music_compatibility_progress.setFormat("Idle")
         self.music_compatibility_progress.setTextVisible(True)
 
-        self.music_compatibility_table = QTableWidget(0, 9)
+        self.music_compatibility_table = QTableWidget(0, 10)
         self.music_compatibility_table.setHorizontalHeaderLabels(
             [
                 "File",
                 "Extension",
+                "Codec",
                 "Status",
                 "Reason",
                 "Sample Rate (Hz)",
@@ -1554,7 +1960,7 @@ class ToolboxWindow(QMainWindow):
                 "EQ Compatibility",
             ]
         )
-        eq_header_item = self.music_compatibility_table.horizontalHeaderItem(8)
+        eq_header_item = self.music_compatibility_table.horizontalHeaderItem(9)
         if eq_header_item is not None:
             eq_header_item.setToolTip(
                 "Indicates equaliser compatibility only. The file can still play, but if marked not compatible the equaliser will be disabled."
@@ -1562,7 +1968,7 @@ class ToolboxWindow(QMainWindow):
         self.music_compatibility_table.verticalHeader().setVisible(False)
         self._configure_resizable_table_columns(
             self.music_compatibility_table,
-            [320, 100, 120, 300, 140, 90, 100, 90, 140],
+            [320, 100, 90, 120, 300, 140, 90, 100, 90, 140],
         )
         self.music_compatibility_table.setAlternatingRowColors(True)
         self.music_compatibility_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1672,7 +2078,7 @@ class ToolboxWindow(QMainWindow):
         browser_layout.setContentsMargins(10, 10, 10, 10)
         browser_layout.setSpacing(10)
 
-        self.browser_root_label = QLabel("Root: no valid target selected")
+        self.browser_root_label = QLabel("")
         self.browser_root_label.setObjectName("targetSummary")
 
         self.browser_size_progress = QProgressBar()
@@ -1682,12 +2088,14 @@ class ToolboxWindow(QMainWindow):
         self.browser_size_progress.setTextVisible(True)
         self.browser_size_progress.hide()
 
-        self.browser_tree = QTreeView()
+        self.browser_tree = BrowserTreeView()
         self.browser_model = QFileSystemModel(self.browser_tree)
         self.browser_model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot)
         self.browser_model.setReadOnly(True)
         self.browser_proxy_model = FileBrowserProxyModel(self.browser_model, self.browser_tree)
         self.browser_tree.setModel(self.browser_proxy_model)
+        self.browser_proxy_model.selection_changed.connect(self._on_browser_selection_changed)
+        self.browser_tree.setItemDelegateForColumn(0, BrowserCheckDelegate(self.browser_tree))
         self.browser_tree.setRootIndex(QModelIndex())
         self.browser_tree.setHeaderHidden(False)
         self.browser_tree.setAnimated(True)
@@ -1695,6 +2103,7 @@ class ToolboxWindow(QMainWindow):
         self.browser_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.browser_tree.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.browser_tree.setSortingEnabled(True)
+        
 
         browser_header = self.browser_tree.header()
         browser_header.setSectionResizeMode(QHeaderView.Interactive)
@@ -1726,29 +2135,26 @@ class ToolboxWindow(QMainWindow):
         properties_tab = QWidget()
         properties_layout = QVBoxLayout(properties_tab)
         properties_layout.setContentsMargins(0, 0, 0, 0)
-        properties_layout.setSpacing(8)
-
-        self.file_props_title = QLabel("File Properties")
-        self.file_props_title.setObjectName("sectionLabel")
-        self.file_props_hint = QLabel("Select an audio file to view details.")
-        self.file_props_hint.setObjectName("targetSummary")
+        properties_layout.setSpacing(12)
 
         self.file_props_table = QTableWidget(0, 2)
         self.file_props_table.setHorizontalHeaderLabels(["Property", "Value"])
         self.file_props_table.verticalHeader().setVisible(False)
-        self._configure_resizable_table_columns(self.file_props_table, [240, 520])
+        self.file_props_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        file_props_header = self.file_props_table.horizontalHeader()
+        file_props_header.setSectionResizeMode(QHeaderView.Interactive)
+        file_props_header.setStretchLastSection(True)
+        self.file_props_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.file_props_table.setAlternatingRowColors(True)
         self.file_props_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.file_props_table.setEditTriggers(QTableWidget.NoEditTriggers)
 
-        properties_layout.addWidget(self.file_props_title)
-        properties_layout.addWidget(self.file_props_hint)
-        properties_layout.addWidget(self.file_props_table, 1)
+        properties_layout.addWidget(self.file_props_table)
 
         lyrics_tab = QWidget()
         lyrics_layout = QVBoxLayout(lyrics_tab)
-        lyrics_layout.setContentsMargins(0, 0, 0, 0)
-        lyrics_layout.setSpacing(8)
+        lyrics_layout.setContentsMargins(0, 8, 0, 0)
+        lyrics_layout.setSpacing(12)
 
         self.file_lyrics_title = QLabel("Embedded Lyrics")
         self.file_lyrics_title.setObjectName("sectionLabel")
@@ -1763,10 +2169,41 @@ class ToolboxWindow(QMainWindow):
         lyrics_layout.addWidget(self.file_lyrics_hint)
         lyrics_layout.addWidget(self.file_lyrics_text, 1)
 
+        # Album Art metadata tab (per-file)
+        album_art_meta_tab = QWidget()
+        album_art_meta_layout = QVBoxLayout(album_art_meta_tab)
+        album_art_meta_layout.setContentsMargins(0, 8, 0, 0)
+        album_art_meta_layout.setSpacing(12)
+
+        self.file_art_meta_title = QLabel("Embedded Album Art")
+        self.file_art_meta_title.setObjectName("sectionLabel")
+        self.file_art_meta_hint = QLabel("Select an audio file to view embedded album art.")
+        self.file_art_meta_hint.setObjectName("targetSummary")
+
+        self.file_art_meta_preview = QLabel()
+        self.file_art_meta_preview.setAlignment(Qt.AlignCenter)
+        self.file_art_meta_preview.setObjectName("fileArtPreviewTab")
+
+        # Table for album art metadata (Property / Value)
+        self.file_art_meta_table = QTableWidget(0, 2)
+        self.file_art_meta_table.setHorizontalHeaderLabels(["Property", "Value"])
+        self.file_art_meta_table.verticalHeader().setVisible(False)
+        self.file_art_meta_table.setAlternatingRowColors(True)
+        self.file_art_meta_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        art_header = self.file_art_meta_table.horizontalHeader()
+        art_header.setSectionResizeMode(0, QHeaderView.Interactive)
+        art_header.setSectionResizeMode(1, QHeaderView.Stretch)
+
+        album_art_meta_layout.addWidget(self.file_art_meta_title)
+        album_art_meta_layout.addWidget(self.file_art_meta_hint)
+        album_art_meta_layout.addWidget(self.file_art_meta_preview)
+        album_art_meta_layout.addWidget(self.file_art_meta_table, 1)
+
         self.file_details_tabs.addTab(properties_tab, "Properties")
+        self.file_details_tabs.addTab(album_art_meta_tab, "Album Art")
         self.file_details_tabs.addTab(lyrics_tab, "Embedded Lyrics")
 
-        browser_right_layout.addWidget(self.file_details_tabs, 1)
+        browser_right_layout.addWidget(self.file_details_tabs, 2)
 
         self.lrc_preview_panel = QWidget()
         lrc_preview_layout = QVBoxLayout(self.lrc_preview_panel)
@@ -1795,7 +2232,25 @@ class ToolboxWindow(QMainWindow):
         browser_splitter.setStretchFactor(0, 3)
         browser_splitter.setStretchFactor(1, 2)
 
-        browser_layout.addWidget(self.browser_root_label)
+        browser_header_layout = QHBoxLayout()
+        browser_header_layout.setContentsMargins(0, 0, 0, 0)
+        browser_header_layout.setSpacing(8)
+        browser_header_layout.addWidget(self.browser_root_label)
+        self.browser_bulk_edit_btn = QPushButton("▼")
+        self.browser_bulk_edit_btn.setMaximumWidth(32)
+        self.browser_bulk_edit_btn.setEnabled(False)
+        self.browser_bulk_edit_btn.clicked.connect(self._show_bulk_metadata_menu)
+        browser_header_layout.addWidget(self.browser_bulk_edit_btn)
+        # self.browser_show_music_only_chk = QCheckBox("Show music files only")
+        # self.browser_show_music_only_chk.setToolTip("Hide non-audio files in the browser view")
+        # self.browser_show_music_only_chk.setChecked(False)
+        # self.browser_show_music_only_chk.toggled.connect(
+        lambda v: self.browser_proxy_model.set_show_music_files_only(v)
+        # )
+        # browser_header_layout.addWidget(self.browser_show_music_only_chk)
+        browser_header_layout.addStretch()
+
+        browser_layout.addLayout(browser_header_layout)
         browser_layout.addWidget(self.browser_size_progress)
         browser_layout.addWidget(browser_splitter, 1)
 
@@ -1926,6 +2381,7 @@ class ToolboxWindow(QMainWindow):
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
         self._build_help_pane()
+        
 
         content_row = QHBoxLayout()
         content_row.setContentsMargins(0, 0, 0, 0)
@@ -1940,6 +2396,45 @@ class ToolboxWindow(QMainWindow):
         self.status_credit_label = QLabel("Developed by: Silent Sphinx @silent-sphinx")
         self.statusBar().addPermanentWidget(self.status_credit_label)
         self.statusBar().showMessage("Ready")
+        # UI build complete
+
+    def _on_path_input_editing_finished(self) -> None:
+        # If focus moved directly to the browser tree (user clicked an item),
+        # ignore editingFinished to avoid triggering an unwanted refresh.
+        try:
+            fw = QApplication.focusWidget()
+            if fw is not None and (fw is self.browser_tree or fw is self.browser_tree.viewport()):
+                return
+        except Exception:
+            pass
+
+        current = self.path_input.text().strip()
+        if current == getattr(self, "_last_path_input_text", None):
+            return
+        self._last_path_input_text = current
+        self.show_info()
+
+    def _diagnostic_check(self) -> None:
+        """Lightweight runtime diagnostics to help debug an empty main window."""
+        try:
+            central = self.centralWidget()
+            tabs_present = hasattr(self, "tabs") and self.tabs is not None
+            browser_present = hasattr(self, "browser_tree") and self.browser_tree is not None
+            drive_combo_present = hasattr(self, "drive_combo") and self.drive_combo is not None
+            info = {
+                "central_widget": bool(central),
+                "tabs_count": getattr(self, "tabs", None).count() if tabs_present else None,
+                "browser_tree_valid": bool(browser_present),
+                "drive_combo_valid": bool(drive_combo_present),
+            }
+            if not central or (tabs_present and getattr(self, "tabs").count() == 0):
+                QMessageBox.warning(
+                    self,
+                    "Startup Diagnostic",
+                    "Main window initialized but content appears missing. See console for details.",
+                )
+        except Exception:
+            pass
 
     def _build_help_pane(self) -> None:
         self.help_container = QWidget()
@@ -2038,7 +2533,7 @@ class ToolboxWindow(QMainWindow):
                 "Inspect file metadata, rename files, and repair individual media.\n\n"
                 "Once you have selected your target directory, navigate through the folder structure to identify any files or folders you would like to edit.\n\n"
                 "Right-click on any media file to interact with it: Rename, Add/Fix Album Art, or Look up Lyrics.\n\n"
-                "After selecting a music file, you can view its metadata and properties on the right-hand side of the screen. Any field marked with a pencil icon can be modified."
+                "After selecting a music file, you can view its metadata and properties on the right-hand side of the screen. Any field marked with a pencil icon can be modified, and the remove button beside it will delete that metadata field."
             ),
             "Album Art": (
                 "Detect embedded artwork that may cause compatibility issues and convert it to a supported JPEG non-progressive format.\n\n"
@@ -2447,13 +2942,18 @@ class ToolboxWindow(QMainWindow):
             self.statusBar().showMessage("Drive refresh already running")
             return
 
-        self.refresh_drives_btn.setEnabled(False)
-        self.unmount_drive_btn.setEnabled(False)
-        self.refresh_drives_btn.setText("Refreshing...")
-        self.drive_combo.clear()
-        self.drive_combo.addItem("Scanning removable drives...")
-        self.statusBar().showMessage("Scanning removable drives...")
-        self._update_directory_tab_access()
+        # Guard against cases where the underlying C++ widgets have been
+        # destroyed (can happen during shutdown or if called too early).
+        try:
+            self.refresh_drives_btn.setEnabled(False)
+            self.unmount_drive_btn.setEnabled(False)
+            self.refresh_drives_btn.setText("Refreshing...")
+            self.drive_combo.clear()
+            self.drive_combo.addItem("Scanning removable drives...")
+            self.statusBar().showMessage("Scanning removable drives...")
+            self._update_directory_tab_access()
+        except RuntimeError:
+            return
 
         self._drive_scan_thread = QThread(self)
         self._drive_scan_worker = DriveScanWorker()
@@ -2520,7 +3020,11 @@ class ToolboxWindow(QMainWindow):
         return "exfat" in normalized or "fat" in normalized
 
     def _selected_drive_path(self) -> str | None:
-        selected = self.drive_combo.currentData()
+        try:
+            selected = self.drive_combo.currentData()
+        except RuntimeError:
+            return None
+
         if not isinstance(selected, str) or not selected:
             return None
         if any(option.path == selected for option in self.drive_options):
@@ -3830,38 +4334,39 @@ class ToolboxWindow(QMainWindow):
         self.scan_file_cleanup_breakdown()
 
     def refresh_directory_browser(self, target: str) -> None:
+        # refresh_directory_browser called
         self._pending_dir_size_scan_target = None
         self._cancel_directory_size_scan()
         self.browser_proxy_model.set_directory_sizes_enabled(False)
         self._dir_size_scan_target = None
+        self.browser_proxy_model.clear_checked_paths()
 
         if not target or not os.path.exists(target):
-            self.browser_root_label.setText("Root: no valid target selected")
+            self.browser_root_label.setText("")
             self.browser_tree.setEnabled(False)
             self.browser_proxy_model.clear_size_cache()
             self.browser_proxy_model.invalidate()
             self.browser_size_progress.hide()
             self.browser_tree.setRootIndex(QModelIndex())
             self._populate_file_properties([])
-            self._set_album_art_preview(None, "")
-            self.file_props_hint.setText("Select an audio file to view details.")
+            self._set_album_art_tab(None, "")
             self._set_embedded_lyrics_text("Select an audio file to view embedded lyrics.", "")
             self._show_audio_details_panel()
             self._reset_album_art_results()
             return
 
         resolved = str(Path(target).expanduser().resolve())
+        self.browser_proxy_model.clear_checked_paths()
         self.browser_proxy_model.clear_size_cache()
         self.browser_proxy_model.invalidate()
         source_index = self.browser_model.setRootPath(resolved)
         proxy_index = self.browser_proxy_model.mapFromSource(source_index)
         self.browser_tree.setRootIndex(proxy_index)
-        self.browser_root_label.setText(f"Root: {resolved}")
         self.browser_tree.setEnabled(True)
         self.browser_size_progress.hide()
+        self._on_browser_selection_changed(0)
         self._populate_file_properties([])
-        self._set_album_art_preview(None, "")
-        self.file_props_hint.setText("Select an audio file to view details.")
+        self._set_album_art_tab(None, "")
         self._set_embedded_lyrics_text("Select an audio file to view embedded lyrics.", "")
         self._show_audio_details_panel()
         self._reset_album_art_results()
@@ -3883,7 +4388,7 @@ class ToolboxWindow(QMainWindow):
                 "Select Target First",
                 "Please select a removable drive or choose a valid folder before using Directory Browser.",
             )
-            self.browser_root_label.setText("Root: choose a valid target first")
+            self.browser_root_label.setText("")
             self.browser_tree.setEnabled(False)
             self.browser_size_progress.hide()
             if self._about_tab_index >= 0:
@@ -3946,6 +4451,181 @@ class ToolboxWindow(QMainWindow):
     def _cancel_directory_size_scan(self) -> None:
         if self._dir_size_scan_worker is not None:
             self._dir_size_scan_worker.request_cancel()
+
+    def _show_bulk_metadata_menu(self) -> None:
+        menu = QMenu(self)
+        edit_action = menu.addAction("Edit Metadata")
+        edit_action.triggered.connect(self._show_bulk_metadata_editor)
+        menu.popup(self.browser_bulk_edit_btn.mapToGlobal(self.browser_bulk_edit_btn.rect().bottomLeft()))
+
+    def _show_bulk_metadata_editor(self) -> None:
+        selected_paths = list(self.browser_proxy_model.checked_paths())
+        if not selected_paths:
+            QMessageBox.warning(self, "No Selection", "No files selected.")
+            return
+        
+        dialog = BulkMetadataEditDialog(selected_paths, self)
+        dialog.exec()
+
+    def _bulk_update_metadata(self, selected_paths: list[str], metadata: dict[str, str]) -> None:
+        """Bulk update metadata for selected files."""
+        if not mutagen:
+            QMessageBox.critical(self, "Error", "mutagen library not available for metadata editing.")
+            return
+        
+        updated = 0
+        failed = []
+        def _try_mutagen_write(p: Path) -> tuple[bool, str]:
+            """Try to write metadata via mutagen. Returns (success, message)."""
+            try:
+                # First try the easy interface
+                audio = mutagen.File(str(p), easy=True)
+                if audio is not None:
+                    if audio.tags is None:
+                        try:
+                            audio.add_tags()
+                        except Exception:
+                            pass
+                    for k, v in metadata.items():
+                        if v is None:
+                            continue
+                        try:
+                            # easy mutagen expects lists
+                            audio.tags[k] = [v]
+                        except Exception:
+                            try:
+                                audio.tags[str(k)] = [v]
+                            except Exception:
+                                pass
+                    try:
+                        audio.save()
+                        return True, ""
+                    except Exception as exc:
+                        # fallthrough to format-specific attempts
+                        last_err = str(exc)
+
+                # Format-specific attempts for common container types
+                suf = p.suffix.lower()
+                if suf in (".wav", ".wave"):
+                    try:
+                        from mutagen.wave import WAVE
+
+                        w = WAVE(str(p))
+                        if w.tags is None:
+                            try:
+                                w.add_tags()
+                            except Exception:
+                                pass
+                        if metadata.get("artist") is not None:
+                            w.tags["IART"] = metadata["artist"]
+                        if metadata.get("title") is not None:
+                            w.tags["INAM"] = metadata["title"]
+                        w.save()
+                        return True, ""
+                    except Exception as exc:
+                        last_err = str(exc)
+
+                if suf in (".aiff", ".aif"):
+                    try:
+                        from mutagen.aiff import AIFF
+
+                        a = AIFF(str(p))
+                        if a.tags is None:
+                            try:
+                                a.add_tags()
+                            except Exception:
+                                pass
+                        if metadata.get("artist") is not None:
+                            a.tags["IART"] = metadata["artist"]
+                        if metadata.get("title") is not None:
+                            a.tags["NAME"] = metadata["title"]
+                        a.save()
+                        return True, ""
+                    except Exception as exc:
+                        last_err = str(exc)
+
+                # If we reached here, mutagen couldn't write the metadata
+                return False, last_err if "last_err" in locals() else "mutagen failed"
+            except Exception as exc:
+                return False, str(exc)
+
+        def _ffmpeg_fallback(p: Path) -> tuple[bool, str]:
+            """Attempt to write metadata by remuxing with ffmpeg (no re-encode)."""
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(p),
+                "-c",
+                "copy",
+            ]
+            for k, v in metadata.items():
+                if v is None:
+                    continue
+                cmd.extend(["-metadata", f"{k}={v}"])
+            cmd.append(str(tmp))
+            try:
+                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if proc.returncode == 0 and tmp.exists():
+                    try:
+                        os.replace(str(tmp), str(p))
+                        return True, ""
+                    except Exception as exc:
+                        try:
+                            tmp.unlink()
+                        except Exception:
+                            pass
+                        return False, f"replace failed: {str(exc)}"
+                stderr = proc.stderr.decode(errors="ignore") if proc and proc.stderr is not None else "ffmpeg failed"
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except Exception:
+                    pass
+                return False, stderr.strip()
+            except FileNotFoundError:
+                return False, "ffmpeg not installed"
+            except Exception as exc:
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except Exception:
+                    pass
+                return False, str(exc)
+
+        for file_path in selected_paths:
+            path = Path(file_path)
+            if not path.exists() or path.is_dir():
+                continue
+            try:
+                ok, msg = _try_mutagen_write(path)
+                if not ok:
+                    ok2, msg2 = _ffmpeg_fallback(path)
+                    if ok2:
+                        updated += 1
+                        continue
+                    else:
+                        failed.append(f"{path.name} ({msg or msg2})")
+                        continue
+                else:
+                    updated += 1
+            except Exception as e:
+                failed.append(f"{path.name} ({str(e)[:60]})")
+        
+        msg = f"Successfully updated {updated} file(s)."
+        if failed:
+            msg += f"\n\nFailed: {', '.join(failed[:10])}"
+            if len(failed) > 10:
+                msg += f"... and {len(failed) - 10} more"
+        
+        QMessageBox.information(self, "Metadata Update", msg)
+        self.statusBar().showMessage(f"Updated metadata for {updated} files", 4000)
+
+    @Slot(int)
+    def _on_browser_selection_changed(self, count: int) -> None:
+        self.browser_root_label.setText(f"{count} selected")
+        self.browser_bulk_edit_btn.setEnabled(count > 0)
 
     @Slot(int)
     def _on_dir_size_scan_progress(self, scanned_dirs: int) -> None:
@@ -4097,10 +4777,13 @@ class ToolboxWindow(QMainWindow):
         add_art_action = None
         fix_action = None
         lookup_add_lyrics_action = None
+        debug_action = None
         if is_audio_file:
             add_art_action = menu.addAction("Add Album Art")
             fix_action = menu.addAction("Fix Album Art")
             lookup_add_lyrics_action = menu.addAction("Lookup/Add Lyrics")
+            menu.addSeparator()
+            debug_action = menu.addAction("File Debug")
 
         selected_action = menu.exec(self.browser_tree.viewport().mapToGlobal(pos))
         if selected_action == rename_action:
@@ -4111,6 +4794,8 @@ class ToolboxWindow(QMainWindow):
             self.fix_album_art_for_file(path)
         if lookup_add_lyrics_action is not None and selected_action == lookup_add_lyrics_action:
             self.lookup_and_add_lyrics_for_file(path)
+        if debug_action is not None and selected_action == debug_action:
+            self.show_file_debug_dialog(path)
 
     def rename_browser_item(self, path: str) -> None:
         target_path = Path(path)
@@ -4414,6 +5099,113 @@ class ToolboxWindow(QMainWindow):
             "Album Art Added",
             f"{file_path.name}\n\nAlbum art has been embedded as JPEG non-progressive.",
         )
+
+    def show_file_debug_dialog(self, path: str) -> None:
+        """Show comprehensive metadata debug information for a file."""
+        file_path = Path(path)
+        if not file_path.exists():
+            QMessageBox.warning(self, "File Not Found", "The selected file no longer exists.")
+            return
+
+        # Gather all metadata
+        debug_lines: list[str] = []
+        debug_lines.append(f"File: {file_path.name}")
+        debug_lines.append(f"Path: {file_path}")
+        debug_lines.append(f"Size: {format_bytes(file_path.stat().st_size)}")
+        debug_lines.append("")
+
+        # FFprobe metadata
+        debug_lines.append("=== FFprobe Audio Info ===")
+        ffprobe_info = _ffprobe_audio_info(file_path)
+        if ffprobe_info:
+            for key in sorted(ffprobe_info.keys()):
+                value = ffprobe_info[key]
+                if key == "tags" and isinstance(value, dict):
+                    debug_lines.append(f"{key}:")
+                    for tag_key, tag_value in sorted(value.items()):
+                        debug_lines.append(f"  {tag_key}: {tag_value}")
+                else:
+                    debug_lines.append(f"{key}: {value}")
+        else:
+            debug_lines.append("(No ffprobe data)")
+        debug_lines.append("")
+
+        # Mutagen metadata
+        debug_lines.append("=== Mutagen Tags ===")
+        if mutagen is not None:
+            try:
+                audio = mutagen.File(file_path)
+                if audio:
+                    debug_lines.append(f"Format: {audio.__class__.__name__}")
+                    info = getattr(audio, "info", None)
+                    if info:
+                        debug_lines.append("Info attributes:")
+                        for attr in sorted(dir(info)):
+                            if attr.startswith("_"):
+                                continue
+                            try:
+                                value = getattr(info, attr)
+                                if not callable(value):
+                                    debug_lines.append(f"  {attr}: {value}")
+                            except Exception:
+                                pass
+                    tags = getattr(audio, "tags", None)
+                    if tags:
+                        debug_lines.append("Tags:")
+                        try:
+                            for key in sorted(tags.keys()):
+                                value = tags[key]
+                                debug_lines.append(f"  {key}: {value}")
+                        except Exception:
+                            debug_lines.append("  (Unable to read tags)")
+                    else:
+                        debug_lines.append("(No tags)")
+                else:
+                    debug_lines.append("(No audio data)")
+            except Exception as exc:
+                debug_lines.append(f"(Error reading: {exc})")
+        else:
+            debug_lines.append("(Mutagen not available)")
+
+        # Create dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"File Debug: {file_path.name}")
+        dialog.setGeometry(100, 100, 900, 600)
+
+        layout = QVBoxLayout(dialog)
+
+        # Title label
+        title = QLabel(f"Debug Information for: {file_path.name}")
+        title_font = title.font()
+        title_font.setBold(True)
+        title.setFont(title_font)
+        layout.addWidget(title)
+
+        # Text display (selectable and copyable)
+        text_display = QPlainTextEdit()
+        text_display.setPlainText("\n".join(debug_lines))
+        text_display.setReadOnly(True)
+        text_display.setLineWrapMode(QPlainTextEdit.NoWrap)
+        layout.addWidget(text_display)
+
+        # Button bar
+        button_layout = QHBoxLayout()
+        
+        copy_btn = QPushButton("Copy All to Clipboard")
+        copy_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(text_display.toPlainText())
+        )
+        button_layout.addWidget(copy_btn)
+        
+        button_layout.addStretch(1)
+        
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        button_layout.addWidget(close_btn)
+
+        layout.addLayout(button_layout)
+
+        dialog.exec()
 
     def lookup_and_add_lyrics_for_file(self, path: str) -> None:
         file_path = Path(path)
@@ -5089,10 +5881,10 @@ class ToolboxWindow(QMainWindow):
         candidates: list[dict[str, object]] = []
         for row in range(self.music_compatibility_table.rowCount()):
             file_item = self.music_compatibility_table.item(row, 0)
-            status_item = self.music_compatibility_table.item(row, 2)
-            sample_rate_item = self.music_compatibility_table.item(row, 4)
-            bit_depth_item = self.music_compatibility_table.item(row, 5)
-            eq_item = self.music_compatibility_table.item(row, 8)
+            status_item = self.music_compatibility_table.item(row, 3)
+            sample_rate_item = self.music_compatibility_table.item(row, 5)
+            bit_depth_item = self.music_compatibility_table.item(row, 6)
+            eq_item = self.music_compatibility_table.item(row, 9)
 
             if file_item is None or status_item is None:
                 continue
@@ -5394,8 +6186,8 @@ class ToolboxWindow(QMainWindow):
 
         for row in range(self.music_compatibility_table.rowCount()):
             quick_filter_match = True
-            status_item = self.music_compatibility_table.item(row, 2)
-            eq_item = self.music_compatibility_table.item(row, 8)
+            status_item = self.music_compatibility_table.item(row, 3)
+            eq_item = self.music_compatibility_table.item(row, 9)
             status_text = status_item.text().strip().upper() if status_item is not None else ""
             eq_text = eq_item.text().strip().lower() if eq_item is not None else ""
 
@@ -5431,7 +6223,7 @@ class ToolboxWindow(QMainWindow):
     @Slot(list, int, int, int, int, int)
     def _on_music_compatibility_scan_finished(
         self,
-        rows: list[tuple[str, str, str, str, str, str, str, str, str, str]],
+        rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str]],
         supported: int,
         unsupported: int,
         unknown: int,
@@ -5453,6 +6245,7 @@ class ToolboxWindow(QMainWindow):
                 (
                     file_name,
                     extension,
+                    codec,
                     status,
                     reason,
                     sample_rate,
@@ -5466,6 +6259,7 @@ class ToolboxWindow(QMainWindow):
                 items = [
                     QTableWidgetItem(file_name),
                     QTableWidgetItem(extension),
+                    QTableWidgetItem(codec),
                     QTableWidgetItem(status),
                     QTableWidgetItem(reason),
                     QTableWidgetItem(sample_rate),
@@ -5475,7 +6269,7 @@ class ToolboxWindow(QMainWindow):
                     QTableWidgetItem(eq_compatibility),
                 ]
 
-                reason_item = items[3]
+                reason_item = items[4]
                 reason_item.setToolTip(reason)
 
                 for col, item in enumerate(items):
@@ -5494,12 +6288,12 @@ class ToolboxWindow(QMainWindow):
                     status_bg = QColor("#3C3C3C")
                     status_fg = QColor("#E2E2E2")
 
-                status_item = self.music_compatibility_table.item(row_index, 2)
+                status_item = self.music_compatibility_table.item(row_index, 3)
                 if status_item is not None:
                     status_item.setBackground(status_bg)
                     status_item.setForeground(status_fg)
 
-                eq_item = self.music_compatibility_table.item(row_index, 8)
+                eq_item = self.music_compatibility_table.item(row_index, 9)
                 if eq_item is not None:
                     eq_text = eq_item.text().strip().lower()
                     if eq_text == "not compatible":
@@ -6525,10 +7319,14 @@ class ToolboxWindow(QMainWindow):
         section_item.setForeground(QColor("#E8E8E8"))
         self.file_props_table.setItem(row_index, 0, section_item)
         if section_key == "metadata":
-            add_btn = QPushButton("➕")
-            add_btn.setToolTip("Add metadata row")
-            add_btn.setFixedSize(28, 22)
-            add_btn.setStyleSheet("font-size: 12px; padding: 0px;")
+            add_btn = QPushButton("＋")
+            add_btn.setToolTip("Add metadata field")
+            add_btn.setFixedSize(24, 24)
+            add_btn.setStyleSheet(
+                "QPushButton { font-size: 11px; padding: 0px; border: 1px solid #505050; }"
+                "QPushButton:hover { background-color: #404040; }"
+            )
+            add_btn.setFocusPolicy(Qt.NoFocus)
             add_btn.clicked.connect(self._on_add_metadata_row_clicked)
 
             add_cell = QWidget(self.file_props_table)
@@ -6545,9 +7343,10 @@ class ToolboxWindow(QMainWindow):
     def _set_editable_metadata_cell(self, row_index: int, value_text: str, metadata_key: str) -> None:
         editor_container = QWidget(self.file_props_table)
         editor_layout = QHBoxLayout(editor_container)
-        editor_layout.setContentsMargins(4, 0, 4, 0)
-        editor_layout.setSpacing(6)
+        editor_layout.setContentsMargins(0, 0, 4, 0)
+        editor_layout.setSpacing(4)
 
+        # Text editor
         editor = QLineEdit(value_text, editor_container)
         editor.setToolTip("Editable metadata field. Press Enter to save.")
         editor.setProperty("originalValue", value_text)
@@ -6555,14 +7354,41 @@ class ToolboxWindow(QMainWindow):
             lambda key=metadata_key, input_widget=editor: self._on_metadata_editor_finished(key, input_widget)
         )
 
-        edit_icon = QLabel("✎", editor_container)
-        edit_icon.setAlignment(Qt.AlignCenter)
-        edit_icon.setFixedWidth(16)
-        edit_icon.setToolTip("Editable metadata field")
-        edit_icon.setStyleSheet("color: #B5B5B5;")
+        # Status indicator (dirty state)
+        status_label = QLabel("", editor_container)
+        status_label.setObjectName("metaStatus")
+        status_label.setFixedWidth(14)
+        status_label.setAlignment(Qt.AlignCenter)
+        status_label.setStyleSheet("color: #FF6B6B; font-size: 10px;")
 
+        def _mark_dirty(_text: str) -> None:
+            try:
+                status_label.setText("●")
+                editor.setProperty("dirty", True)
+            except Exception:
+                pass
+
+        editor.textChanged.connect(_mark_dirty)
+
+        # Remove button
+        remove_btn = QPushButton("×", editor_container)
+        remove_btn.setFixedSize(24, 24)
+        remove_btn.setToolTip("Remove this metadata field")
+        remove_btn.setStyleSheet(
+            "QPushButton { font-size: 14px; padding: 0px; border: 1px solid #505050; }"
+            "QPushButton:hover { background-color: #404040; }"
+        )
+        remove_btn.setFocusPolicy(Qt.NoFocus)
+        remove_btn.clicked.connect(
+            lambda checked=False, key=metadata_key, input_widget=editor: self._on_metadata_remove_clicked(
+                key, input_widget
+            )
+        )
+
+        # Layout: editor (stretch), status, remove button
         editor_layout.addWidget(editor, 1)
-        editor_layout.addWidget(edit_icon, 0)
+        editor_layout.addWidget(status_label, 0)
+        editor_layout.addWidget(remove_btn, 0)
         self.file_props_table.setCellWidget(row_index, 1, editor_container)
 
     def _populate_file_properties(
@@ -6635,28 +7461,125 @@ class ToolboxWindow(QMainWindow):
 
         tags = getattr(easy_audio, "tags", None)
         if tags is None:
+            # Fallback: try without easy=True for formats that don't support it
             try:
-                easy_audio.add_tags()
-            except Exception as exc:
-                return False, f"Unable to initialize tags: {exc}"
-            tags = getattr(easy_audio, "tags", None)
+                easy_audio = mutagen.File(file_path)
+                tags = getattr(easy_audio, "tags", None)
+            except Exception:
+                tags = None
+
             if tags is None:
-                return False, "Unable to initialize editable metadata tags."
+                try:
+                    easy_audio.add_tags()
+                except Exception as exc:
+                    return False, f"Unable to initialize tags: {exc}"
+                tags = getattr(easy_audio, "tags", None)
+                if tags is None:
+                    return False, "Unable to initialize editable metadata tags."
 
         values = self._metadata_input_to_values(value_text)
         try:
             if values:
                 tags[metadata_key] = values
+                easy_audio.save()
             else:
+                removed = False
+                # First, try to delete via easy tags
                 try:
-                    del tags[metadata_key]
+                    if metadata_key in tags:
+                        try:
+                            del tags[metadata_key]
+                            easy_audio.save()
+                            removed = True
+                        except Exception:
+                            # Some backends may not allow direct deletion via easy tags
+                            removed = False
                 except Exception:
-                    tags[metadata_key] = []
-            easy_audio.save()
+                    removed = False
+
+                # If easy deletion didn't work, try full mutagen tag API as a fallback
+                if not removed:
+                    try:
+                        removed = self._delete_tag_by_format(file_path, metadata_key)
+                    except Exception:
+                        removed = False
+
+                # As a last resort, set an empty list for easy tags (preserves behavior)
+                if not removed:
+                    try:
+                        tags[metadata_key] = []
+                        easy_audio.save()
+                    except Exception:
+                        # If all deletion attempts failed, raise to surface the error
+                        raise
         except Exception as exc:
             return False, f"Unable to save metadata field '{metadata_key}': {exc}"
 
         return True, "Saved"
+
+    def _remove_audio_metadata_tag(self, file_path: Path, metadata_key: str) -> tuple[bool, str]:
+        return self._save_audio_metadata_tag(file_path, metadata_key, "")
+
+    def _delete_tag_by_format(self, file_path: Path, metadata_key: str) -> bool:
+        """Attempt format-specific deletion using mutagen full API.
+
+        Returns True when deletion was performed and saved, False otherwise.
+        """
+        if mutagen is None:
+            return False
+
+        try:
+            full_audio = mutagen.File(file_path)
+        except Exception:
+            return False
+
+        if not full_audio:
+            return False
+
+        full_tags = getattr(full_audio, "tags", None)
+        if not full_tags:
+            return False
+
+        lowered = metadata_key.lower()
+        deleted_any = False
+
+        try:
+            # ID3 / MP3 handling
+            cls_name = full_audio.__class__.__name__.lower()
+
+            # Iterate keys and remove those matching or containing the metadata_key
+            for key in list(full_tags.keys()):
+                key_str = str(key)
+                if key_str.lower() == lowered or lowered in key_str.lower():
+                    try:
+                        # Prefer format-specific delete APIs where available
+                        if hasattr(full_tags, "delall"):
+                            try:
+                                full_tags.delall(key_str)
+                                deleted_any = True
+                                continue
+                            except Exception:
+                                pass
+
+                        try:
+                            del full_tags[key]
+                            deleted_any = True
+                        except Exception:
+                            # Some containers require different methods; ignore here
+                            pass
+                    except Exception:
+                        pass
+
+            if deleted_any:
+                try:
+                    full_audio.save()
+                    return True
+                except Exception:
+                    return False
+        except Exception:
+            return False
+
+        return False
 
     def _find_file_props_section_row(self, section_key: str) -> int:
         marker = f"section:{section_key}"
@@ -6814,6 +7737,55 @@ class ToolboxWindow(QMainWindow):
 
         if ok:
             self.statusBar().showMessage(f"Saved metadata: {metadata_key}", 3000)
+
+            # Mark the editor as saved (clear dirty, show check briefly, update originalValue and tooltip)
+            try:
+                container = input_widget.parent()
+                status = None
+                if container is not None:
+                    status = container.findChild(QLabel, "metaStatus")
+                if status is not None:
+                    status.setText("✓")
+                    status.setStyleSheet("color: #4CAF50; font-size: 12px;")
+                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                    status.setToolTip(f"Saved: {timestamp}")
+                    input_widget.setProperty("dirty", False)
+                    input_widget.setProperty("originalValue", current_value)
+                    QTimer.singleShot(1400, lambda: status.setText(""))
+            except Exception:
+                pass
+
+    def _on_metadata_remove_clicked(self, metadata_key: str, input_widget: QLineEdit) -> None:
+        if self._updating_file_props_table:
+            return
+
+        file_path = self._active_audio_metadata_path
+        if file_path is None:
+            return
+        if not file_path.exists() or not file_path.is_file():
+            QMessageBox.warning(self, "File Not Available", "The selected audio file is no longer available.")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Remove Metadata Field",
+            f"Remove '{metadata_key}' from this file?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        ok, message = self._remove_audio_metadata_tag(file_path, metadata_key)
+        if not ok:
+            QMessageBox.warning(self, "Metadata Remove Failed", message)
+            return
+
+        current_index = self.browser_tree.currentIndex()
+        if current_index.isValid():
+            self.on_browser_item_clicked(current_index)
+
+        self.statusBar().showMessage(f"Removed metadata: {metadata_key}", 3000)
 
     def _set_embedded_lyrics_text(self, hint: str, lyrics_text: str) -> None:
         self.file_lyrics_hint.setText(hint)
@@ -7011,6 +7983,60 @@ class ToolboxWindow(QMainWindow):
         self.file_props_table.setCellWidget(preview_row, 1, preview_widget)
         self.file_props_table.setRowHeight(preview_row, scaled.height() + 12)
 
+    def _set_album_art_tab(self, art_bytes: bytes | None, art_mime: str) -> None:
+        # Populate per-file Album Art tab preview and metadata table
+        try:
+            preview_widget = self.file_art_meta_preview
+            table = self.file_art_meta_table
+        except Exception:
+            return
+
+        if not art_bytes:
+            try:
+                preview_widget.clear()
+                table.setRowCount(0)
+            except Exception:
+                pass
+            return
+
+        pixmap = QPixmap()
+        loaded = bool(art_bytes) and pixmap.loadFromData(art_bytes)
+        if not loaded or pixmap.isNull():
+            preview_widget.setText(f"Album art unavailable ({art_mime})")
+            try:
+                table.setRowCount(2)
+                table.setItem(0, 0, QTableWidgetItem("MIME"))
+                table.setItem(0, 1, QTableWidgetItem(art_mime))
+                table.setItem(1, 0, QTableWidgetItem("Data Size"))
+                table.setItem(1, 1, QTableWidgetItem(format_bytes(len(art_bytes))))
+            except Exception:
+                pass
+            return
+
+        max_preview_side = 320
+        scaled = pixmap.scaled(
+            max_preview_side,
+            max_preview_side,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        preview_widget.setPixmap(scaled)
+        dims = image_size_from_bytes(art_bytes)
+        dimensions = f"{dims[0]} x {dims[1]}" if dims else "Unknown"
+        jpeg_type = jpeg_scan_type(art_bytes)
+        table_rows = [
+            ("MIME", art_mime),
+            ("Data Size", format_bytes(len(art_bytes))),
+            ("Dimensions", dimensions),
+        ]
+        if jpeg_type and jpeg_type != "Not JPEG":
+            table_rows.append(("JPEG Scan", jpeg_type))
+
+        table.setRowCount(len(table_rows))
+        for row_index, (prop, value) in enumerate(table_rows):
+            table.setItem(row_index, 0, QTableWidgetItem(prop))
+            table.setItem(row_index, 1, QTableWidgetItem(value))
+
     def _format_duration(self, seconds: float) -> str:
         if seconds <= 0:
             return "0:00"
@@ -7086,155 +8112,107 @@ class ToolboxWindow(QMainWindow):
         return normalized.title()
 
     def _extract_mutagen_metadata_rows(self, file_path: Path) -> list[tuple[str, str]]:
-        if mutagen is None:
-            return [("Metadata Engine", "Mutagen unavailable")]
-
-        try:
-            audio = mutagen.File(file_path)
-        except Exception as exc:
-            return [("Metadata Engine", f"Mutagen read failed: {exc}")]
-
-        if not audio:
-            return [("Metadata Engine", "No parseable metadata")]
+        """Extract technical audio metadata using ffprobe."""
+        ffprobe_info = _ffprobe_audio_info(file_path)
+        
+        if ffprobe_info is None:
+            return [("Metadata Engine", "FFprobe unavailable")]
 
         rows: list[tuple[str, str]] = []
-        rows.append(("Metadata Engine", "Mutagen"))
-        rows.append(("Container Type", audio.__class__.__name__))
-
-        info = getattr(audio, "info", None)
-        if info is not None:
-            info_attrs: dict[str, object] = {}
-            for attr_name in dir(info):
-                if attr_name.startswith("_"):
-                    continue
-                try:
-                    attr_value = getattr(info, attr_name)
-                except Exception:
-                    continue
-                if callable(attr_value) or attr_value is None:
-                    continue
-                info_attrs[attr_name] = attr_value
-
-            preferred_info = [
-                ("length", "Duration"),
-                ("bitrate", "Bitrate"),
-                ("sample_rate", "Sample Rate"),
-                ("channels", "Channels"),
-                ("bits_per_sample", "Bits Per Sample"),
-                ("codec", "Codec"),
-                ("codec_description", "Codec Description"),
-                ("bitrate_mode", "Bitrate Mode"),
-                ("encoder_info", "Encoder Info"),
-                ("encoder_settings", "Encoder Settings"),
-            ]
-            handled_attrs: set[str] = set()
-
-            for attr_name, label in preferred_info:
-                if attr_name not in info_attrs:
-                    continue
-                raw_value = info_attrs[attr_name]
-                handled_attrs.add(attr_name)
-
-                if attr_name == "length":
-                    try:
-                        seconds = float(raw_value)
-                        rows.append((label, f"{self._format_duration(seconds)} ({seconds:.3f} s)"))
-                    except Exception:
-                        rows.append((label, self._normalize_metadata_value(raw_value)))
-                    continue
-
-                if attr_name == "bitrate":
-                    try:
-                        bitrate = int(raw_value)
-                        kbps = bitrate / 1000.0
-                        rows.append((label, f"{kbps:.1f} kbps ({bitrate} bps)"))
-                    except Exception:
-                        rows.append((label, self._normalize_metadata_value(raw_value)))
-                    continue
-
-                if attr_name == "sample_rate":
-                    try:
-                        rows.append((label, f"{int(raw_value)} Hz"))
-                    except Exception:
-                        rows.append((label, self._normalize_metadata_value(raw_value)))
-                    continue
-
-                normalized = self._normalize_metadata_value(raw_value)
-                if normalized:
-                    rows.append((label, normalized))
-
-            for attr_name in sorted(info_attrs.keys(), key=lambda item: item.lower()):
-                if attr_name in handled_attrs:
-                    continue
-                normalized = self._normalize_metadata_value(info_attrs[attr_name])
-                if not normalized:
-                    continue
-                label = "Audio " + attr_name.replace("_", " ").title()
-                rows.append((label, normalized))
-
-        tags = getattr(audio, "tags", None)
+        rows.append(("Metadata Engine", "FFprobe"))
+        
+        format_name = ffprobe_info.get("format_long_name")
+        if format_name:
+            rows.append(("Container Type", format_name))
+        
+        # Duration
+        duration = ffprobe_info.get("duration")
+        if duration is not None:
+            try:
+                rows.append(("Duration", f"{self._format_duration(duration)} ({duration:.3f} s)"))
+            except Exception:
+                rows.append(("Duration", str(duration)))
+        
+        # Bitrate
+        bitrate = ffprobe_info.get("bitrate")
+        if bitrate is not None:
+            try:
+                kbps = bitrate / 1000.0
+                rows.append(("Bitrate", f"{kbps:.1f} kbps ({bitrate} bps)"))
+            except Exception:
+                rows.append(("Bitrate", str(bitrate)))
+        
+        # Sample Rate
+        sample_rate = ffprobe_info.get("sample_rate")
+        if sample_rate is not None:
+            rows.append(("Sample Rate", f"{int(sample_rate)} Hz"))
+        
+        # Channels
+        channels = ffprobe_info.get("channels")
+        if channels is not None:
+            rows.append(("Channels", str(channels)))
+        
+        # Bit Depth
+        bit_depth = ffprobe_info.get("bit_depth")
+        if bit_depth is not None:
+            rows.append(("Bits Per Sample", f"{bit_depth}-bit"))
+        
+        # Codec
+        codec_name = ffprobe_info.get("codec_name")
+        if codec_name:
+            rows.append(("Codec", codec_name))
+        
+        codec_long_name = ffprobe_info.get("codec_long_name")
+        if codec_long_name:
+            rows.append(("Codec Description", codec_long_name))
+        
+        # Tags
+        tags = ffprobe_info.get("tags", {})
         if not tags:
             rows.append(("Tags", "None found"))
             return rows
-
+        
         tag_rows_added = 0
-        try:
-            tag_keys = sorted(tags.keys(), key=lambda item: str(item).lower())
-        except Exception:
-            tag_keys = []
-
-        for tag_key in tag_keys:
-            values: list[object] = []
-            getall = getattr(tags, "getall", None)
-            if callable(getall):
-                try:
-                    values = list(getall(tag_key))
-                except Exception:
-                    values = []
-
-            if not values:
-                try:
-                    raw_value = tags[tag_key]
-                except Exception:
-                    continue
-                if isinstance(raw_value, list):
-                    values = list(raw_value)
-                else:
-                    values = [raw_value]
-
-            if not values:
+        for tag_key in sorted(tags.keys(), key=lambda item: str(item).lower()):
+            tag_value = tags[tag_key]
+            normalized = self._normalize_metadata_value(tag_value)
+            if not normalized:
                 continue
-
-            for index, value in enumerate(values, start=1):
-                normalized = self._normalize_metadata_value(value)
-                if not normalized:
-                    continue
-
-                label = f"Tag {tag_key}"
-                if len(values) > 1:
-                    label += f" #{index}"
-                rows.append((label, normalized))
-                tag_rows_added += 1
-
+            
+            label = f"Tag {tag_key}"
+            rows.append((label, normalized))
+            tag_rows_added += 1
+        
         if tag_rows_added == 0:
             rows.append(("Tags", "None found"))
-
+        
         return rows
 
     def _extract_editable_mutagen_rows(self, file_path: Path) -> list[tuple[str, str, str | None]]:
+        """Extract editable tags from audio file using Mutagen.
+        
+        Use Mutagen directly instead of ffprobe for extracting editable tags,
+        since Mutagen knows what keys are valid for each format.
+        This prevents trying to edit non-editable file properties.
+        """
         if mutagen is None:
             return []
 
         try:
-            easy_audio = mutagen.File(file_path, easy=True)
+            # Try with easy=True first (format-agnostic tag access)
+            audio = mutagen.File(file_path, easy=True)
         except Exception:
-            return []
+            audio = None
 
-        if not easy_audio:
-            return []
+        if not audio:
+            try:
+                # Fallback: try without easy=True
+                audio = mutagen.File(file_path)
+            except Exception:
+                return []
 
-        tags = getattr(easy_audio, "tags", None)
-        if tags is None:
+        tags = getattr(audio, "tags", None)
+        if not tags:
             return []
 
         rows: list[tuple[str, str, str | None]] = []
@@ -7243,8 +8221,11 @@ class ToolboxWindow(QMainWindow):
             "artist",
             "album",
             "albumartist",
+            "album_artist",
             "tracknumber",
+            "track",
             "discnumber",
+            "disc",
             "date",
             "genre",
             "composer",
@@ -7252,31 +8233,43 @@ class ToolboxWindow(QMainWindow):
             "lyrics",
         ]
 
+        # Get all keys from tags
         existing_keys: list[str] = []
         try:
             existing_keys = [str(item) for item in tags.keys()]
         except Exception:
             existing_keys = []
 
+        # Build a case-insensitive map
         existing_set = {key.lower(): key for key in existing_keys}
+        
+        # Collect keys in preferred order
         keys: list[str] = []
         for preferred_key in preferred_keys:
-            keys.append(existing_set.get(preferred_key, preferred_key))
-
-        seen_lower = {item.lower() for item in keys}
-
+            if preferred_key in existing_set:
+                keys.append(existing_set[preferred_key])
+        
+        # Add any remaining keys not in preferred list
+        seen_lower = {key.lower() for key in keys}
         for key in sorted(existing_keys, key=lambda item: item.lower()):
             if key.lower() not in seen_lower:
                 keys.append(key)
                 seen_lower.add(key.lower())
 
+        # Extract values for each key
         for key in keys:
-            raw_values = tags.get(key, [])
-            if isinstance(raw_values, (list, tuple)):
-                values = [str(item).strip() for item in raw_values if str(item).strip()]
-            else:
-                single = str(raw_values).strip()
-                values = [single] if single else []
+            values: list[str] = []
+            
+            # Try to get values (format-dependent)
+            raw_value = tags.get(key, [])
+            
+            if isinstance(raw_value, (list, tuple)):
+                values = [str(item).strip() for item in raw_value if str(item).strip()]
+            elif raw_value:
+                values = [str(raw_value).strip()]
+
+            if not values:
+                continue
 
             value_text = "; ".join(values)
             rows.append((self._metadata_label_for_key(str(key)), value_text, str(key)))
@@ -7320,6 +8313,15 @@ class ToolboxWindow(QMainWindow):
             ("Readable", "Yes" if os.access(file_path, os.R_OK) else "No"),
             ("Writable", "Yes" if os.access(file_path, os.W_OK) else "No"),
         ]
+        
+        # Add codec information if available
+        try:
+            from .music_compatibility import _get_audio_codec
+            codec = _get_audio_codec(file_path)
+            if codec:
+                rows.append(("Audio Codec", codec))
+        except Exception:
+            pass
 
         rows.append(("__SECTION__", "Metadata"))
         if editable_rows:
@@ -7330,8 +8332,7 @@ class ToolboxWindow(QMainWindow):
         rows.append(("__SECTION__", "Technical Details"))
         rows.extend(self._extract_mutagen_metadata_rows(file_path))
 
-        rows.append(("__SECTION__", "Album Art"))
-        rows.extend(album_art_rows)
+        # Album art metadata is shown in its own tab; do not add to properties table.
         return rows, art_bytes, art_mime
 
     def on_browser_item_clicked(self, index) -> None:
@@ -7345,8 +8346,8 @@ class ToolboxWindow(QMainWindow):
         if self.browser_model.isDir(source_index):
             self._active_audio_metadata_path = None
             self._populate_file_properties([])
-            self._set_album_art_preview(None, "")
-            self.file_props_hint.setText("Select an audio file to view details.")
+            self._set_album_art_tab(None, "")
+            self._set_album_art_tab(None, "")
             self._set_embedded_lyrics_text("Select an audio file to view embedded lyrics.", "")
             return
 
@@ -7359,8 +8360,7 @@ class ToolboxWindow(QMainWindow):
         if suffix not in AUDIO_FILE_EXTENSIONS:
             self._active_audio_metadata_path = None
             self._populate_file_properties([])
-            self._set_album_art_preview(None, "")
-            self.file_props_hint.setText("Selected file is not an audio file.")
+            self._set_album_art_tab(None, "")
             self._set_embedded_lyrics_text("Selected file is not an audio file.", "")
             return
 
@@ -7369,15 +8369,14 @@ class ToolboxWindow(QMainWindow):
         except Exception as exc:
             self._active_audio_metadata_path = None
             self._populate_file_properties([])
-            self._set_album_art_preview(None, "")
-            self.file_props_hint.setText(f"Failed to read file properties: {exc}")
+            self._set_album_art_tab(None, "")
             self._set_embedded_lyrics_text("Unable to read embedded lyrics.", str(exc))
             return
 
         self._active_audio_metadata_path = Path(path)
-        self.file_props_hint.setText("Edit metadata values in the table, or click + in Metadata to add a new property/value row.")
         self._populate_file_properties(props)
-        self._set_album_art_preview(art_bytes, art_mime)
+        # Populate album art tab only (do not add album art metadata to properties table)
+        self._set_album_art_tab(art_bytes, art_mime)
 
         lyrics_hint, lyrics_text = self._embedded_lyrics_for_file(Path(path))
         self._set_embedded_lyrics_text(lyrics_hint, lyrics_text)
