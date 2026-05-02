@@ -3,16 +3,10 @@ import json
 import re
 import shutil
 import subprocess
-import wave
 from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Slot
-
-try:
-    import mutagen
-except Exception:
-    mutagen = None
 
 
 LOSSY_FORMATS = {".mp3", ".ogg", ".m4a", ".wma"}
@@ -105,26 +99,40 @@ def _infer_bit_depth_from_sample_fmt(sample_fmt: str | None) -> int | None:
     return _positive_int_or_none(_safe_int(match.group(1)))
 
 
-def _ffprobe_audio_info(path: Path) -> dict[str, int | None] | None:
+def _ffprobe_audio_info(path: Path) -> dict[str, int | None | str] | None:
+    """Extract comprehensive audio metadata using ffprobe.
+    
+    Returns dict with:
+      - sample_rate: int or None
+      - bit_depth: int or None  
+      - codec_name: str or None
+      - channels: int or None
+      - bitrate: int or None
+      - duration: float or None
+      - format_long_name: str or None
+      - max_block_size: int or None (for FLAC)
+      - tags: dict of metadata tags
+    """
     ffprobe_executable = _resolve_ffprobe_executable()
     if ffprobe_executable is None:
         return None
 
     cmd = [
         ffprobe_executable,
-        "-v",
-        "error",
-        "-select_streams",
-        "a:0",
+        "-v", "error",
+        "-select_streams", "a:0",
         "-show_entries",
-        "stream=sample_rate,sample_fmt,bits_per_sample,bits_per_raw_sample,max_block_size",
-        "-of",
-        "json",
+        "stream=sample_rate,sample_fmt,bits_per_sample,bits_per_raw_sample,max_block_size,codec_name,channels,bit_rate,"
+        "duration,codec_long_name",
+        "-show_entries", "format=duration,bit_rate,format_long_name",
+        "-show_entries", "stream_tags",
+        "-show_entries", "format_tags",
+        "-of", "json",
         str(path),
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=10)
     except Exception:
         return None
 
@@ -136,12 +144,18 @@ def _ffprobe_audio_info(path: Path) -> dict[str, int | None] | None:
     except Exception:
         return None
 
+    # Extract stream information
     streams = payload.get("streams") or []
     if not streams:
         return None
 
     stream = streams[0]
+    
+    # Extract basic audio properties
     sample_rate = _positive_int_or_none(_safe_int(stream.get("sample_rate")))
+    channels = _positive_int_or_none(_safe_int(stream.get("channels")))
+    
+    # Bit depth extraction with fallback logic
     bit_depth = _first_valid_int(
         stream.get("bits_per_raw_sample"),
         stream.get("bits_per_sample"),
@@ -149,16 +163,69 @@ def _ffprobe_audio_info(path: Path) -> dict[str, int | None] | None:
     bit_depth = _positive_int_or_none(bit_depth)
     if bit_depth is None:
         bit_depth = _infer_bit_depth_from_sample_fmt(stream.get("sample_fmt"))
-
-    flac_block_max = _positive_int_or_none(_safe_int(stream.get("max_block_size")))
-
-    if sample_rate is None and bit_depth is None and flac_block_max is None:
-        return None
+    
+    codec_name = str(stream.get("codec_name", "")).strip().lower() or None
+    codec_long_name = str(stream.get("codec_long_name", "")).strip() or None
+    max_block_size = _positive_int_or_none(_safe_int(stream.get("max_block_size")))
+    
+    # Duration and bitrate from stream first, then format
+    duration = None
+    try:
+        stream_duration = float(stream.get("duration", 0))
+        if stream_duration > 0:
+            duration = stream_duration
+    except (ValueError, TypeError):
+        pass
+    
+    if duration is None:
+        format_info = payload.get("format") or {}
+        try:
+            format_duration = float(format_info.get("duration", 0))
+            if format_duration > 0:
+                duration = format_duration
+        except (ValueError, TypeError):
+            pass
+    
+    bit_rate = None
+    try:
+        stream_bitrate = int(stream.get("bit_rate", 0))
+        if stream_bitrate > 0:
+            bit_rate = stream_bitrate
+    except (ValueError, TypeError):
+        pass
+    
+    if bit_rate is None:
+        format_info = payload.get("format") or {}
+        try:
+            format_bitrate = int(format_info.get("bit_rate", 0))
+            if format_bitrate > 0:
+                bit_rate = format_bitrate
+        except (ValueError, TypeError):
+            pass
+    
+    format_long_name = str(payload.get("format", {}).get("format_long_name", "")).strip() or None
+    
+    # Extract tags from both stream and format level
+    tags = {}
+    stream_tags = stream.get("tags") or {}
+    format_tags = payload.get("format", {}).get("tags") or {}
+    
+    if stream_tags:
+        tags.update({k.lower(): v for k, v in stream_tags.items()})
+    if format_tags:
+        tags.update({k.lower(): v for k, v in format_tags.items()})
 
     return {
         "sample_rate": sample_rate,
         "bit_depth": bit_depth,
-        "flac_block_max": flac_block_max,
+        "flac_block_max": max_block_size,
+        "codec_name": codec_name,
+        "codec_long_name": codec_long_name,
+        "channels": channels,
+        "bitrate": bit_rate,
+        "duration": duration,
+        "format_long_name": format_long_name,
+        "tags": tags,
     }
 
 
@@ -173,6 +240,34 @@ def _map_dsd_multiple(sample_rate: int) -> int | None:
             if best is None or diff < best[1]:
                 best = (nearest, diff)
     return best[0] if best else None
+
+
+def _get_audio_codec(path: Path) -> str | None:
+    """Extract the actual audio codec name from the file using ffprobe."""
+    ffprobe_info = _ffprobe_audio_info(path)
+    if ffprobe_info and ffprobe_info.get("codec_name"):
+        return ffprobe_info.get("codec_name")
+    return None
+
+
+def _read_audio_metadata(path: Path) -> dict[str, int | None | str]:
+    """Read audio metadata using ffprobe exclusively."""
+    ffprobe_info = _ffprobe_audio_info(path)
+    
+    if ffprobe_info is None:
+        return {
+            "sample_rate": None,
+            "bit_depth": None,
+            "flac_block_max": None,
+            "codec_name": None,
+        }
+    
+    return {
+        "sample_rate": ffprobe_info.get("sample_rate"),
+        "bit_depth": ffprobe_info.get("bit_depth"),
+        "flac_block_max": ffprobe_info.get("flac_block_max"),
+        "codec_name": ffprobe_info.get("codec_name"),
+    }
 
 
 def _short_missing_metadata_reason(missing_fields: list[str]) -> str:
@@ -190,6 +285,43 @@ def _relative_path_for_target(path: Path, target_dir: Path) -> str:
         return path.relative_to(target_dir).as_posix()
     except Exception:
         return str(path)
+
+
+def _validate_codec_for_container(extension: str, codec_name: str | None) -> tuple[bool, str]:
+    """Validate that the audio codec matches the container format expectations.
+    
+    Returns:
+        (is_valid, reason_if_invalid)
+    """
+    if codec_name is None:
+        return True, ""  # Can't validate if codec unknown
+    
+    # M4A/M4B/M4P containers should only have AAC, ALAC, or related codecs
+    if extension in {".m4a", ".m4b", ".m4p"}:
+        codec_lower = codec_name.lower().strip()
+        
+        # Valid codec names for M4A containers
+        valid_m4a_codecs = {
+            "aac", "aac_lc", "he-aac", "aac-lc", "he_aac",
+            "alac",  # Apple Lossless Audio Codec
+            "ac-3", "ec-3", "dts", "dts-hd",  # Sometimes found in M4A containers
+        }
+        
+        # MP4 audio object type codes (returned by ffprobe for M4A files)
+        # mp4a.40.2 = AAC-LC Low Complexity (most common)
+        # mp4a.40.x / m4a.40.x = AAC family codecs
+        # mp4a.66.x / m4a.66.x = AAC-LC SBR (Spectral Band Replication)
+        # mp4a.67.x / m4a.67.x = AAC-LC PS (Parametric Stereo)
+        # mp4a.68.x / m4a.68.x = AAC-LC PS Enhanced
+        if codec_lower.startswith(("mp4a.", "m4a.")):
+            # MP4 audio object type code - these are valid AAC variants
+            return True, ""
+        
+        if codec_lower not in valid_m4a_codecs:
+            return False, f"M4A container has incorrect codec '{codec_name}' (expected AAC or ALAC)"
+    
+    return True, ""
+
 
 
 def _evaluate_music_file_with_cache(path: Path, target_dir: Path) -> dict[str, str]:
@@ -224,66 +356,6 @@ def _evaluate_music_file_with_cache(path: Path, target_dir: Path) -> dict[str, s
     return result
 
 
-def _read_audio_metadata(path: Path) -> dict[str, int | None]:
-    sample_rate = None
-    bit_depth = None
-    flac_block_max = None
-
-    if mutagen is not None:
-        try:
-            audio = mutagen.File(path)
-        except Exception:
-            audio = None
-
-        info = getattr(audio, "info", None) if audio else None
-        if info is not None:
-            sample_rate = _positive_int_or_none(
-                _first_valid_int(
-                getattr(info, "sample_rate", None),
-                getattr(info, "samplerate", None),
-                )
-            )
-            bit_depth = _positive_int_or_none(
-                _first_valid_int(
-                getattr(info, "bits_per_sample", None),
-                getattr(info, "bit_depth", None),
-                getattr(info, "bits_per_raw_sample", None),
-                )
-            )
-            flac_block_max = _positive_int_or_none(
-                _first_valid_int(
-                getattr(info, "max_blocksize", None),
-                getattr(info, "max_block_size", None),
-                )
-            )
-
-    if path.suffix.lower() == ".wav" and (sample_rate is None or bit_depth is None):
-        try:
-            with wave.open(str(path), "rb") as wav_file:
-                if sample_rate is None:
-                    sample_rate = _positive_int_or_none(_safe_int(wav_file.getframerate()))
-                if bit_depth is None:
-                    bit_depth = _positive_int_or_none(_safe_int(wav_file.getsampwidth() * 8))
-        except Exception:
-            pass
-
-    if sample_rate is None or bit_depth is None or flac_block_max is None:
-        ffprobe_info = _ffprobe_audio_info(path)
-        if ffprobe_info:
-            if sample_rate is None:
-                sample_rate = ffprobe_info.get("sample_rate")
-            if bit_depth is None:
-                bit_depth = ffprobe_info.get("bit_depth")
-            if flac_block_max is None:
-                flac_block_max = ffprobe_info.get("flac_block_max")
-
-    return {
-        "sample_rate": sample_rate,
-        "bit_depth": bit_depth,
-        "flac_block_max": flac_block_max,
-    }
-
-
 def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
     relative_path = _relative_path_for_target(path, target_dir)
 
@@ -296,6 +368,7 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
     bit_depth_text = "-"
     block_size_text = "N/A"
     dsd_profile = "-"
+    codec_text = "-"
     eq_sample_rate = None
     eq_bit_depth = None
 
@@ -304,6 +377,7 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         return {
             "file": relative_path,
             "extension": extension_display,
+            "codec": codec_text,
             "status": status,
             "category": category,
             "reason": reason,
@@ -330,22 +404,34 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         metadata = _read_audio_metadata(path)
         sample_rate = metadata.get("sample_rate")
         bit_depth = metadata.get("bit_depth")
+        codec_name = metadata.get("codec_name")
         eq_sample_rate = sample_rate
         eq_bit_depth = bit_depth
 
+        codec_text = codec_name if codec_name else "-"
         sample_rate_text = str(sample_rate) if sample_rate is not None else "-"
         bit_depth_text = str(bit_depth) if bit_depth is not None else "N/A"
-        status = "SUPPORTED"
-        category = "supported"
-        reason = "Lossy format supported"
+        
+        # Validate codec matches container format
+        codec_valid, codec_error = _validate_codec_for_container(extension, codec_name)
+        if not codec_valid:
+            status = "UNSUPPORTED"
+            category = "unsupported"
+            reason = codec_error
+        else:
+            status = "SUPPORTED"
+            category = "supported"
+            reason = "Lossy format supported"
     elif extension in PCM_FORMATS:
         metadata = _read_audio_metadata(path)
         sample_rate = metadata.get("sample_rate")
         bit_depth = metadata.get("bit_depth")
         flac_block_max = metadata.get("flac_block_max")
+        codec_name = metadata.get("codec_name")
         eq_sample_rate = sample_rate
         eq_bit_depth = bit_depth
 
+        codec_text = codec_name if codec_name else "-"
         sample_rate_text = str(sample_rate) if sample_rate is not None else "-"
         bit_depth_text = str(bit_depth) if bit_depth is not None else "-"
         if extension == ".flac":
@@ -387,8 +473,10 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
     elif extension in DSD_FORMATS:
         metadata = _read_audio_metadata(path)
         sample_rate = metadata.get("sample_rate")
+        codec_name = metadata.get("codec_name")
         eq_sample_rate = sample_rate
         sample_rate_text = str(sample_rate) if sample_rate is not None else "-"
+        codec_text = codec_name if codec_name else "-"
 
         if sample_rate is None:
             status = "UNKNOWN"
@@ -435,6 +523,7 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
     return {
         "file": relative_path,
         "extension": extension_display,
+        "codec": codec_text,
         "status": status,
         "category": category,
         "reason": reason,
@@ -490,7 +579,7 @@ class MusicCompatibilityScanWorker(QObject):
             unsupported = 0
             unknown = 0
             skipped = 0
-            rows: list[tuple[str, str, str, str, str, str, str, str, str, str]] = []
+            rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str]] = []
 
             self.progress.emit(0, total_files, supported, unsupported, unknown, skipped)
 
@@ -504,6 +593,7 @@ class MusicCompatibilityScanWorker(QObject):
                     (
                         result["file"],
                         result["extension"],
+                        result["codec"],
                         result["status"],
                         result["reason"],
                         result["sample_rate"],
