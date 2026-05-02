@@ -9,14 +9,24 @@ An easy desktop app to prepare your music folders and USB drives for the Snowsky
 
 ![Overview](Overview.png)
 
+## Has the tool failed to fix your media?
+
+Has your music file failed to be located by Snowsky Echo Mini Toolbox? Does it say it’s compatible but still not work, or has the file conversion failed?
+Please help the community by submitting a bug report—your feedback helps improve the tool!
+
+**GitHub:** *Issues > New Issue > Incompatible Music Format*
+
 ## Table of Contents
 
 - [Snowsky Echo Mini Toolbox](#snowsky-echo-mini-toolbox)
+  - [Has the tool failed to fix your media?](#has-the-tool-failed-to-fix-your-media)
   - [Table of Contents](#table-of-contents)
   - [Main Features](#main-features)
   - [Requirements](#requirements)
   - [Important Notes](#important-notes)
   - [Installation](#installation)
+    - [Required Dependencies (Linux Only)](#required-dependencies-linux-only)
+    - [Supported Operating Systems](#supported-operating-systems)
   - [Build from source](#build-from-source)
   - [Compatibility Rules](#compatibility-rules)
   - [Contributing](#contributing)
