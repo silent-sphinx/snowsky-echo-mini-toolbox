@@ -1,3 +1,5 @@
+archive/
+
 # Virtual Environment 
 .venv*
 venv*
@@ -11,7 +13,6 @@ venv*
 __pycache__
 
 # Temporary Build Directories
-build_assets/
 build/
-pyi_ffprobe_path_hook.py
-dist
+build_binaries/
+dist/
