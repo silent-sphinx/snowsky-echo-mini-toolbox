@@ -62,7 +62,7 @@ from .album_art import (
     to_non_progressive_jpeg,
     write_embedded_album_art,
 )
-from .constants import ALBUM_ART_CACHE_LIMIT, AUDIO_FILE_EXTENSIONS
+from .constants import ALBUM_ART_CACHE_LIMIT, APP_VERSION, AUDIO_FILE_EXTENSIONS
 from .music_compatibility import KNOWN_AUDIO_FORMATS, MusicCompatibilityScanWorker, _ffprobe_audio_info
 from .models import DriveOption
 from .system_info import collect_target_info, format_bytes, list_removable_drives
@@ -2395,7 +2395,9 @@ class ToolboxWindow(QMainWindow):
 
         self.setCentralWidget(root)
         self._position_header_logo()
+        self.status_version_label = QLabel(f"Version: {APP_VERSION}")
         self.status_credit_label = QLabel("Developed by: Silent Sphinx @silent-sphinx")
+        self.statusBar().addPermanentWidget(self.status_version_label)
         self.statusBar().addPermanentWidget(self.status_credit_label)
         self.statusBar().showMessage("Ready")
         # UI build complete
