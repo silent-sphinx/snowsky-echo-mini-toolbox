@@ -53,17 +53,8 @@ if base:
     os.environ["PATH"] = base + os.pathsep + current if current else base
 PY
 
-echo "Running PyInstaller (this may take a while)..."
-pyinstaller \
-  --name "$APP_NAME" \
-  --windowed \
-  --noconfirm \
-  --clean \
-  --collect-all PySide6 \
-  --hidden-import certifi \
-  --add-binary "build_assets/ffprobe:." \
-  --runtime-hook pyi_ffprobe_path_hook.py \
-  main.py
+echo "Running PyInstaller with optimized spec (this may take a while)..."
+pyinstaller --noconfirm --clean Snowsky\ Echo\ Mini\ Toolbox.spec
 
 echo "Creating tar.gz release..."
 tar -C dist -czf "dist/${APP_SLUG}-${VERSION}-linux.tar.gz" "$APP_NAME"
