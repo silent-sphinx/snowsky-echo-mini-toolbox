@@ -125,6 +125,26 @@ def _resolve_ffprobe_executable() -> str | None:
     return None
 
 
+def _subprocess_no_window_kwargs() -> dict[str, object]:
+    if os.name != "nt":
+        return {}
+
+    kwargs: dict[str, object] = {}
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    startupinfo_factory = getattr(subprocess, "STARTUPINFO", None)
+    if startupinfo_factory is not None:
+        startupinfo = startupinfo_factory()
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        kwargs["startupinfo"] = startupinfo
+
+    return kwargs
+
+
 def _infer_bit_depth_from_sample_fmt(sample_fmt: str | None) -> int | None:
     if not sample_fmt:
         return None
@@ -189,7 +209,14 @@ def _ffprobe_audio_info(path: Path) -> dict[str, int | None | str] | None:
     last_err: str | None = None
     for attempt in range(2):
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=10)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+                **_subprocess_no_window_kwargs(),
+            )
         except subprocess.TimeoutExpired as exc:
             last_err = f"ffprobe timeout: {exc}"
             logger.debug("ffprobe timeout for %s (attempt %d): %s", path, attempt + 1, exc)
