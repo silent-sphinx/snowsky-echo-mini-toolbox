@@ -561,7 +561,7 @@ class BrowserTreeView(QTreeView):
 
         current_index = start_index
         safety_limit = 0
-        while current_index.isValid() and safety_limit < 100000:
+        while current_index.isValid() and safety_limit < 10000:
             model.setData(current_index, check_state, Qt.CheckStateRole)
             if current_index == end_index:
                 return
@@ -573,7 +573,7 @@ class BrowserTreeView(QTreeView):
 
         current_index = end_index
         safety_limit = 0
-        while current_index.isValid() and safety_limit < 100000:
+        while current_index.isValid() and safety_limit < 10000:
             model.setData(current_index, check_state, Qt.CheckStateRole)
             if current_index == start_index:
                 return
@@ -1176,11 +1176,14 @@ class MusicConversionWorker(QObject):
         suffix = base_path.suffix
         parent = base_path.parent
         counter = 1
-        while True:
+        max_attempts = 10000
+        while counter <= max_attempts:
             candidate = parent / f"{stem}.bak{counter}{suffix}"
             if not candidate.exists():
                 return candidate
             counter += 1
+        # Fallback if too many backups exist
+        return base_path.with_name(f"{stem}.bak-{int(time.time())}{suffix}")
 
     @Slot()
     def run(self) -> None:
