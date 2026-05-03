@@ -62,6 +62,51 @@ def _first_valid_int(*values) -> int | None:
     return None
 
 
+def _extract_flac_max_block_size(stream: dict, codec_name: str | None) -> int | None:
+    """Extract FLAC max block size from ffprobe stream keys across versions."""
+    if codec_name != "flac":
+        return None
+
+    # Different ffprobe builds expose this using different key names.
+    max_block_size = _first_valid_int(
+        stream.get("max_block_size"),
+        stream.get("max_blocksize"),
+        stream.get("max_samples_per_frame"),
+    )
+    return _positive_int_or_none(max_block_size)
+
+
+def _read_flac_streaminfo_block_max_size(path: Path) -> int | None:
+    """Read FLAC STREAMINFO max block size directly from file metadata."""
+    try:
+        with path.open("rb") as handle:
+            if handle.read(4) != b"fLaC":
+                return None
+
+            while True:
+                header = handle.read(4)
+                if len(header) < 4:
+                    return None
+
+                is_last = bool(header[0] & 0x80)
+                block_type = header[0] & 0x7F
+                block_length = int.from_bytes(header[1:4], "big")
+
+                if block_type == 0:  # STREAMINFO
+                    payload = handle.read(block_length)
+                    if len(payload) < 4:
+                        return None
+                    max_block_size = int.from_bytes(payload[2:4], "big")
+                    return _positive_int_or_none(max_block_size)
+
+                # Skip non-STREAMINFO metadata blocks.
+                handle.seek(block_length, os.SEEK_CUR)
+                if is_last:
+                    return None
+    except Exception:
+        return None
+
+
 def _resolve_ffprobe_executable() -> str | None:
     ffprobe_path = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
     if ffprobe_path:
@@ -122,7 +167,7 @@ def _ffprobe_audio_info(path: Path) -> dict[str, int | None | str] | None:
         "-v", "error",
         "-select_streams", "a:0",
         "-show_entries",
-        "stream=sample_rate,sample_fmt,bits_per_sample,bits_per_raw_sample,max_block_size,codec_name,channels,bit_rate,"
+        "stream=sample_rate,sample_fmt,bits_per_sample,bits_per_raw_sample,max_block_size,max_blocksize,max_samples_per_frame,codec_name,channels,bit_rate,"
         "duration,codec_long_name",
         "-show_entries", "format=duration,bit_rate,format_long_name",
         "-show_entries", "stream_tags",
@@ -166,7 +211,9 @@ def _ffprobe_audio_info(path: Path) -> dict[str, int | None | str] | None:
     
     codec_name = str(stream.get("codec_name", "")).strip().lower() or None
     codec_long_name = str(stream.get("codec_long_name", "")).strip() or None
-    max_block_size = _positive_int_or_none(_safe_int(stream.get("max_block_size")))
+    max_block_size = _extract_flac_max_block_size(stream, codec_name)
+    if max_block_size is None and path.suffix.lower() == ".flac":
+        max_block_size = _read_flac_streaminfo_block_max_size(path)
     
     # Duration and bitrate from stream first, then format
     duration = None
