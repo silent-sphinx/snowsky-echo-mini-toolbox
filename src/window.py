@@ -14,6 +14,8 @@ import urllib.request
 from collections import OrderedDict
 from pathlib import Path
 import traceback
+import logging
+import tempfile
 
 from PySide6.QtCore import QDir, QModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot, QTimer
 from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPen, QPixmap, QRegion, QClipboard
@@ -979,6 +981,8 @@ class MusicConversionWorker(QObject):
         self.backup_root = backup_root
         self._cancel_requested = False
         self._active_process: subprocess.Popen | None = None
+        # per-conversion timeout in seconds
+        self.CONVERSION_TIMEOUT = 600
 
     def request_cancel(self) -> None:
         self._cancel_requested = True
@@ -1038,17 +1042,24 @@ class MusicConversionWorker(QObject):
             str(source_file),
         ]
 
+        logger = logging.getLogger(__name__)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.debug("ffprobe timeout while resolving sample rate for %s", source_file)
+            return None
         except Exception:
+            logger.debug("ffprobe invocation failed while resolving sample rate for %s", source_file, exc_info=True)
             return None
 
         if result.returncode != 0:
+            logger.debug("ffprobe returned non-zero resolving sample rate for %s: %s", source_file, (result.stderr or "").strip())
             return None
 
         try:
             payload = json.loads(result.stdout)
         except Exception:
+            logger.debug("ffprobe output JSON parse failed for %s", source_file, exc_info=True)
             return None
 
         streams = payload.get("streams") or []
@@ -1102,16 +1113,18 @@ class MusicConversionWorker(QObject):
         return command
 
     def _run_conversion_subprocess(self, command: list[str]) -> tuple[bool, str]:
+        logger = logging.getLogger(__name__)
         try:
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
         except Exception as exc:
             return False, str(exc)
 
         self._active_process = process
+        start_time = time.time()
         try:
             while True:
                 if self._cancel_requested:
@@ -1129,10 +1142,27 @@ class MusicConversionWorker(QObject):
                     process.wait(timeout=0.1)
                     break
                 except subprocess.TimeoutExpired:
+                    # enforce conversion timeout
+                    elapsed = time.time() - start_time
+                    if elapsed > self.CONVERSION_TIMEOUT:
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                        return False, f"ffmpeg conversion timed out after {self.CONVERSION_TIMEOUT} seconds"
                     continue
 
             if process.returncode != 0:
-                return False, f"ffmpeg conversion failed (exit code {process.returncode})"
+                stderr_bytes = b""
+                try:
+                    if process.stderr is not None:
+                        stderr_bytes = process.stderr.read() or b""
+                except Exception:
+                    pass
+                stderr_text = stderr_bytes.decode(errors="replace").strip()
+                logger.debug("ffmpeg stderr: %s", stderr_text)
+                short = stderr_text[:2000]
+                return False, f"ffmpeg conversion failed (exit code {process.returncode}): {short}"
 
             return False, ""
         finally:
@@ -1221,7 +1251,15 @@ class MusicConversionWorker(QObject):
                     continue
 
                 output_path = source_path.with_suffix(".flac")
-                temp_output_path = output_path.with_name(f".{output_path.stem}.tmp{output_path.suffix}")
+                # create a secure temp file in the destination directory to ensure
+                # rename/replace is atomic on the same filesystem
+                try:
+                    fd, tmp_name = tempfile.mkstemp(prefix=f".{output_path.stem}.tmp", suffix=output_path.suffix, dir=str(source_path.parent))
+                    os.close(fd)
+                    temp_output_path = Path(tmp_name)
+                except Exception:
+                    # fallback to a hidden temp name next to the output
+                    temp_output_path = output_path.with_name(f".{output_path.stem}.tmp{output_path.suffix}")
 
                 if self.backup_root is not None:
                     backup_target = self.backup_root / Path(relative_file)
@@ -1629,7 +1667,10 @@ class ToolboxWindow(QMainWindow):
         self._cleanup_scan_target: str | None = None
         self._file_rename_scan_target: str | None = None
         self._lyrics_manager_scan_target: str | None = None
+        self._lyrics_manager_scan_results: list[dict[str, object]] = []
         self._lyrics_lookup_results: list[dict[str, object]] = []
+        # Cache LRCLIB lookups by signature to avoid duplicate network requests
+        self._lrclib_cache: dict[tuple[str, str, str, int], tuple[str, str, str]] = {}
         self._cleanup_type_files: dict[str, list[Path]] = {}
         self._last_scan_target: str | None = None
         self._last_incompatible_files: list[str] = []
@@ -3226,6 +3267,7 @@ class ToolboxWindow(QMainWindow):
         self.lyrics_manager_export_lrc_btn.setEnabled(False)
         self.lyrics_manager_apply_lookup_btn.setEnabled(False)
         self._lyrics_manager_scan_target = None
+        self._lyrics_manager_scan_results = []
         self._lyrics_lookup_results = []
 
     def _configure_lyrics_manager_scan_table(self) -> None:
@@ -6431,6 +6473,7 @@ class ToolboxWindow(QMainWindow):
         total_audio = len(audio_files)
 
         self._configure_lyrics_manager_scan_table()
+        self._lyrics_manager_scan_results = []
         self._lyrics_lookup_results = []
         self.lyrics_manager_table.setRowCount(0)
         self.lyrics_manager_progress.setRange(0, max(total_audio, 1))
@@ -6456,6 +6499,7 @@ class ToolboxWindow(QMainWindow):
         without_lyrics = 0
         error_count = 0
         rows: list[tuple[str, str, str]] = []
+        scan_results: list[dict[str, object]] = []
         matching_lrc = 0
 
         try:
@@ -6480,6 +6524,17 @@ class ToolboxWindow(QMainWindow):
                 else:
                     without_lyrics += 1
                     rows.append((relative_path, "No", lrc_status))
+
+                scan_results.append(
+                    {
+                        "file_path": str(file_path),
+                        "relative_path": relative_path,
+                        "embedded": "Error" if error else ("Yes" if entries else "No"),
+                        "lrc_status": lrc_status,
+                        "has_lyrics": bool(entries),
+                        "has_error": bool(error),
+                    }
+                )
 
                 self.lyrics_manager_progress.setValue(index)
                 self.lyrics_manager_progress.setFormat(f"Scanning {index}/{total_audio}")
@@ -6521,6 +6576,7 @@ class ToolboxWindow(QMainWindow):
             self.lyrics_manager_table.viewport().update()
 
         self._lyrics_manager_scan_target = str(resolved_target)
+        self._lyrics_manager_scan_results = scan_results
         self.lyrics_manager_progress.setRange(0, total_audio)
         self.lyrics_manager_progress.setValue(total_audio)
         self.lyrics_manager_progress.setFormat(
@@ -6963,7 +7019,33 @@ class ToolboxWindow(QMainWindow):
             return
 
         resolved_target = target_path.resolve()
-        audio_files = self._collect_target_audio_files(resolved_target)
+
+        # Prefer the prior Scan Lyrics results so bulk lookup only targets
+        # files the scan has already identified as needing lyrics work.
+        scan_results: list[dict[str, object]] = []
+        if self._lyrics_manager_scan_target:
+            try:
+                scan_target_path = Path(self._lyrics_manager_scan_target).resolve()
+            except Exception:
+                scan_target_path = None
+
+            if scan_target_path == resolved_target and self._lyrics_manager_scan_results:
+                scan_results = list(self._lyrics_manager_scan_results)
+
+        if scan_results:
+            audio_files = []
+            for row in scan_results:
+                if str(row.get("embedded") or "") != "No":
+                    continue
+                if str(row.get("lrc_status") or "") == "Yes":
+                    continue
+                file_path_text = str(row.get("file_path") or "")
+                if not file_path_text:
+                    continue
+                audio_files.append(Path(file_path_text))
+        else:
+            audio_files = self._collect_target_audio_files(resolved_target)
+
         total_audio = len(audio_files)
 
         self._lyrics_lookup_results = []
@@ -6980,8 +7062,13 @@ class ToolboxWindow(QMainWindow):
         if total_audio == 0:
             self.lyrics_manager_progress.setRange(0, 1)
             self.lyrics_manager_progress.setValue(0)
-            self.lyrics_manager_progress.setFormat("Complete: no audio files found")
-            self.lyrics_manager_summary_label.setText("No audio files found in target.")
+            self.lyrics_manager_progress.setFormat("Complete: no eligible audio files found")
+            if scan_results:
+                self.lyrics_manager_summary_label.setText(
+                    "Scan found no files that needed LRCLIB lookup (embedded lyrics or .lrc sidecars already present)."
+                )
+            else:
+                self.lyrics_manager_summary_label.setText("No audio files found in target.")
             self.lyrics_manager_scan_btn.setEnabled(True)
             self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
             self.lyrics_manager_export_lrc_btn.setEnabled(True)
@@ -6994,6 +7081,15 @@ class ToolboxWindow(QMainWindow):
         error_count = 0
 
         try:
+            # Use scan results when available, so bulk lookup only runs on
+            # files that the scan already marked as missing embedded lyrics
+            # and without an existing .lrc sidecar.
+            # Parallelize network lookups to speed up bulk operations while
+            # keeping metadata extraction synchronous (mutagen is not always
+            # thread-safe across all formats). We'll collect metadata first,
+            # then perform LRCLIB requests in a ThreadPoolExecutor. Results
+            # are cached in-memory for this run to avoid duplicate queries.
+            lookup_jobs: list[tuple[int, Path, str, dict[str, object] | None, str | None]] = []
             for index, file_path in enumerate(audio_files, start=1):
                 try:
                     relative_path = file_path.relative_to(resolved_target).as_posix()
@@ -7001,49 +7097,117 @@ class ToolboxWindow(QMainWindow):
                     relative_path = str(file_path)
 
                 metadata, metadata_error = self._lyrics_lookup_metadata_for_file(file_path)
-                if metadata_error:
-                    status = "Error"
-                    source = f"metadata: {metadata_error}"
-                    lyrics_text = ""
-                else:
-                    status, source, lyrics_text = self._lookup_lyrics_from_lrclib(
-                        title=str(metadata.get("title") or ""),
-                        artist=str(metadata.get("artist") or ""),
-                        album=str(metadata.get("album") or ""),
-                        duration=int(metadata.get("duration") or 0),
+                lookup_jobs.append((index, file_path, relative_path, metadata if not metadata_error else None, metadata_error))
+
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            max_workers = min(8, (os.cpu_count() or 4) * 2)
+            with ThreadPoolExecutor(max_workers=max_workers) as exc:
+                future_to_job = {}
+                for index, file_path, relative_path, metadata, metadata_error in lookup_jobs:
+                    if metadata_error:
+                        # no network request; record error directly
+                        self._lyrics_lookup_results.append(
+                            {
+                                "file_path": str(file_path),
+                                "relative_path": relative_path,
+                                "status": "Error",
+                                "source": f"metadata: {metadata_error}",
+                                "preview": "",
+                                "lyrics_text": "",
+                                "apply_status": "-",
+                            }
+                        )
+                        error_count += 1
+                        self.lyrics_manager_progress.setValue(index)
+                        continue
+
+                    title = str(metadata.get("title") or "")
+                    artist = str(metadata.get("artist") or "")
+                    album = str(metadata.get("album") or "")
+                    duration = int(metadata.get("duration") or 0)
+
+                    key = (title, artist, album, duration)
+                    cached = self._lrclib_cache.get(key)
+                    if cached is not None:
+                        status, source, lyrics_text = cached
+                        preview = self._lyrics_lookup_preview(lyrics_text)
+                        apply_status = "Ready" if lyrics_text else "-"
+                        self._lyrics_lookup_results.append(
+                            {
+                                "file_path": str(file_path),
+                                "relative_path": relative_path,
+                                "status": status,
+                                "source": source,
+                                "preview": preview,
+                                "lyrics_text": lyrics_text,
+                                "apply_status": apply_status,
+                            }
+                        )
+                        if status == "Found":
+                            found_count += 1
+                        elif status == "Not found":
+                            not_found_count += 1
+                        elif status == "Instrumental":
+                            instrumental_count += 1
+                        else:
+                            error_count += 1
+                        self.lyrics_manager_progress.setValue(index)
+                        continue
+
+                    # submit network lookup to pool
+                    future = exc.submit(
+                        self._lookup_lyrics_from_lrclib, title, artist, album, duration
+                    )
+                    future_to_job[future] = (index, file_path, relative_path, key)
+
+                # Collect results as they complete
+                for future in as_completed(future_to_job):
+                    index, file_path, relative_path, key = future_to_job[future]
+                    try:
+                        status, source, lyrics_text = future.result()
+                    except Exception as exc:
+                        status = "Error"
+                        source = f"exception: {exc}"
+                        lyrics_text = ""
+
+                    # cache the result
+                    try:
+                        self._lrclib_cache[key] = (status, source, lyrics_text)
+                    except Exception:
+                        pass
+
+                    preview = self._lyrics_lookup_preview(lyrics_text)
+                    apply_status = "Ready" if lyrics_text else "-"
+
+                    self._lyrics_lookup_results.append(
+                        {
+                            "file_path": str(file_path),
+                            "relative_path": relative_path,
+                            "status": status,
+                            "source": source,
+                            "preview": preview,
+                            "lyrics_text": lyrics_text,
+                            "apply_status": apply_status,
+                        }
                     )
 
-                preview = self._lyrics_lookup_preview(lyrics_text)
-                apply_status = "Ready" if lyrics_text else "-"
+                    if status == "Found":
+                        found_count += 1
+                    elif status == "Not found":
+                        not_found_count += 1
+                    elif status == "Instrumental":
+                        instrumental_count += 1
+                    else:
+                        error_count += 1
 
-                self._lyrics_lookup_results.append(
-                    {
-                        "file_path": str(file_path),
-                        "relative_path": relative_path,
-                        "status": status,
-                        "source": source,
-                        "preview": preview,
-                        "lyrics_text": lyrics_text,
-                        "apply_status": apply_status,
-                    }
-                )
-
-                if status == "Found":
-                    found_count += 1
-                elif status == "Not found":
-                    not_found_count += 1
-                elif status == "Instrumental":
-                    instrumental_count += 1
-                else:
-                    error_count += 1
-
-                self.lyrics_manager_progress.setValue(index)
-                self.lyrics_manager_progress.setFormat(f"Lookup {index}/{total_audio}")
-                if index % 10 == 0 or index == total_audio:
-                    self.lyrics_manager_summary_label.setText(
-                        f"Lookup: {index}/{total_audio} | Found: {found_count} | Not found: {not_found_count} | Instrumental: {instrumental_count} | Errors: {error_count}"
-                    )
-                QApplication.processEvents()
+                    # update progress for the file's index
+                    self.lyrics_manager_progress.setValue(index)
+                    if index % 10 == 0 or index == total_audio:
+                        self.lyrics_manager_summary_label.setText(
+                            f"Lookup: {index}/{total_audio} | Found: {found_count} | Not found: {not_found_count} | Instrumental: {instrumental_count} | Errors: {error_count}"
+                        )
+                    QApplication.processEvents()
         finally:
             self.lyrics_manager_scan_btn.setEnabled(True)
             self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
@@ -8201,9 +8365,16 @@ class ToolboxWindow(QMainWindow):
     def _extract_mutagen_metadata_rows(self, file_path: Path) -> list[tuple[str, str]]:
         """Extract technical audio metadata using ffprobe."""
         ffprobe_info = _ffprobe_audio_info(file_path)
-        
-        if ffprobe_info is None:
-            return [("Metadata Engine", "FFprobe unavailable")]
+
+        if not ffprobe_info or (isinstance(ffprobe_info, dict) and ffprobe_info.get("error")):
+            err = ffprobe_info.get("error") if isinstance(ffprobe_info, dict) else None
+            rows: list[tuple[str, str]] = [("Metadata Engine", "FFprobe unavailable")]
+            if err:
+                try:
+                    rows.append(("FFprobe Error", str(err)))
+                except Exception:
+                    rows.append(("FFprobe Error", "(unavailable)"))
+            return rows
 
         rows: list[tuple[str, str]] = []
         rows.append(("Metadata Engine", "FFprobe"))

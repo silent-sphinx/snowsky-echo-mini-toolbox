@@ -7,6 +7,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Slot
+import logging
 
 
 LOSSY_FORMATS = {".mp3", ".ogg", ".m4a", ".wma"}
@@ -158,41 +159,68 @@ def _ffprobe_audio_info(path: Path) -> dict[str, int | None | str] | None:
       - max_block_size: int or None (for FLAC)
       - tags: dict of metadata tags
     """
+    logger = logging.getLogger(__name__)
+
     ffprobe_executable = _resolve_ffprobe_executable()
     if ffprobe_executable is None:
-        return None
+        return {"error": "ffprobe not found"}
 
     cmd = [
         ffprobe_executable,
-        "-v", "error",
-        "-select_streams", "a:0",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
         "-show_entries",
         "stream=sample_rate,sample_fmt,bits_per_sample,bits_per_raw_sample,max_block_size,max_blocksize,max_samples_per_frame,codec_name,channels,bit_rate,"
         "duration,codec_long_name",
-        "-show_entries", "format=duration,bit_rate,format_long_name",
-        "-show_entries", "stream_tags",
-        "-show_entries", "format_tags",
-        "-of", "json",
+        "-show_entries",
+        "format=duration,bit_rate,format_long_name",
+        "-show_entries",
+        "stream_tags",
+        "-show_entries",
+        "format_tags",
+        "-of",
+        "json",
         str(path),
     ]
 
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=10)
-    except Exception:
-        return None
+    # Try a couple of times for transient failures (timeouts, intermittent I/O)
+    last_err: str | None = None
+    for attempt in range(2):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=10)
+        except subprocess.TimeoutExpired as exc:
+            last_err = f"ffprobe timeout: {exc}"
+            logger.debug("ffprobe timeout for %s (attempt %d): %s", path, attempt + 1, exc)
+            continue
+        except Exception as exc:
+            last_err = f"ffprobe invocation failed: {exc}"
+            logger.debug("ffprobe invocation failed for %s (attempt %d): %s", path, attempt + 1, exc)
+            continue
 
-    if result.returncode != 0:
-        return None
+        if result.returncode != 0:
+            stderr_text = (result.stderr or "").strip()
+            last_err = f"ffprobe returned non-zero exit code {result.returncode}: {stderr_text}"
+            logger.debug("ffprobe stderr for %s (attempt %d): %s", path, attempt + 1, stderr_text)
+            continue
 
-    try:
-        payload = json.loads(result.stdout)
-    except Exception:
-        return None
+        try:
+            payload = json.loads(result.stdout)
+        except Exception as exc:
+            last_err = f"failed to parse ffprobe JSON output: {exc}"
+            logger.debug("ffprobe JSON parse failed for %s: %s", path, exc)
+            continue
+
+        # Success
+        break
+    else:
+        return {"error": last_err or "ffprobe failed"}
 
     # Extract stream information
     streams = payload.get("streams") or []
     if not streams:
-        return None
+        return {"error": "no streams found in ffprobe output"}
 
     stream = streams[0]
     
@@ -292,15 +320,16 @@ def _map_dsd_multiple(sample_rate: int) -> int | None:
 def _get_audio_codec(path: Path) -> str | None:
     """Extract the actual audio codec name from the file using ffprobe."""
     ffprobe_info = _ffprobe_audio_info(path)
-    if ffprobe_info and ffprobe_info.get("codec_name"):
-        return ffprobe_info.get("codec_name")
-    return None
+    if not ffprobe_info:
+        return None
+    if isinstance(ffprobe_info, dict) and ffprobe_info.get("error"):
+        return None
+    return ffprobe_info.get("codec_name")
 
 
 def _read_audio_metadata(path: Path) -> dict[str, int | None | str]:
     """Read audio metadata using ffprobe exclusively."""
     ffprobe_info = _ffprobe_audio_info(path)
-    
     if ffprobe_info is None:
         return {
             "sample_rate": None,
@@ -308,7 +337,18 @@ def _read_audio_metadata(path: Path) -> dict[str, int | None | str]:
             "flac_block_max": None,
             "codec_name": None,
         }
-    
+
+    # If ffprobe reported an error, return that information for higher-level
+    # callers to surface a more informative reason instead of failing silently.
+    if isinstance(ffprobe_info, dict) and ffprobe_info.get("error"):
+        return {
+            "sample_rate": None,
+            "bit_depth": None,
+            "flac_block_max": None,
+            "codec_name": None,
+            "ffprobe_error": ffprobe_info.get("error"),
+        }
+
     return {
         "sample_rate": ffprobe_info.get("sample_rate"),
         "bit_depth": ffprobe_info.get("bit_depth"),
@@ -449,6 +489,7 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         reason = f"Explicitly unsupported format: {extension}"
     elif extension in LOSSY_FORMATS:
         metadata = _read_audio_metadata(path)
+        ffprobe_error = metadata.get("ffprobe_error")
         sample_rate = metadata.get("sample_rate")
         bit_depth = metadata.get("bit_depth")
         codec_name = metadata.get("codec_name")
@@ -456,21 +497,30 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         eq_bit_depth = bit_depth
 
         codec_text = codec_name if codec_name else "-"
+        if ffprobe_error:
+            status = "UNKNOWN"
+            category = "unknown"
+            reason = f"ffprobe error: {ffprobe_error}"
         sample_rate_text = str(sample_rate) if sample_rate is not None else "-"
         bit_depth_text = str(bit_depth) if bit_depth is not None else "N/A"
         
-        # Validate codec matches container format
-        codec_valid, codec_error = _validate_codec_for_container(extension, codec_name)
-        if not codec_valid:
-            status = "UNSUPPORTED"
-            category = "unsupported"
-            reason = codec_error
+        # If ffprobe failed, surface that and skip further validation
+        if ffprobe_error:
+            pass
         else:
-            status = "SUPPORTED"
-            category = "supported"
-            reason = "Lossy format supported"
+            # Validate codec matches container format
+            codec_valid, codec_error = _validate_codec_for_container(extension, codec_name)
+            if not codec_valid:
+                status = "UNSUPPORTED"
+                category = "unsupported"
+                reason = codec_error
+            else:
+                status = "SUPPORTED"
+                category = "supported"
+                reason = "Lossy format supported"
     elif extension in PCM_FORMATS:
         metadata = _read_audio_metadata(path)
+        ffprobe_error = metadata.get("ffprobe_error")
         sample_rate = metadata.get("sample_rate")
         bit_depth = metadata.get("bit_depth")
         flac_block_max = metadata.get("flac_block_max")
@@ -479,6 +529,10 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         eq_bit_depth = bit_depth
 
         codec_text = codec_name if codec_name else "-"
+        if ffprobe_error:
+            status = "UNKNOWN"
+            category = "unknown"
+            reason = f"ffprobe error: {ffprobe_error}"
         sample_rate_text = str(sample_rate) if sample_rate is not None else "-"
         bit_depth_text = str(bit_depth) if bit_depth is not None else "-"
         if extension == ".flac":
@@ -486,69 +540,79 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         else:
             block_size_text = "N/A"
 
-        missing_pcm_fields: list[str] = []
-        if sample_rate is None:
-            missing_pcm_fields.append("sample rate")
-        if bit_depth is None:
-            missing_pcm_fields.append("bit depth")
-
-        if missing_pcm_fields:
-            status = "UNKNOWN"
-            category = "unknown"
-            reason = _short_missing_metadata_reason(missing_pcm_fields)
-        elif extension == ".flac" and flac_block_max is None:
-            status = "UNKNOWN"
-            category = "unknown"
-            reason = "Missing FLAC block size"
-        elif extension == ".flac" and flac_block_max > FLAC_BLOCK_MAX_LIMIT:
-            status = "UNSUPPORTED"
-            category = "unsupported"
-            reason = f"FLAC block size {flac_block_max} exceeds limit {FLAC_BLOCK_MAX_LIMIT}"
-        elif sample_rate > 192000 or bit_depth > 24:
-            status = "UNSUPPORTED"
-            category = "unsupported"
-            reason_parts: list[str] = []
-            if sample_rate > 192000:
-                reason_parts.append(f"sample rate {sample_rate} > 192000 Hz")
-            if bit_depth > 24:
-                reason_parts.append(f"bit depth {bit_depth} > 24-bit")
-            reason = "Exceeds PCM limits: " + ", ".join(reason_parts)
+        # If ffprobe failed, surface that and skip deeper PCM validation.
+        if ffprobe_error:
+            pass
         else:
-            status = "SUPPORTED"
-            category = "supported"
-            reason = "Within PCM limits"
+            missing_pcm_fields: list[str] = []
+            if sample_rate is None:
+                missing_pcm_fields.append("sample rate")
+            if bit_depth is None:
+                missing_pcm_fields.append("bit depth")
+
+            if missing_pcm_fields:
+                status = "UNKNOWN"
+                category = "unknown"
+                reason = _short_missing_metadata_reason(missing_pcm_fields)
+            elif extension == ".flac" and flac_block_max is None:
+                status = "UNKNOWN"
+                category = "unknown"
+                reason = "Missing FLAC block size"
+            elif extension == ".flac" and flac_block_max > FLAC_BLOCK_MAX_LIMIT:
+                status = "UNSUPPORTED"
+                category = "unsupported"
+                reason = f"FLAC block size {flac_block_max} exceeds limit {FLAC_BLOCK_MAX_LIMIT}"
+            elif sample_rate > 192000 or bit_depth > 24:
+                status = "UNSUPPORTED"
+                category = "unsupported"
+                reason_parts: list[str] = []
+                if sample_rate > 192000:
+                    reason_parts.append(f"sample rate {sample_rate} > 192000 Hz")
+                if bit_depth > 24:
+                    reason_parts.append(f"bit depth {bit_depth} > 24-bit")
+                reason = "Exceeds PCM limits: " + ", ".join(reason_parts)
+            else:
+                status = "SUPPORTED"
+                category = "supported"
+                reason = "Within PCM limits"
     elif extension in DSD_FORMATS:
         metadata = _read_audio_metadata(path)
+        ffprobe_error = metadata.get("ffprobe_error")
         sample_rate = metadata.get("sample_rate")
         codec_name = metadata.get("codec_name")
         eq_sample_rate = sample_rate
         sample_rate_text = str(sample_rate) if sample_rate is not None else "-"
         codec_text = codec_name if codec_name else "-"
 
-        if sample_rate is None:
+        if ffprobe_error:
             status = "UNKNOWN"
             category = "unknown"
-            reason = "Missing sample rate"
+            reason = f"ffprobe error: {ffprobe_error}"
         else:
-            mapped_multiple = _map_dsd_multiple(sample_rate)
-            if mapped_multiple is None:
-                status = "UNSUPPORTED"
-                category = "unsupported"
-                reason = f"Unrecognized DSD sample rate: {sample_rate} Hz"
+            if sample_rate is None:
+                status = "UNKNOWN"
+                category = "unknown"
+                reason = "Missing sample rate"
             else:
-                dsd_profile = f"DSD{mapped_multiple}"
-                if mapped_multiple > 256:
+                mapped_multiple = _map_dsd_multiple(sample_rate)
+                if mapped_multiple is None:
                     status = "UNSUPPORTED"
                     category = "unsupported"
-                    reason = f"Exceeds DSD256 (detected DSD{mapped_multiple})"
-                elif mapped_multiple not in SUPPORTED_DSD_MULTIPLES:
-                    status = "UNSUPPORTED"
-                    category = "unsupported"
-                    reason = f"Unsupported DSD profile DSD{mapped_multiple}"
+                    reason = f"Unrecognized DSD sample rate: {sample_rate} Hz"
                 else:
-                    status = "SUPPORTED"
-                    category = "supported"
-                    reason = "Supported DSD profile"
+                    dsd_profile = f"DSD{mapped_multiple}"
+                    if mapped_multiple > 256:
+                        status = "UNSUPPORTED"
+                        category = "unsupported"
+                        reason = f"Exceeds DSD256 (detected DSD{mapped_multiple})"
+                    elif mapped_multiple not in SUPPORTED_DSD_MULTIPLES:
+                        status = "UNSUPPORTED"
+                        category = "unsupported"
+                        reason = f"Unsupported DSD profile DSD{mapped_multiple}"
+                    else:
+                        status = "SUPPORTED"
+                        category = "supported"
+                        reason = "Supported DSD profile"
     else:
         status = "UNSUPPORTED"
         category = "unsupported"
