@@ -70,6 +70,8 @@ from .music_compatibility import (
     MusicCompatibilityScanWorker,
     _ffprobe_audio_info,
     _subprocess_no_window_kwargs,
+    _resolve_ffmpeg_executable,
+    _resolve_ffprobe_executable,
 )
 from .models import DriveOption
 from .system_info import collect_target_info, format_bytes, list_removable_drives
@@ -1031,11 +1033,12 @@ class MusicConversionWorker(QObject):
                     except Exception:
                         continue
 
-        if shutil.which("ffprobe") is None:
+        ffprobe_path = _resolve_ffprobe_executable()
+        if ffprobe_path is None:
             return None
 
         cmd = [
-            "ffprobe",
+            ffprobe_path,
             "-v",
             "error",
             "-select_streams",
@@ -1091,8 +1094,10 @@ class MusicConversionWorker(QObject):
         max_sample_rate = 192000
         target_bit_depth = 16 if self.make_eq_compatible else 24
 
+        ffmpeg_exec = getattr(self, "_ffmpeg_executable", None) or "ffmpeg"
+
         command = [
-            "ffmpeg",
+            ffmpeg_exec,
             "-y",
             "-v",
             "error",
@@ -6040,11 +6045,12 @@ class ToolboxWindow(QMainWindow):
         dry_run: bool = False,
         backup_root: Path | None = None,
     ) -> None:
-        if shutil.which("ffmpeg") is None:
+        resolved_ffmpeg = _resolve_ffmpeg_executable()
+        if resolved_ffmpeg is None:
             QMessageBox.warning(
                 self,
                 "ffmpeg Not Found",
-                "ffmpeg is required for conversion but was not found in PATH.",
+                "ffmpeg is required for conversion but was not found in PATH or bundled assets.",
             )
             return
 
@@ -6133,6 +6139,12 @@ class ToolboxWindow(QMainWindow):
             dry_run,
             backup_root,
         )
+        # Provide the resolved ffmpeg executable path to the worker so it can
+        # invoke the bundled/system ffmpeg directly.
+        try:
+            self._music_conversion_worker._ffmpeg_executable = resolved_ffmpeg
+        except Exception:
+            pass
         self._music_conversion_worker.moveToThread(self._music_conversion_thread)
 
         self._music_conversion_thread.started.connect(self._music_conversion_worker.run)

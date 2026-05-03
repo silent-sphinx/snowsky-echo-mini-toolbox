@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import re
 import shutil
@@ -112,12 +113,41 @@ def _resolve_ffprobe_executable() -> str | None:
     ffprobe_path = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
     if ffprobe_path:
         return ffprobe_path
+    # Check PyInstaller bundle temp folder when frozen
+    meipass = getattr(sys, "_MEIPASS", "")
+    local_candidates = []
+    if meipass:
+        local_candidates.extend([Path(meipass) / "ffprobe", Path(meipass) / "ffprobe.exe"]) 
+    else:
+        repo_root = Path(__file__).resolve().parent.parent
+        local_candidates.extend([repo_root / "build_assets" / "ffprobe", repo_root / "build_assets" / "ffprobe.exe"]) 
 
-    repo_root = Path(__file__).resolve().parent.parent
-    local_candidates = [
-        repo_root / "build_assets" / "ffprobe",
-        repo_root / "build_assets" / "ffprobe.exe",
-    ]
+    for candidate in local_candidates:
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    return None
+
+
+def _resolve_ffmpeg_executable() -> str | None:
+    """Resolve an ffmpeg executable path.
+
+    Preference order:
+      1. System PATH (ffmpeg / ffmpeg.exe)
+      2. Local bundled candidate under repo_root/build_assets/ffmpeg
+    """
+    ffmpeg_path = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    if ffmpeg_path:
+        return ffmpeg_path
+
+    meipass = getattr(sys, "_MEIPASS", "")
+    local_candidates = []
+    if meipass:
+        local_candidates.extend([Path(meipass) / "ffmpeg", Path(meipass) / "ffmpeg.exe"]) 
+    else:
+        repo_root = Path(__file__).resolve().parent.parent
+        local_candidates.extend([repo_root / "build_assets" / "ffmpeg", repo_root / "build_assets" / "ffmpeg.exe"]) 
+
     for candidate in local_candidates:
         if candidate.exists() and os.access(candidate, os.X_OK):
             return str(candidate)
