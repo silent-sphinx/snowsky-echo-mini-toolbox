@@ -65,7 +65,12 @@ from .album_art import (
     write_embedded_album_art,
 )
 from .constants import ALBUM_ART_CACHE_LIMIT, APP_VERSION, AUDIO_FILE_EXTENSIONS
-from .music_compatibility import KNOWN_AUDIO_FORMATS, MusicCompatibilityScanWorker, _ffprobe_audio_info
+from .music_compatibility import (
+    KNOWN_AUDIO_FORMATS,
+    MusicCompatibilityScanWorker,
+    _ffprobe_audio_info,
+    _subprocess_no_window_kwargs,
+)
 from .models import DriveOption
 from .system_info import collect_target_info, format_bytes, list_removable_drives
 
@@ -1044,7 +1049,14 @@ class MusicConversionWorker(QObject):
 
         logger = logging.getLogger(__name__)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=10)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+                **_subprocess_no_window_kwargs(),
+            )
         except subprocess.TimeoutExpired:
             logger.debug("ffprobe timeout while resolving sample rate for %s", source_file)
             return None
@@ -1704,7 +1716,7 @@ class ToolboxWindow(QMainWindow):
         return base_path.joinpath(*parts)
 
     def _header_logo_pixmap(self) -> QPixmap | None:
-        logo_path = self._asset_path("assets", "logo.png")
+        logo_path = self._asset_path("assets", "toolbox-logo.png")
         if not logo_path.exists():
             return None
 
@@ -8365,9 +8377,14 @@ class ToolboxWindow(QMainWindow):
             return key
         return normalized.title()
 
-    def _extract_mutagen_metadata_rows(self, file_path: Path) -> list[tuple[str, str]]:
+    def _extract_mutagen_metadata_rows(
+        self,
+        file_path: Path,
+        ffprobe_info: dict[str, int | None | str] | None = None,
+    ) -> list[tuple[str, str]]:
         """Extract technical audio metadata using ffprobe."""
-        ffprobe_info = _ffprobe_audio_info(file_path)
+        if ffprobe_info is None:
+            ffprobe_info = _ffprobe_audio_info(file_path)
 
         if not ffprobe_info or (isinstance(ffprobe_info, dict) and ffprobe_info.get("error")):
             err = ffprobe_info.get("error") if isinstance(ffprobe_info, dict) else None
@@ -8542,6 +8559,8 @@ class ToolboxWindow(QMainWindow):
         stat_info = file_path.stat()
         modified = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat_info.st_mtime))
 
+        ffprobe_info = _ffprobe_audio_info(file_path)
+
         art_bytes, art_mime = self._cached_embedded_album_art(file_path, stat_info)
         if art_bytes:
             art_size = format_bytes(len(art_bytes))
@@ -8577,10 +8596,9 @@ class ToolboxWindow(QMainWindow):
         
         # Add codec information if available
         try:
-            from .music_compatibility import _get_audio_codec
-            codec = _get_audio_codec(file_path)
+            codec = ffprobe_info.get("codec_name") if ffprobe_info else None
             if codec:
-                rows.append(("Audio Codec", codec))
+                rows.append(("Audio Codec", str(codec)))
         except Exception:
             pass
 
@@ -8591,7 +8609,7 @@ class ToolboxWindow(QMainWindow):
             rows.append(("Tags", "No metadata tags available"))
 
         rows.append(("__SECTION__", "Technical Details"))
-        rows.extend(self._extract_mutagen_metadata_rows(file_path))
+        rows.extend(self._extract_mutagen_metadata_rows(file_path, ffprobe_info))
 
         # Album art metadata is shown in its own tab; do not add to properties table.
         return rows, art_bytes, art_mime
