@@ -28,12 +28,12 @@ def _get_ffmpeg_asset_dir() -> str:
     if sys.platform == 'darwin':
         machine = platform.machine()  # 'arm64' or 'x86_64'
         if machine == 'arm64':
-            return 'build_assets/macos_silicon'
-        return 'build_assets/macos_intel'
+            return 'build_binaries/macos_silicon'
+        return 'build_binaries/macos_intel'
     if sys.platform == 'linux':
-        return 'build_assets/linux_x64'
+        return 'build_binaries/linux_x64'
     if sys.platform == 'win32':
-        return 'build_assets/windows_x64'
+        return 'build_binaries/windows_x64'
     raise RuntimeError(f'Unsupported platform: {sys.platform}')
 
 
@@ -117,9 +117,12 @@ pyside_datas, pyside_binaries, pyside_hiddenimports = _collect_pyside_modules(
 
 datas = [] + _filter_webengine_entries(pyside_datas)
 
+# Add platform-specific binary extensions
+_exe_ext = '.exe' if sys.platform == 'win32' else ''
+
 binaries = [
-    (f'{ffmpeg_asset_dir}/ffprobe', '.'),
-    (f'{ffmpeg_asset_dir}/ffmpeg', '.'),
+    (f'{ffmpeg_asset_dir}/ffprobe{_exe_ext}', '.'),
+    (f'{ffmpeg_asset_dir}/ffmpeg{_exe_ext}', '.'),
 ] + _filter_webengine_entries(pyside_binaries)
 
 hiddenimports = [
