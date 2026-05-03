@@ -16,7 +16,7 @@ from pathlib import Path
 import traceback
 
 from PySide6.QtCore import QDir, QModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot, QTimer
-from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPen, QPixmap, QRegion
+from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPen, QPixmap, QRegion, QClipboard
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -2068,6 +2068,8 @@ class ToolboxWindow(QMainWindow):
         self.file_rename_table.setAlternatingRowColors(True)
         self.file_rename_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.file_rename_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.file_rename_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.file_rename_table.customContextMenuRequested.connect(self._on_file_rename_table_context_menu)
 
         file_rename_layout.addLayout(file_rename_controls)
         file_rename_layout.addWidget(self.file_rename_summary_label)
@@ -3699,21 +3701,26 @@ class ToolboxWindow(QMainWindow):
                     audio_full = None
 
                 full_tags = getattr(audio_full, "tags", None) if audio_full else None
+                def _safe_full_tag(*keys):
+                    if not full_tags:
+                        return None
+
+                    for key in keys:
+                        try:
+                            value = full_tags.get(key)
+                        except Exception:
+                            continue
+
+                        if value:
+                            return value
+
+                    return None
+
                 if full_tags:
                     if track_raw is None:
-                        track_raw = (
-                            full_tags.get("TRCK")
-                            or full_tags.get("tracknumber")
-                            or full_tags.get("TRACKNUMBER")
-                            or full_tags.get("trkn")
-                        )
+                        track_raw = _safe_full_tag("TRCK", "tracknumber", "TRACKNUMBER", "trkn")
                     if title_raw is None:
-                        title_raw = (
-                            full_tags.get("TIT2")
-                            or full_tags.get("title")
-                            or full_tags.get("TITLE")
-                            or full_tags.get("\xa9nam")
-                        )
+                        title_raw = _safe_full_tag("TIT2", "title", "TITLE", "\xa9nam")
 
             result["track_number"] = self._extract_track_number(track_raw)
             result["track_title"] = self._extract_track_title(title_raw)
@@ -3849,10 +3856,16 @@ class ToolboxWindow(QMainWindow):
             if suggested_name == file_path.name:
                 already_matching += 1
                 continue
+            elif suggested_name.lower() == file_path.name.lower():
+                # Only capitalization differs
+                reason = "Metadata Title uses different name"
+            else:
+                # Actual content difference
+                reason = "Name differs from preset"
 
             suggested_path = file_path.with_name(suggested_name)
             suggestions.append(
-                (file_path, suggested_path, formatted_track_no, safe_title, "Name differs from preset")
+                (file_path, suggested_path, formatted_track_no, safe_title, reason)
             )
 
         progress.close()
@@ -3875,7 +3888,14 @@ class ToolboxWindow(QMainWindow):
                 if target_counts.get(key, 0) > 1:
                     conflict_reason = "Duplicate suggested target name"
                 elif target_path_item.exists() and target_path_item != source_path:
-                    conflict_reason = "Target name already exists"
+                    # On case-insensitive filesystems, check if they refer to the same file
+                    try:
+                        is_same_file = target_path_item.samefile(source_path)
+                    except Exception:
+                        is_same_file = False
+                    
+                    if not is_same_file:
+                        conflict_reason = "Target name already exists"
 
                 reason_text = conflict_reason or base_reason
 
@@ -3998,50 +4018,68 @@ class ToolboxWindow(QMainWindow):
             if not source_path.exists():
                 failed.append((str(source_path), "Source file no longer exists"))
             elif target_path_item.exists() and target_path_item != source_path:
-                failed.append((str(source_path), "Target name already exists"))
-            else:
-                source_lrc_path = source_path.with_suffix(".lrc")
-                target_lrc_path = target_path_item.with_suffix(".lrc")
+                # On case-insensitive filesystems, check if they refer to the same file
+                try:
+                    is_same_file = target_path_item.samefile(source_path)
+                except Exception:
+                    is_same_file = False
+                
+                if not is_same_file:
+                    failed.append((str(source_path), "Target name already exists"))
+                    progress.setValue(index)
+                    QApplication.processEvents()
+                    continue
+                # If is_same_file, fall through to rename logic
+            
+            # Rename logic (executes when source exists and target is either missing or the same file)
+            if not source_path.exists():
+                continue
+            
+            source_lrc_path = source_path.with_suffix(".lrc")
+            target_lrc_path = target_path_item.with_suffix(".lrc")
 
-                if (
-                    source_lrc_path.exists()
-                    and target_lrc_path.exists()
-                    and target_lrc_path != source_lrc_path
-                ):
+            if source_lrc_path.exists() and target_lrc_path.exists():
+                # On case-insensitive filesystems, check if they refer to the same file
+                try:
+                    is_same_lrc_file = target_lrc_path.samefile(source_lrc_path)
+                except Exception:
+                    is_same_lrc_file = False
+                
+                if not is_same_lrc_file:
                     failed.append((str(source_path), "Matching .lrc target already exists"))
                     progress.setValue(index)
                     QApplication.processEvents()
                     continue
 
-                try:
-                    source_path.rename(target_path_item)
+            try:
+                source_path.rename(target_path_item)
 
-                    if source_lrc_path.exists() and target_lrc_path != source_lrc_path:
+                if source_lrc_path.exists() and target_lrc_path != source_lrc_path:
+                    try:
+                        source_lrc_path.rename(target_lrc_path)
+                        lrc_renamed += 1
+                    except Exception as lrc_exc:
+                        rollback_reason = ""
                         try:
-                            source_lrc_path.rename(target_lrc_path)
-                            lrc_renamed += 1
-                        except Exception as lrc_exc:
-                            rollback_reason = ""
-                            try:
-                                target_path_item.rename(source_path)
-                            except Exception as rollback_exc:
-                                rollback_reason = f"; rollback failed: {rollback_exc}"
+                            target_path_item.rename(source_path)
+                        except Exception as rollback_exc:
+                            rollback_reason = f"; rollback failed: {rollback_exc}"
 
-                            failed.append(
-                                (
-                                    str(source_path),
-                                    f"Renamed audio file but failed to rename matching .lrc: {lrc_exc}{rollback_reason}",
-                                )
+                        failed.append(
+                            (
+                                str(source_path),
+                                f"Renamed audio file but failed to rename matching .lrc: {lrc_exc}{rollback_reason}",
                             )
-                            progress.setValue(index)
-                            QApplication.processEvents()
-                            continue
+                        )
+                        progress.setValue(index)
+                        QApplication.processEvents()
+                        continue
 
-                    self._purge_cached_album_art_for_path(source_path)
-                    self._purge_cached_album_art_for_path(target_path_item)
-                    renamed += 1
-                except Exception as exc:
-                    failed.append((str(source_path), str(exc)))
+                self._purge_cached_album_art_for_path(source_path)
+                self._purge_cached_album_art_for_path(target_path_item)
+                renamed += 1
+            except Exception as exc:
+                failed.append((str(source_path), str(exc)))
 
             progress.setValue(index)
             QApplication.processEvents()
@@ -4069,6 +4107,22 @@ class ToolboxWindow(QMainWindow):
             QMessageBox.information(self, "Rename Completed", "\n".join(message_lines))
 
         self.scan_file_rename_suggestions()
+
+    def _on_file_rename_table_context_menu(self, pos) -> None:
+        """Handle right-click context menu on the rename table."""
+        item = self.file_rename_table.itemAt(pos)
+        if not item:
+            return
+
+        menu = QMenu(self)
+        copy_action = menu.addAction("Copy")
+        action = menu.exec(self.file_rename_table.mapToGlobal(pos))
+
+        if action == copy_action:
+            text = item.text()
+            if text:
+                clipboard = QApplication.clipboard()
+                clipboard.setText(text)
 
     def _cleanup_category_for_file(self, file_name: str, extension: str) -> str:
         if file_name.startswith("."):
