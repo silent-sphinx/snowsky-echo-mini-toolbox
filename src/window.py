@@ -3217,9 +3217,11 @@ class ToolboxWindow(QMainWindow):
         self.lyrics_manager_progress.setFormat("Idle")
         self._configure_lyrics_manager_scan_table()
         self.lyrics_manager_table.setRowCount(0)
+        # Require the user to run a Scan first. Only the scan button is enabled
+        # until a scan has been performed (which sets `_lyrics_manager_scan_target`).
         self.lyrics_manager_scan_btn.setEnabled(True)
-        self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
-        self.lyrics_manager_export_lrc_btn.setEnabled(True)
+        self.lyrics_manager_bulk_lookup_btn.setEnabled(False)
+        self.lyrics_manager_export_lrc_btn.setEnabled(False)
         self.lyrics_manager_apply_lookup_btn.setEnabled(False)
         self._lyrics_manager_scan_target = None
         self._lyrics_lookup_results = []
@@ -4125,7 +4127,7 @@ class ToolboxWindow(QMainWindow):
                 clipboard.setText(text)
 
     def _cleanup_category_for_file(self, file_name: str, extension: str) -> str:
-        if file_name.startswith("."):
+        if file_name.startswith("._"):
             return "Hidden"
         if extension in AUDIO_FILE_EXTENSIONS:
             return "Audio"
@@ -4143,6 +4145,8 @@ class ToolboxWindow(QMainWindow):
             return "Subtitle"
         if extension in EXECUTABLE_FILE_EXTENSIONS:
             return "Executable"
+        if file_name.startswith("."):
+            return "Hidden"
         return "Other"
 
     def _cleanup_file_type_label(self, file_name: str, extension: str, category: str) -> str:
@@ -4150,6 +4154,8 @@ class ToolboxWindow(QMainWindow):
             lowered = file_name.lower()
             if lowered.startswith("._") and extension:
                 return f"._*{extension} (macOS sidecar)"
+            if extension:
+                return f".*{extension}"
             return file_name
         if extension:
             return extension
@@ -4279,7 +4285,7 @@ class ToolboxWindow(QMainWindow):
         total_files = sum(int(stats_by_type[key]["count"]) for key in sorted_keys)
         found_types = len(sorted_keys)
         self.cleanup_summary_label.setText(
-            f"Scanned {total_files} files across {found_types} found file types | Total size: {format_bytes(total_bytes)}"
+            f"Scanned {total_files} files across {found_types} file types | Total size: {format_bytes(total_bytes)}"
         )
         self.cleanup_remove_btn.setEnabled(total_files > 0)
         self.statusBar().showMessage("File cleanup scan completed", 4000)
@@ -6926,6 +6932,14 @@ class ToolboxWindow(QMainWindow):
             self.lyrics_manager_table.viewport().update()
 
     def bulk_lookup_lyrics(self) -> None:
+        # Require a scan to have been run first.
+        if not self._lyrics_manager_scan_target:
+            QMessageBox.information(
+                self,
+                "Run Scan First",
+                "Run 'Scan Lyrics' first to inventory audio files before performing a bulk lookup.",
+            )
+            return
         target = self.path_input.text().strip()
         if not target:
             self._set_lyrics_manager_idle("Choose a target before running bulk lookup.")
@@ -7053,6 +7067,14 @@ class ToolboxWindow(QMainWindow):
             and str(row.get("lyrics_text") or "").strip()
         ]
 
+        if not self._lyrics_manager_scan_target:
+            QMessageBox.information(
+                self,
+                "Run Scan First",
+                "Run 'Scan Lyrics' first to inventory audio files before applying lookup results.",
+            )
+            return
+
         if not ready_rows:
             QMessageBox.information(
                 self,
@@ -7142,6 +7164,15 @@ class ToolboxWindow(QMainWindow):
         self.statusBar().showMessage(f"Lookup apply complete: {applied_count} files", 5000)
 
     def convert_embedded_lyrics_to_lrc(self) -> None:
+        # Require a scan to have been run first.
+        if not self._lyrics_manager_scan_target:
+            QMessageBox.information(
+                self,
+                "Run Scan First",
+                "Run 'Scan Lyrics' first to inventory audio files before converting embedded lyrics.",
+            )
+            return
+
         target = self.path_input.text().strip()
         if not target:
             QMessageBox.information(
