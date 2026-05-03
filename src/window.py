@@ -7717,67 +7717,54 @@ class ToolboxWindow(QMainWindow):
         if mutagen is None:
             return False, "Mutagen is unavailable, so metadata cannot be saved."
 
+        file_str = str(file_path)
+        values = self._metadata_input_to_values(value_text)
+
         try:
-            easy_audio = mutagen.File(file_path, easy=True)
-        except Exception as exc:
-            return False, f"Unable to open file metadata: {exc}"
+            if file_path.suffix.lower() == ".mp3":
+                try:
+                    from mutagen.easyid3 import EasyID3
+                    from mutagen.id3 import ID3, ID3NoHeaderError
+                except ImportError as exc:
+                    return False, f"Unable to import MP3 metadata helpers: {exc}"
 
-        if not easy_audio:
-            return False, "Unable to parse audio metadata for this file."
+                try:
+                    tags = EasyID3(file_str)
+                except ID3NoHeaderError:
+                    ID3().save(file_str)
+                    tags = EasyID3(file_str)
 
-        tags = getattr(easy_audio, "tags", None)
-        if tags is None:
-            # Fallback: try without easy=True for formats that don't support it
+                if values:
+                    tags[metadata_key] = values
+                else:
+                    if metadata_key in tags:
+                        del tags[metadata_key]
+
+                tags.save(file_str)
+                return True, "Saved"
+
             try:
-                easy_audio = mutagen.File(file_path)
-                tags = getattr(easy_audio, "tags", None)
-            except Exception:
-                tags = None
+                audio = mutagen.File(file_str, easy=True)
+            except Exception as exc:
+                return False, f"Unable to open file metadata: {exc}"
+
+            if not audio:
+                return False, "Unable to parse audio metadata for this file."
+
+            tags = getattr(audio, "tags", None)
+            if tags is None:
+                tags = audio
 
             if tags is None:
-                try:
-                    easy_audio.add_tags()
-                except Exception as exc:
-                    return False, f"Unable to initialize tags: {exc}"
-                tags = getattr(easy_audio, "tags", None)
-                if tags is None:
-                    return False, "Unable to initialize editable metadata tags."
+                return False, "Unable to initialize editable metadata tags."
 
-        values = self._metadata_input_to_values(value_text)
-        try:
             if values:
                 tags[metadata_key] = values
-                easy_audio.save()
             else:
-                removed = False
-                # First, try to delete via easy tags
-                try:
-                    if metadata_key in tags:
-                        try:
-                            del tags[metadata_key]
-                            easy_audio.save()
-                            removed = True
-                        except Exception:
-                            # Some backends may not allow direct deletion via easy tags
-                            removed = False
-                except Exception:
-                    removed = False
+                if metadata_key in tags:
+                    del tags[metadata_key]
 
-                # If easy deletion didn't work, try full mutagen tag API as a fallback
-                if not removed:
-                    try:
-                        removed = self._delete_tag_by_format(file_path, metadata_key)
-                    except Exception:
-                        removed = False
-
-                # As a last resort, set an empty list for easy tags (preserves behavior)
-                if not removed:
-                    try:
-                        tags[metadata_key] = []
-                        easy_audio.save()
-                    except Exception:
-                        # If all deletion attempts failed, raise to surface the error
-                        raise
+            audio.save()
         except Exception as exc:
             return False, f"Unable to save metadata field '{metadata_key}': {exc}"
 
