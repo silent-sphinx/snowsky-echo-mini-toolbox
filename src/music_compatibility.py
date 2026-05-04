@@ -704,9 +704,9 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
 
 
 class MusicCompatibilityScanWorker(QObject):
-    progress = Signal(int, int, int, int, int, int)
-    finished = Signal(list, int, int, int, int, int)
-    cancelled = Signal(int, int, int, int, int, int)
+    progress = Signal(int, int, int, int, int, int, int)
+    finished = Signal(list, int, int, int, int, int, int)
+    cancelled = Signal(int, int, int, int, int, int, int)
     failed = Signal(str)
 
     def __init__(self, target_path: Path):
@@ -723,7 +723,7 @@ class MusicCompatibilityScanWorker(QObject):
             candidate_files: list[Path] = []
             for root_dir, dir_names, file_names in os.walk(self.target_path):
                 if self._cancel_requested:
-                    self.cancelled.emit(0, 0, 0, 0, 0, 0)
+                    self.cancelled.emit(0, 0, 0, 0, 0, 0, 0)
                     return
 
                 # Do not descend into hidden directories.
@@ -731,7 +731,7 @@ class MusicCompatibilityScanWorker(QObject):
 
                 for file_name in file_names:
                     if self._cancel_requested:
-                        self.cancelled.emit(0, 0, 0, 0, 0, 0)
+                        self.cancelled.emit(0, 0, 0, 0, 0, 0, 0)
                         return
                     if file_name.startswith("."):
                         continue
@@ -747,13 +747,14 @@ class MusicCompatibilityScanWorker(QObject):
             unsupported = 0
             unknown = 0
             skipped = 0
+            eq_incompatible = 0
             rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str]] = []
 
-            self.progress.emit(0, total_files, supported, unsupported, unknown, skipped)
+            self.progress.emit(0, total_files, supported, unsupported, unknown, skipped, eq_incompatible)
 
             for index, file_path in enumerate(candidate_files, start=1):
                 if self._cancel_requested:
-                    self.cancelled.emit(index - 1, total_files, supported, unsupported, unknown, skipped)
+                    self.cancelled.emit(index - 1, total_files, supported, unsupported, unknown, skipped, eq_incompatible)
                     return
 
                 result = _evaluate_music_file_with_cache(file_path, self.target_path)
@@ -783,9 +784,13 @@ class MusicCompatibilityScanWorker(QObject):
                 else:
                     skipped += 1
 
-                if index == total_files or index % 25 == 0:
-                    self.progress.emit(index, total_files, supported, unsupported, unknown, skipped)
+                # Count EQ-incompatible supported files
+                if category == "supported" and result["eq_compatibility"].lower() == "not compatible":
+                    eq_incompatible += 1
 
-            self.finished.emit(rows, supported, unsupported, unknown, skipped, total_files)
+                if index == total_files or index % 25 == 0:
+                    self.progress.emit(index, total_files, supported, unsupported, unknown, skipped, eq_incompatible)
+
+            self.finished.emit(rows, supported, unsupported, unknown, skipped, total_files, eq_incompatible)
         except Exception as exc:
             self.failed.emit(str(exc))

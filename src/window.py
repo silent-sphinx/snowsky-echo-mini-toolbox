@@ -1658,6 +1658,7 @@ class ToolboxWindow(QMainWindow):
         self._music_compatibility_scan_target: Path | None = None
         self._last_music_compatibility_scan_target: Path | None = None
         self._last_music_compatibility_unsupported_count = 0
+        self._last_music_compatibility_eq_incompatible_count = 0
         self._music_conversion_thread: QThread | None = None
         self._music_conversion_worker: MusicConversionWorker | None = None
         self._music_conversion_progress_dialog: QProgressDialog | None = None
@@ -5699,7 +5700,10 @@ class ToolboxWindow(QMainWindow):
             return
 
         resolved_target = target_path.resolve()
-        has_actionable_results = self._last_music_compatibility_unsupported_count > 0
+        has_actionable_results = (
+            self._last_music_compatibility_unsupported_count > 0
+            or self._last_music_compatibility_eq_incompatible_count > 0
+        )
         self.music_compatibility_convert_btn.setEnabled(
             self._last_music_compatibility_scan_target == resolved_target
             and has_actionable_results
@@ -5711,7 +5715,7 @@ class ToolboxWindow(QMainWindow):
         self._music_compatibility_scan_worker = None
         self._music_compatibility_scan_thread = None
 
-    @Slot(int, int, int, int, int, int)
+    @Slot(int, int, int, int, int, int, int)
     def _on_music_compatibility_scan_cancelled(
         self,
         scanned: int,
@@ -5720,9 +5724,11 @@ class ToolboxWindow(QMainWindow):
         unsupported: int,
         unknown: int,
         skipped: int,
+        eq_incompatible: int,
     ) -> None:
         self._music_compatibility_scan_target = None
         self._last_music_compatibility_unsupported_count = 0
+        self._last_music_compatibility_eq_incompatible_count = 0
         self.music_compatibility_scan_btn.setEnabled(True)
         self.music_compatibility_cancel_btn.setEnabled(False)
         self.music_compatibility_progress.setRange(0, max(total, 1))
@@ -6290,6 +6296,7 @@ class ToolboxWindow(QMainWindow):
         self._music_conversion_thread = None
 
     @Slot(int, int, int, int, int, int)
+    @Slot(int, int, int, int, int, int, int)
     def _on_music_compatibility_scan_progress(
         self,
         scanned: int,
@@ -6298,6 +6305,7 @@ class ToolboxWindow(QMainWindow):
         unsupported: int,
         unknown: int,
         skipped: int,
+        eq_incompatible: int,
     ) -> None:
         total_for_ui = max(total, 1)
         self.music_compatibility_progress.setRange(0, total_for_ui)
@@ -6357,7 +6365,7 @@ class ToolboxWindow(QMainWindow):
 
             self.music_compatibility_table.setRowHidden(row, not (quick_filter_match and text_match))
 
-    @Slot(list, int, int, int, int, int)
+    @Slot(list, int, int, int, int, int, int)
     def _on_music_compatibility_scan_finished(
         self,
         rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str]],
@@ -6366,9 +6374,11 @@ class ToolboxWindow(QMainWindow):
         unknown: int,
         skipped: int,
         total_files: int,
+        eq_incompatible: int,
     ) -> None:
         self._last_music_compatibility_scan_target = self._music_compatibility_scan_target
         self._last_music_compatibility_unsupported_count = unsupported
+        self._last_music_compatibility_eq_incompatible_count = eq_incompatible
         self._music_compatibility_scan_target = None
         self.music_compatibility_scan_btn.setEnabled(True)
         self.music_compatibility_cancel_btn.setEnabled(False)
@@ -6471,6 +6481,7 @@ class ToolboxWindow(QMainWindow):
     def _on_music_compatibility_scan_failed(self, error: str) -> None:
         self._music_compatibility_scan_target = None
         self._last_music_compatibility_unsupported_count = 0
+        self._last_music_compatibility_eq_incompatible_count = 0
         self.music_compatibility_scan_btn.setEnabled(True)
         self.music_compatibility_cancel_btn.setEnabled(False)
         self.music_compatibility_convert_btn.setEnabled(False)
