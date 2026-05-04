@@ -51,12 +51,6 @@ Please help the community by submitting a bug report—your feedback helps impro
 - Backup/Restore:
   - Creates ZIP backups, or copy/move your library to another location.
 
-## Requirements
-
-- Python 3.12
-- ffmpeg and ffprobe (bundled in releases)
-- Linux Qt/XCB runtime libraries (Linux)
-
 ## Important Notes
 
 - This program has the ability to modify your Snowsky Echo Mini Library, ALWAYS check to see if the program is making the intended changes on your data, before applying.
@@ -78,15 +72,18 @@ Only the following operating systems have an official release, follow 'build fro
 
 | Operating System | Architecture | Format |
 | ---- | ---- | ---- |
-| Windows | 32-bit & 64-bit | Installation (.exe) |
-| Linux   | x86-64 (64-bit) | .tar.gz & .deb |
+| Windows | 64-bit | Installation (.exe) |
+| Linux   | AMD64 (64-bit) | .tar.gz & .deb |
 | MacOS | ARM64 (Apple Silicon) | .dmg |
 
 ## Build from source
 
 This project is developed in Python 3.12+, and using Python 3.12 is recommended.
 
-1. Ensure that ffmpeg is installed (for ffprobe)
+Note: If `pip install -r requirements.txt` fails, ensure your active Python interpreter is
+Python 3.12. On Windows, the Python launcher can help (e.g. `py -3.12 -m venv venv`).
+
+1. Ensure that ffmpeg is installed (for ffmpeg/ffprobe)
 2. Clone the repository.
 3. Create and activate a virtual environment.
 4. Install dependencies.

@@ -2992,7 +2992,13 @@ class ToolboxWindow(QMainWindow):
         dialog = QFileDialog(self, "Select Folder", str(Path.home()))
         dialog.setFileMode(QFileDialog.Directory)
         dialog.setOption(QFileDialog.ShowDirsOnly, True)
-        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        # On Windows the native folder dialog is required to allow selecting
+        # drive roots (e.g. "C:\\", "D:\\"). Prefer the native dialog
+        # there; use the non-native dialog elsewhere for styling consistency.
+        if sys.platform.startswith("win"):
+            dialog.setOption(QFileDialog.DontUseNativeDialog, False)
+        else:
+            dialog.setOption(QFileDialog.DontUseNativeDialog, True)
 
         if not dialog.exec():
             return
@@ -8723,6 +8729,10 @@ class ToolboxWindow(QMainWindow):
         try:
             info = collect_target_info(target)
         except Exception as exc:
+            import logging
+
+            logger = logging.getLogger(__name__)
+            logger.exception("Failed to inspect target: %s", target)
             QMessageBox.critical(self, "Error", f"Failed to inspect target:\n{exc}")
             self.statusBar().showMessage("Failed to inspect target")
             return
