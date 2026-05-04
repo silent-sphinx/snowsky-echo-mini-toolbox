@@ -196,7 +196,14 @@ def collect_target_info(path: str) -> list[tuple[str, str]]:
     readable = "Yes" if os.access(resolved, os.R_OK) else "No"
     writable = "Yes" if os.access(resolved, os.W_OK) else "No"
     executable = "Yes" if os.access(resolved, os.X_OK) else "No"
-    modified = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(resolved)))
+    try:
+        modified = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(resolved))
+        )
+    except Exception:
+        # Some filesystems or root paths (especially removable drives on Windows)
+        # may not provide a valid modification time. Fall back to Unknown.
+        modified = "Unknown"
     used_percent = (stats.used / stats.total * 100) if stats.total else 0
 
     target_type = "Removable Drive" if os.path.ismount(resolved) else "Folder"

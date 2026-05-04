@@ -80,6 +80,9 @@ Only the following operating systems have an official release, follow 'build fro
 
 This project is developed in Python 3.12+, and using Python 3.12 is recommended.
 
+Note: If `pip install -r requirements.txt` fails, ensure your active Python interpreter is
+Python 3.12. On Windows, the Python launcher can help (e.g. `py -3.12 -m venv venv`).
+
 1. Ensure that ffmpeg is installed (for ffmpeg/ffprobe)
 2. Clone the repository.
 3. Create and activate a virtual environment.
