@@ -76,7 +76,7 @@ from .music_compatibility import (
     get_all_streams,
 )
 from .models import DriveOption
-from .system_info import collect_target_info, format_bytes, list_removable_drives
+from .system_info import collect_target_info, format_bytes, list_removable_drives, attempt_unmount_mountpoint
 
 try:
     import mutagen
@@ -1561,37 +1561,53 @@ class BulkMetadataEditDialog(QDialog):
         info_label.setObjectName("targetSummary")
         layout.addWidget(info_label)
 
-        # Create form fields
-        self.artist_input = QLineEdit()
-        self.artist_input.setPlaceholderText("Leave empty to skip")
-        layout.addWidget(QLabel("Artist:"))
-        layout.addWidget(self.artist_input)
+        help_label = QLabel(
+            "Choose a tag name from the list or type your own. Select Remove to delete that tag from every chosen file."
+        )
+        help_label.setWordWrap(True)
+        help_label.setObjectName("targetSummary")
+        layout.addWidget(help_label)
 
-        self.album_input = QLineEdit()
-        self.album_input.setPlaceholderText("Leave empty to skip")
-        layout.addWidget(QLabel("Album:"))
-        layout.addWidget(self.album_input)
+        self.tag_name_combo = QComboBox()
+        self.tag_name_combo.setEditable(True)
+        self.tag_name_combo.addItems(
+            [
+                "artist",
+                "album",
+                "title",
+                "date",
+                "genre",
+                "albumartist",
+                "tracknumber",
+                "discnumber",
+                "comment",
+                "lyrics",
+            ]
+        )
+        self.tag_name_combo.setCurrentIndex(-1)
+        self.tag_name_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.tag_name_combo.lineEdit().setPlaceholderText("Tag name, for example: mood or albumartist")
+        layout.addWidget(QLabel("Tag name:"))
+        layout.addWidget(self.tag_name_combo)
 
-        self.title_input = QLineEdit()
-        self.title_input.setPlaceholderText("Leave empty to skip")
-        layout.addWidget(QLabel("Title:"))
-        layout.addWidget(self.title_input)
+        self.action_combo = QComboBox()
+        self.action_combo.addItems(["Set / replace value", "Remove matching tags"])
+        layout.addWidget(QLabel("Action:"))
+        layout.addWidget(self.action_combo)
 
-        self.date_input = QLineEdit()
-        self.date_input.setPlaceholderText("Leave empty to skip (format: YYYY or YYYY-MM-DD)")
-        layout.addWidget(QLabel("Date:"))
-        layout.addWidget(self.date_input)
+        self.tag_value_input = QLineEdit()
+        self.tag_value_input.setPlaceholderText("Tag value")
+        layout.addWidget(QLabel("Value:"))
+        layout.addWidget(self.tag_value_input)
 
-        self.genre_input = QLineEdit()
-        self.genre_input.setPlaceholderText("Leave empty to skip")
-        layout.addWidget(QLabel("Genre:"))
-        layout.addWidget(self.genre_input)
+        self.action_combo.currentIndexChanged.connect(self._update_value_field_state)
+        self._update_value_field_state()
 
         layout.addStretch()
 
         # Buttons
         button_layout = QHBoxLayout()
-        update_btn = QPushButton("Update")
+        update_btn = QPushButton("Apply")
         update_btn.clicked.connect(self._on_update)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
@@ -1600,23 +1616,25 @@ class BulkMetadataEditDialog(QDialog):
         button_layout.addWidget(cancel_btn)
         layout.addLayout(button_layout)
 
+    def _update_value_field_state(self, *_: object) -> None:
+        remove_mode = self.action_combo.currentIndex() == 1
+        self.tag_value_input.setEnabled(not remove_mode)
+        if remove_mode:
+            self.tag_value_input.clear()
+
     def _on_update(self) -> None:
-        metadata = {
-            "artist": self.artist_input.text() or None,
-            "album": self.album_input.text() or None,
-            "title": self.title_input.text() or None,
-            "date": self.date_input.text() or None,
-            "genre": self.genre_input.text() or None,
-        }
-        
-        # Remove None values
-        metadata = {k: v for k, v in metadata.items() if v is not None}
-        
-        if not metadata:
-            QMessageBox.warning(self, "No Changes", "Please fill in at least one field.")
+        tag_name = self.tag_name_combo.currentText().strip()
+        if not tag_name:
+            QMessageBox.warning(self, "No Tag Selected", "Enter a tag name.")
             return
-        
-        self.parent_window._bulk_update_metadata(self.selected_paths, metadata)
+
+        remove_only = self.action_combo.currentIndex() == 1
+        tag_value = "" if remove_only else self.tag_value_input.text().strip()
+        if not remove_only and not tag_value:
+            QMessageBox.warning(self, "No Value", "Enter a value or switch the action to Remove matching tags.")
+            return
+
+        self.parent_window._bulk_update_metadata(self.selected_paths, tag_name, tag_value, remove_only)
         self.accept()
 
 
@@ -3165,50 +3183,31 @@ class ToolboxWindow(QMainWindow):
         show_result_dialogs: bool = True,
         refresh_drive_list: bool = True,
     ) -> bool:
-        error_detail = ""
         try:
-            if sys.platform != "darwin":
-                raise RuntimeError("Unmount drive is currently supported on macOS only.")
+            ok, message = attempt_unmount_mountpoint(selected_drive)
+            if not ok:
+                raise RuntimeError(message or "Unmount failed")
 
-            commands = [
-                ["diskutil", "unmount", selected_drive],
-                ["diskutil", "unmountDisk", selected_drive],
-            ]
-            unmounted = False
-
-            for command in commands:
-                result = subprocess.run(command, capture_output=True, text=True)
-                if result.returncode == 0:
-                    unmounted = True
-                    break
-                output = (result.stderr or result.stdout or "").strip()
-                if output:
-                    error_detail = output
-
-            if not unmounted:
-                raise RuntimeError(error_detail or "diskutil reported an error.")
-
-            if self.path_input.text().strip() == selected_drive:
-                self.path_input.clear()
-                self.show_info()
+            # Clear path_input if it referenced the unmounted drive
+            try:
+                if self.path_input.text().strip() == selected_drive:
+                    self.path_input.clear()
+                    self.show_info()
+            except Exception:
+                pass
 
             self.statusBar().showMessage(f"Drive unmounted: {selected_drive}", 5000)
             if show_result_dialogs:
-                QMessageBox.information(
-                    self,
-                    "Drive Unmounted",
-                    f"Successfully unmounted:\n{selected_drive}",
-                )
+                QMessageBox.information(self, "Drive Unmounted", f"Successfully unmounted:\n{selected_drive}")
             if refresh_drive_list:
-                self.refresh_drives()
+                try:
+                    self.refresh_drives()
+                except Exception:
+                    pass
             return True
         except Exception as exc:
             if show_result_dialogs:
-                QMessageBox.warning(
-                    self,
-                    "Unmount Failed",
-                    f"Unable to unmount drive:\n{exc}",
-                )
+                QMessageBox.warning(self, "Unmount Failed", f"Unable to unmount drive:\n{exc}")
             self.statusBar().showMessage("Unmount failed", 5000)
             return False
 
@@ -4596,7 +4595,13 @@ class ToolboxWindow(QMainWindow):
         menu.popup(self.browser_bulk_edit_btn.mapToGlobal(self.browser_bulk_edit_btn.rect().bottomLeft()))
 
     def _show_bulk_metadata_editor(self) -> None:
-        selected_paths = list(self.browser_proxy_model.checked_paths())
+        selected_paths = sorted(
+            {
+                path
+                for path in self.browser_proxy_model.checked_paths()
+                if os.path.isfile(path)
+            }
+        )
         if not selected_paths:
             QMessageBox.warning(self, "No Selection", "No files selected.")
             return
@@ -4604,163 +4609,178 @@ class ToolboxWindow(QMainWindow):
         dialog = BulkMetadataEditDialog(selected_paths, self)
         dialog.exec()
 
-    def _bulk_update_metadata(self, selected_paths: list[str], metadata: dict[str, str]) -> None:
-        """Bulk update metadata for selected files."""
+    def _bulk_update_metadata(self, selected_paths: list[str], tag_name: str, tag_value: str, remove_only: bool) -> None:
+        """Bulk set or remove one metadata field across selected files."""
         if not mutagen:
             QMessageBox.critical(self, "Error", "mutagen library not available for metadata editing.")
             return
-        
+
+        tag_name = tag_name.strip()
+        tag_value = tag_value.strip()
+        if not tag_name:
+            QMessageBox.warning(self, "No Tag Selected", "Enter a tag name.")
+            return
+        if not remove_only and not tag_value:
+            QMessageBox.warning(self, "No Value", "Enter a value or choose Remove matching tags.")
+            return
+
         updated = 0
-        failed = []
-        def _try_mutagen_write(p: Path) -> tuple[bool, str]:
-            """Try to write metadata via mutagen. Returns (success, message)."""
+        failed: list[str] = []
+
+        def _save_mp3_custom_frame(id3, custom_key: str, custom_value: str) -> None:
+            from mutagen.id3 import TXXX
+
+            for frame in list(id3.getall("TXXX")):
+                if getattr(frame, "desc", "") == custom_key:
+                    try:
+                        del id3[frame.HashKey]
+                    except Exception:
+                        pass
+            id3.add(TXXX(encoding=3, desc=custom_key, text=[custom_value]))
+
+        def _write_tag_to_file(path: Path) -> tuple[bool, str]:
+            file_str = str(path)
+            suf = path.suffix.lower()
             try:
-                # First try the easy interface
-                audio = mutagen.File(str(p), easy=True)
-                suf = p.suffix.lower()
-                if audio is not None:
-                    if audio.tags is None:
+                if suf == ".mp3":
+                    try:
+                        from mutagen.easyid3 import EasyID3
+                        from mutagen.id3 import ID3, ID3NoHeaderError
+                    except ImportError as exc:
+                        return False, f"Unable to import MP3 metadata helpers: {exc}"
+
+                    if remove_only:
+                        easy_removed = False
+                        custom_removed = False
                         try:
-                            audio.add_tags()
+                            easy_tags = EasyID3(file_str)
+                            if tag_name in easy_tags:
+                                del easy_tags[tag_name]
+                                easy_tags.save(file_str, v2_version=3)
+                                easy_removed = True
+                        except ID3NoHeaderError:
+                            easy_tags = None
                         except Exception:
                             pass
-                    for k, v in metadata.items():
-                        if v is None:
-                            continue
+
                         try:
-                            # easy mutagen expects lists
-                            audio.tags[k] = [v]
-                        except Exception:
-                            try:
-                                audio.tags[str(k)] = [v]
-                            except Exception:
-                                pass
+                            id3 = ID3(file_str)
+                        except ID3NoHeaderError:
+                            id3 = None
+                        except Exception as exc:
+                            return False, str(exc)
+
+                        if id3 is not None:
+                            for frame in list(id3.getall("TXXX")):
+                                if getattr(frame, "desc", "") == tag_name:
+                                    try:
+                                        del id3[frame.HashKey]
+                                        custom_removed = True
+                                    except Exception:
+                                        pass
+                            if custom_removed:
+                                id3.save(file_str, v2_version=3)
+
+                        if easy_removed or custom_removed:
+                            return True, ""
+                        return False, f"Tag '{tag_name}' was not found."
+
                     try:
-                        save_kwargs = {"v2_version": 3} if suf == ".mp3" else {}
-                        audio.save(**save_kwargs)
-                        return True, ""
-                    except Exception as exc:
-                        # fallthrough to format-specific attempts
-                        last_err = str(exc)
+                        easy_tags = EasyID3(file_str)
+                    except ID3NoHeaderError:
+                        ID3().save(file_str, v2_version=3)
+                        easy_tags = EasyID3(file_str)
+                    except Exception:
+                        easy_tags = None
 
-                # Format-specific attempts for common container types
-                if suf in (".wav", ".wave"):
-                    try:
-                        from mutagen.wave import WAVE
-
-                        w = WAVE(str(p))
-                        if w.tags is None:
-                            try:
-                                w.add_tags()
-                            except Exception:
-                                pass
-                        if metadata.get("artist") is not None:
-                            w.tags["IART"] = metadata["artist"]
-                        if metadata.get("title") is not None:
-                            w.tags["INAM"] = metadata["title"]
-                        w.save()
-                        return True, ""
-                    except Exception as exc:
-                        last_err = str(exc)
-
-                if suf in (".aiff", ".aif"):
-                    try:
-                        from mutagen.aiff import AIFF
-
-                        a = AIFF(str(p))
-                        if a.tags is None:
-                            try:
-                                a.add_tags()
-                            except Exception:
-                                pass
-                        if metadata.get("artist") is not None:
-                            a.tags["IART"] = metadata["artist"]
-                        if metadata.get("title") is not None:
-                            a.tags["NAME"] = metadata["title"]
-                        a.save()
-                        return True, ""
-                    except Exception as exc:
-                        last_err = str(exc)
-
-                # If we reached here, mutagen couldn't write the metadata
-                return False, last_err if "last_err" in locals() else "mutagen failed"
-            except Exception as exc:
-                return False, str(exc)
-
-        def _ffmpeg_fallback(p: Path) -> tuple[bool, str]:
-            """Attempt to write metadata by remuxing with ffmpeg (no re-encode)."""
-            tmp = p.with_suffix(p.suffix + ".tmp")
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(p),
-                "-c",
-                "copy",
-            ]
-            if p.suffix.lower() == ".mp3":
-                cmd.extend(["-id3v2_version", "3"])
-            for k, v in metadata.items():
-                if v is None:
-                    continue
-                cmd.extend(["-metadata", f"{k}={v}"])
-            cmd.append(str(tmp))
-            try:
-                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if proc.returncode == 0 and tmp.exists():
-                    try:
-                        os.replace(str(tmp), str(p))
-                        return True, ""
-                    except Exception as exc:
+                    if easy_tags is not None:
                         try:
-                            tmp.unlink()
+                            easy_tags[tag_name] = [tag_value]
+                            easy_tags.save(file_str, v2_version=3)
+                            return True, ""
                         except Exception:
                             pass
-                        return False, f"replace failed: {str(exc)}"
-                stderr = proc.stderr.decode(errors="ignore") if proc and proc.stderr is not None else "ffmpeg failed"
-                try:
-                    if tmp.exists():
-                        tmp.unlink()
-                except Exception:
-                    pass
-                return False, stderr.strip()
-            except FileNotFoundError:
-                return False, "ffmpeg not installed"
+
+                    try:
+                        id3 = ID3(file_str)
+                    except ID3NoHeaderError:
+                        ID3().save(file_str, v2_version=3)
+                        id3 = ID3(file_str)
+                    _save_mp3_custom_frame(id3, tag_name, tag_value)
+                    id3.save(file_str, v2_version=3)
+                    return True, ""
+
+                audio = mutagen.File(file_str, easy=False)
+                if audio is None:
+                    return False, "Unable to parse audio metadata for this file."
+
+                tags = getattr(audio, "tags", None)
+                if tags is None:
+                    if remove_only:
+                        return False, "No metadata tags were found."
+                    try:
+                        audio.add_tags()
+                    except Exception:
+                        pass
+                    tags = getattr(audio, "tags", None)
+
+                if tags is None:
+                    return False, "Unable to initialize metadata tags for this file."
+
+                if remove_only:
+                    removed = False
+                    if hasattr(tags, "delall"):
+                        try:
+                            tags.delall(tag_name)
+                            removed = True
+                        except Exception:
+                            pass
+                    if not removed:
+                        try:
+                            del tags[tag_name]
+                            removed = True
+                        except Exception:
+                            pass
+                    if not removed:
+                        return False, f"Tag '{tag_name}' was not found."
+                else:
+                    try:
+                        tags[tag_name] = [tag_value]
+                    except Exception:
+                        try:
+                            tags[tag_name] = tag_value
+                        except Exception as exc:
+                            return False, str(exc)
+
+                save_kwargs = {"v2_version": 3} if suf == ".mp3" else {}
+                audio.save(**save_kwargs)
+                return True, ""
             except Exception as exc:
-                try:
-                    if tmp.exists():
-                        tmp.unlink()
-                except Exception:
-                    pass
                 return False, str(exc)
 
         for file_path in selected_paths:
             path = Path(file_path)
             if not path.exists() or path.is_dir():
                 continue
-            try:
-                ok, msg = _try_mutagen_write(path)
-                if not ok:
-                    ok2, msg2 = _ffmpeg_fallback(path)
-                    if ok2:
-                        updated += 1
-                        continue
-                    else:
-                        failed.append(f"{path.name} ({msg or msg2})")
-                        continue
-                else:
-                    updated += 1
-            except Exception as e:
-                failed.append(f"{path.name} ({str(e)[:60]})")
-        
-        msg = f"Successfully updated {updated} file(s)."
+            ok, message = _write_tag_to_file(path)
+            if ok:
+                updated += 1
+            else:
+                failed.append(f"{path.name} ({message})")
+
+        summary = f"Successfully updated {updated} file(s)."
+        if remove_only:
+            summary = f"Successfully processed {updated} file(s)."
         if failed:
-            msg += f"\n\nFailed: {', '.join(failed[:10])}"
+            summary += f"\n\nFailed: {', '.join(failed[:10])}"
             if len(failed) > 10:
-                msg += f"... and {len(failed) - 10} more"
-        
-        QMessageBox.information(self, "Metadata Update", msg)
-        self.statusBar().showMessage(f"Updated metadata for {updated} files", 4000)
+                summary += f"... and {len(failed) - 10} more"
+
+        QMessageBox.information(self, "Metadata Update", summary)
+        self.statusBar().showMessage(
+            "Removed metadata tag" if remove_only else f"Updated metadata for {updated} files",
+            4000,
+        )
 
     @Slot(int)
     def _on_browser_selection_changed(self, count: int) -> None:

@@ -222,3 +222,96 @@ def collect_target_info(path: str) -> list[tuple[str, str]]:
         ("Top-Level Files", file_count),
         ("Last Modified", modified),
     ]
+
+
+def attempt_unmount_mountpoint(mountpoint: str) -> tuple[bool, str]:
+    """Try to unmount/eject the given mountpoint.
+
+    Returns (True, "") on success, or (False, "error message") on failure.
+    This is best-effort and attempts platform-appropriate commands.
+    """
+    system_name = platform.system().lower()
+    try:
+        if system_name == "darwin":
+            # Use diskutil for macOS
+            for cmd in (["diskutil", "unmount", mountpoint], ["diskutil", "unmountDisk", mountpoint]):
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                except Exception as exc:
+                    return False, f"Failed to run diskutil: {exc}"
+                if result.returncode == 0:
+                    return True, ""
+                # continue to next command
+            return False, (result.stderr or result.stdout or "diskutil failed")
+
+        if system_name == "linux":
+            # Try findmnt to discover block device, prefer udisksctl if available
+            device = None
+            try:
+                findmnt = shutil.which("findmnt")
+                if findmnt:
+                    res = subprocess.run([findmnt, "-n", "-o", "SOURCE", "--target", mountpoint], capture_output=True, text=True)
+                    if res.returncode == 0 and res.stdout:
+                        device = res.stdout.strip()
+            except Exception:
+                device = None
+
+            # Prefer udisksctl if present and we discovered a device
+            if device and shutil.which("udisksctl"):
+                try:
+                    res = subprocess.run(["udisksctl", "unmount", "-b", device], capture_output=True, text=True)
+                    if res.returncode == 0:
+                        return True, ""
+                    # fallthrough to try umount
+                except Exception as exc:
+                    return False, f"udisksctl failed: {exc}"
+
+            # Fallback to system umount
+            try:
+                res = subprocess.run(["umount", mountpoint], capture_output=True, text=True)
+                if res.returncode == 0:
+                    return True, ""
+                return False, (res.stderr or res.stdout or "umount returned non-zero")
+            except Exception as exc:
+                return False, f"umount failed: {exc}"
+
+        if system_name == "windows":
+            # Attempt Shell.Application Eject via PowerShell
+            try:
+                # Ensure path ends with backslash for COM ParseName on drive letters
+                p = Path(mountpoint)
+                drive = p.anchor or str(mountpoint)
+                # Normalize to e.g. 'E:\'
+                drive_norm = str(Path(drive))
+                ps_cmd = [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    f"(New-Object -ComObject Shell.Application).Namespace(17).ParseName('{drive_norm}').InvokeVerb('Eject')",
+                ]
+                res = subprocess.run(ps_cmd, capture_output=True, text=True, shell=False)
+                if res.returncode == 0:
+                    return True, ""
+                # If COM eject failed, try WMI Dismount (may require privileges)
+                drive_letter = (drive_norm[0] if len(drive_norm) >= 1 else "").upper()
+                if drive_letter and drive_letter.isalpha():
+                    ps_cmd2 = [
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        (
+                            "$v=Get-WmiObject -Class Win32_Volume -Filter \"DriveLetter='" + drive_letter + ":'\";"
+                            " if($v) {$v.Dismount($false,$false); exit 0} else { exit 2 }"
+                        ),
+                    ]
+                    res2 = subprocess.run(ps_cmd2, capture_output=True, text=True, shell=False)
+                    if res2.returncode == 0:
+                        return True, ""
+                    return False, (res2.stderr or res2.stdout or "PowerShell unmount failed")
+                return False, (res.stderr or res.stdout or "PowerShell eject failed")
+            except Exception as exc:
+                return False, f"Windows unmount attempt failed: {exc}"
+
+        return False, f"Unmount not implemented for platform: {system_name}"
+    except Exception as exc:
+        return False, str(exc)
