@@ -31,6 +31,8 @@ def main() -> int:
 
     QApplication.setStyle("Fusion")
     app = QApplication(sys.argv)
+    # Identify the application for QSettings storage
+    app.setOrganizationName("Snowsky")
     app.setApplicationName("Snowsky Echo Mini Toolbox")
     icon_path = _asset_path("assets", "toolbox-logo.png")
     if icon_path.exists():

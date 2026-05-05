@@ -17,7 +17,7 @@ import traceback
 import logging
 import tempfile
 
-from PySide6.QtCore import QDir, QModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot, QTimer
+from PySide6.QtCore import QDir, QModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot, QTimer, QSettings
 from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPen, QPixmap, QRegion, QClipboard
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -50,6 +50,8 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QStyleOptionViewItem,
     QTreeView,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -60,6 +62,7 @@ from .album_art import (
     AlbumArtScanWorker,
     image_size_from_bytes,
     jpeg_scan_type,
+    iter_audio_files,
     read_embedded_album_art,
     to_non_progressive_jpeg,
     write_embedded_album_art,
@@ -69,9 +72,8 @@ from .music_compatibility import (
     KNOWN_AUDIO_FORMATS,
     MusicCompatibilityScanWorker,
     _ffprobe_audio_info,
-    _subprocess_no_window_kwargs,
     _resolve_ffmpeg_executable,
-    _resolve_ffprobe_executable,
+    get_all_streams,
 )
 from .models import DriveOption
 from .system_info import collect_target_info, format_bytes, list_removable_drives
@@ -1033,61 +1035,26 @@ class MusicConversionWorker(QObject):
                     except Exception:
                         continue
 
-        ffprobe_path = _resolve_ffprobe_executable()
-        if ffprobe_path is None:
+        probe_info = _ffprobe_audio_info(source_file)
+        if not probe_info or probe_info.get("error"):
             return None
+        return self._parse_optional_int(probe_info.get("sample_rate"))
 
-        cmd = [
-            ffprobe_path,
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=sample_rate",
-            "-of",
-            "json",
-            str(source_file),
-        ]
+    def _resolve_conversion_stream_metadata(self, source_file: Path) -> tuple[int | None, int | None, int | None]:
+        probe_info = _ffprobe_audio_info(source_file)
+        if not probe_info or probe_info.get("error"):
+            return None, None, None
 
-        logger = logging.getLogger(__name__)
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=10,
-                **_subprocess_no_window_kwargs(),
-            )
-        except subprocess.TimeoutExpired:
-            logger.debug("ffprobe timeout while resolving sample rate for %s", source_file)
-            return None
-        except Exception:
-            logger.debug("ffprobe invocation failed while resolving sample rate for %s", source_file, exc_info=True)
-            return None
-
-        if result.returncode != 0:
-            logger.debug("ffprobe returned non-zero resolving sample rate for %s: %s", source_file, (result.stderr or "").strip())
-            return None
-
-        try:
-            payload = json.loads(result.stdout)
-        except Exception:
-            logger.debug("ffprobe output JSON parse failed for %s", source_file, exc_info=True)
-            return None
-
-        streams = payload.get("streams") or []
-        if not streams:
-            return None
-
-        sample_rate = streams[0].get("sample_rate")
-        return self._parse_optional_int(sample_rate)
+        stream_index = self._parse_optional_int(probe_info.get("stream_index"))
+        sample_rate = self._parse_optional_int(probe_info.get("sample_rate"))
+        bit_depth = self._parse_optional_int(probe_info.get("bit_depth"))
+        return stream_index, sample_rate, bit_depth
 
     def _build_music_conversion_command(
         self,
         source_file: Path,
         output_file: Path,
+        audio_stream_index: int | None,
         sample_rate: int | None,
         bit_depth: int | None,
     ) -> list[str]:
@@ -1103,6 +1070,8 @@ class MusicConversionWorker(QObject):
             "error",
             "-i",
             str(source_file),
+            "-map",
+            f"0:a:{audio_stream_index if audio_stream_index is not None else 0}",
             "-map_metadata",
             "0",
             "-c:a",
@@ -1249,6 +1218,12 @@ class MusicConversionWorker(QObject):
                     self.progress.emit(index, total, detail_label)
                     continue
 
+                stream_index, detected_sample_rate, detected_bit_depth = self._resolve_conversion_stream_metadata(source_path)
+                if sample_rate is None:
+                    sample_rate = detected_sample_rate
+                if bit_depth is None:
+                    bit_depth = detected_bit_depth
+
                 if not source_path.exists() or not source_path.is_file():
                     failed += 1
                     failures.append(f"{relative_file}: file not found")
@@ -1296,6 +1271,7 @@ class MusicConversionWorker(QObject):
                 command = self._build_music_conversion_command(
                     source_path,
                     temp_output_path,
+                    stream_index,
                     sample_rate,
                     bit_depth,
                 )
@@ -1697,9 +1673,11 @@ class ToolboxWindow(QMainWindow):
         self._last_incompatible_files: list[str] = []
         self._active_audio_metadata_path: Path | None = None
         self._updating_file_props_table = False
-        self._help_pane_width = 280
+        # Load persisted help pane preferences
+        settings = QSettings()
+        self._help_pane_width = settings.value("helpPane/width", 280, type=int)
         self._help_rail_width = 34
-        self._help_pane_collapsed = False
+        self._help_pane_collapsed = settings.value("helpPane/collapsed", False, type=bool)
 
         self.setWindowTitle("Snowsky Echo Mini Toolbox")
         self.resize(920, 620)
@@ -1908,6 +1886,10 @@ class ToolboxWindow(QMainWindow):
         self.info_table.setHorizontalHeaderLabels(["Property", "Value"])
         self.info_table.verticalHeader().setVisible(False)
         self._configure_resizable_table_columns(self.info_table, [220, 520])
+        # Keep the Property column at its configured width and let Value expand
+        info_header = self.info_table.horizontalHeader()
+        info_header.setSectionResizeMode(0, QHeaderView.Interactive)
+        info_header.setSectionResizeMode(1, QHeaderView.Stretch)
         self.info_table.setAlternatingRowColors(True)
         self.info_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.info_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -2007,7 +1989,7 @@ class ToolboxWindow(QMainWindow):
         self.music_compatibility_progress.setFormat("Idle")
         self.music_compatibility_progress.setTextVisible(True)
 
-        self.music_compatibility_table = QTableWidget(0, 10)
+        self.music_compatibility_table = QTableWidget(0, 12)
         self.music_compatibility_table.setHorizontalHeaderLabels(
             [
                 "File",
@@ -2020,6 +2002,8 @@ class ToolboxWindow(QMainWindow):
                 "Block Size",
                 "DSD",
                 "EQ Compatibility",
+                "Channels",
+                "Streams",
             ]
         )
         eq_header_item = self.music_compatibility_table.horizontalHeaderItem(9)
@@ -2027,15 +2011,29 @@ class ToolboxWindow(QMainWindow):
             eq_header_item.setToolTip(
                 "Indicates equaliser compatibility only. The file can still play, but if marked not compatible the equaliser will be disabled."
             )
+        channels_header_item = self.music_compatibility_table.horizontalHeaderItem(10)
+        if channels_header_item is not None:
+            channels_header_item.setToolTip(
+                "Audio channel count from the selected audio stream. Multi-channel FLACs shown here."
+            )
+        streams_header_item = self.music_compatibility_table.horizontalHeaderItem(11)
+        if streams_header_item is not None:
+            streams_header_item.setToolTip(
+                "Total number of streams in the container (audio, video, artwork, etc.)."
+            )
         self.music_compatibility_table.verticalHeader().setVisible(False)
         self._configure_resizable_table_columns(
             self.music_compatibility_table,
-            [320, 100, 90, 120, 300, 140, 90, 100, 90, 140],
+            [320, 100, 90, 120, 300, 140, 90, 100, 90, 140, 90, 80],
         )
         self.music_compatibility_table.setAlternatingRowColors(True)
         self.music_compatibility_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.music_compatibility_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.music_compatibility_table.setSortingEnabled(True)
+        self.music_compatibility_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.music_compatibility_table.customContextMenuRequested.connect(
+            self._on_music_compatibility_table_context_menu
+        )
 
         music_compatibility_layout.addLayout(music_compatibility_controls)
         music_compatibility_layout.addWidget(self.music_compatibility_summary_label)
@@ -2217,7 +2215,7 @@ class ToolboxWindow(QMainWindow):
 
         lyrics_tab = QWidget()
         lyrics_layout = QVBoxLayout(lyrics_tab)
-        lyrics_layout.setContentsMargins(0, 8, 0, 0)
+        lyrics_layout.setContentsMargins(8, 8, 0, 0)
         lyrics_layout.setSpacing(12)
 
         self.file_lyrics_title = QLabel("Embedded Lyrics")
@@ -2236,7 +2234,7 @@ class ToolboxWindow(QMainWindow):
         # Album Art metadata tab (per-file)
         album_art_meta_tab = QWidget()
         album_art_meta_layout = QVBoxLayout(album_art_meta_tab)
-        album_art_meta_layout.setContentsMargins(0, 8, 0, 0)
+        album_art_meta_layout.setContentsMargins(8, 8, 0, 0)
         album_art_meta_layout.setSpacing(12)
 
         self.file_art_meta_title = QLabel("Embedded Album Art")
@@ -2578,6 +2576,14 @@ class ToolboxWindow(QMainWindow):
             self.help_container.setFixedWidth(self._help_rail_width)
         else:
             self.help_container.setFixedWidth(self._help_pane_width)
+        try:
+            settings = QSettings()
+            settings.setValue("helpPane/collapsed", collapsed)
+            if not collapsed:
+                # persist the last expanded width
+                settings.setValue("helpPane/width", int(self.help_pane.width()))
+        except Exception:
+            pass
 
     def _update_help_for_tab(self, index: int) -> None:
         tab_name = ""
@@ -2589,7 +2595,7 @@ class ToolboxWindow(QMainWindow):
                 "Welcome to the Snowsky Echo Mini Toolbox, your one-stop shop for organizing and converting your music media. To start, select the location of your media by browsing or choosing one of the mounted drives at the top of the interface.\n\n"
                 "It is recommended to connect your microSD card directly to your computer using a USB reader, rather than plugging in the Snowsky Echo Mini itself, as the device uses a slower interface.\n\n"
                 "The 'About Drive/Folder' tool is useful for ensuring that your microSD card is compatible with your Echo Mini.\n\n"
-                "Please note that editing file metadata is likely to corrupt its record in you favourites.\n\n"
+                "Please note that editing file metadata is likely to corrupt its record in your favourites.\n\n"
                 "Filesystem Rules:\n"
                 "- Formatted as FAT/FAT32 or exFAT.\n"
                 "- Maximum drive size of 256GB.\n\n"
@@ -4611,6 +4617,7 @@ class ToolboxWindow(QMainWindow):
             try:
                 # First try the easy interface
                 audio = mutagen.File(str(p), easy=True)
+                suf = p.suffix.lower()
                 if audio is not None:
                     if audio.tags is None:
                         try:
@@ -4629,14 +4636,14 @@ class ToolboxWindow(QMainWindow):
                             except Exception:
                                 pass
                     try:
-                        audio.save()
+                        save_kwargs = {"v2_version": 3} if suf == ".mp3" else {}
+                        audio.save(**save_kwargs)
                         return True, ""
                     except Exception as exc:
                         # fallthrough to format-specific attempts
                         last_err = str(exc)
 
                 # Format-specific attempts for common container types
-                suf = p.suffix.lower()
                 if suf in (".wav", ".wave"):
                     try:
                         from mutagen.wave import WAVE
@@ -4691,6 +4698,8 @@ class ToolboxWindow(QMainWindow):
                 "-c",
                 "copy",
             ]
+            if p.suffix.lower() == ".mp3":
+                cmd.extend(["-id3v2_version", "3"])
             for k, v in metadata.items():
                 if v is None:
                     continue
@@ -6368,7 +6377,7 @@ class ToolboxWindow(QMainWindow):
     @Slot(list, int, int, int, int, int, int)
     def _on_music_compatibility_scan_finished(
         self,
-        rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str]],
+        rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str, str, str]],
         supported: int,
         unsupported: int,
         unknown: int,
@@ -6400,6 +6409,8 @@ class ToolboxWindow(QMainWindow):
                     block_size,
                     dsd_profile,
                     eq_compatibility,
+                    channels,
+                    stream_count,
                     category,
                 ) = row
 
@@ -6414,6 +6425,8 @@ class ToolboxWindow(QMainWindow):
                     QTableWidgetItem(block_size),
                     QTableWidgetItem(dsd_profile),
                     QTableWidgetItem(eq_compatibility),
+                    QTableWidgetItem(channels),
+                    QTableWidgetItem(stream_count),
                 ]
 
                 reason_item = items[4]
@@ -6476,6 +6489,42 @@ class ToolboxWindow(QMainWindow):
             )
 
         self.statusBar().showMessage("Music compatibility scan completed", 5000)
+
+    def _on_music_compatibility_table_context_menu(self, pos):
+        """Handle right-click context menu on the music compatibility table."""
+        item = self.music_compatibility_table.itemAt(pos)
+        if item is None:
+            return
+
+        row = item.row()
+        file_item = self.music_compatibility_table.item(row, 0)
+        if file_item is None:
+            return
+
+        file_name = file_item.text()
+        if not file_name:
+            return
+
+        # Find the full path from the file name
+        target_dir = Path(self._music_compatibility_scan_target or self._last_music_compatibility_scan_target or ".")
+        file_path = target_dir / file_name
+
+        if not file_path.exists():
+            QMessageBox.warning(
+                self,
+                "File Not Found",
+                f"Could not locate file: {file_path}",
+            )
+            return
+
+        # Create context menu
+        menu = QMenu()
+        view_streams_action = menu.addAction("View Streams")
+        action = menu.exec(self.music_compatibility_table.mapToGlobal(pos))
+
+        if action == view_streams_action:
+            dialog = StreamsInfoDialog(file_path, self)
+            dialog.exec()
 
     @Slot(str)
     def _on_music_compatibility_scan_failed(self, error: str) -> None:
@@ -7604,15 +7653,6 @@ class ToolboxWindow(QMainWindow):
         self.scan_album_art_compatibility()
 
     def _insert_file_properties_section_row(self, row_index: int, title: str, section_key: str) -> None:
-        section_item = QTableWidgetItem(title)
-        section_font = section_item.font()
-        section_font.setBold(True)
-        section_item.setFont(section_font)
-        section_item.setFlags(Qt.ItemIsEnabled)
-        section_item.setData(Qt.UserRole, f"section:{section_key}")
-        section_item.setBackground(QColor("#303030"))
-        section_item.setForeground(QColor("#E8E8E8"))
-        self.file_props_table.setItem(row_index, 0, section_item)
         if section_key == "metadata":
             add_btn = QPushButton("＋")
             add_btn.setToolTip("Add metadata field")
@@ -7624,14 +7664,40 @@ class ToolboxWindow(QMainWindow):
             add_btn.setFocusPolicy(Qt.NoFocus)
             add_btn.clicked.connect(self._on_add_metadata_row_clicked)
 
-            add_cell = QWidget(self.file_props_table)
-            add_layout = QHBoxLayout(add_cell)
-            add_layout.setContentsMargins(0, 0, 4, 0)
-            add_layout.setSpacing(0)
-            add_layout.addStretch(1)
-            add_layout.addWidget(add_btn, 0)
-            self.file_props_table.setCellWidget(row_index, 1, add_cell)
+            section_widget = QWidget(self.file_props_table)
+            section_widget.setStyleSheet("background-color: #303030;")
+            section_layout = QHBoxLayout(section_widget)
+            section_layout.setContentsMargins(8, 0, 8, 0)
+            section_layout.setSpacing(8)
+
+            section_label = QLabel(title, section_widget)
+            section_font = section_label.font()
+            section_font.setBold(True)
+            section_label.setFont(section_font)
+            section_label.setProperty("sectionRow", True)
+            section_label.setStyleSheet("color: #E8E8E8; background: transparent;")
+
+            section_layout.addWidget(section_label, 1)
+            section_layout.addWidget(add_btn, 0, Qt.AlignRight)
+            # Add a hidden marker item so section lookups (by UserRole) still work
+            section_item = QTableWidgetItem()
+            section_item.setFlags(Qt.ItemIsEnabled)
+            section_item.setData(Qt.UserRole, f"section:{section_key}")
+            section_item.setBackground(QColor("#303030"))
+            section_item.setForeground(QColor("#E8E8E8"))
+            self.file_props_table.setItem(row_index, 0, section_item)
+            self.file_props_table.setSpan(row_index, 0, 1, 2)
+            self.file_props_table.setCellWidget(row_index, 0, section_widget)
         else:
+            section_item = QTableWidgetItem(title)
+            section_font = section_item.font()
+            section_font.setBold(True)
+            section_item.setFont(section_font)
+            section_item.setFlags(Qt.ItemIsEnabled)
+            section_item.setData(Qt.UserRole, f"section:{section_key}")
+            section_item.setBackground(QColor("#303030"))
+            section_item.setForeground(QColor("#E8E8E8"))
+            self.file_props_table.setItem(row_index, 0, section_item)
             self.file_props_table.setSpan(row_index, 0, 1, 2)
         self.file_props_table.setRowHeight(row_index, 24)
 
@@ -7760,7 +7826,7 @@ class ToolboxWindow(QMainWindow):
                 try:
                     tags = EasyID3(file_str)
                 except ID3NoHeaderError:
-                    ID3().save(file_str)
+                    ID3().save(file_str, v2_version=3)
                     tags = EasyID3(file_str)
 
                 if values:
@@ -7769,7 +7835,7 @@ class ToolboxWindow(QMainWindow):
                     if metadata_key in tags:
                         del tags[metadata_key]
 
-                tags.save(file_str)
+                tags.save(file_str, v2_version=3)
                 return True, "Saved"
 
             try:
@@ -7793,7 +7859,8 @@ class ToolboxWindow(QMainWindow):
                 if metadata_key in tags:
                     del tags[metadata_key]
 
-            audio.save()
+            save_kwargs = {"v2_version": 3} if file_path.suffix.lower() == ".mp3" else {}
+            audio.save(**save_kwargs)
         except Exception as exc:
             return False, f"Unable to save metadata field '{metadata_key}': {exc}"
 
@@ -7854,7 +7921,8 @@ class ToolboxWindow(QMainWindow):
 
             if deleted_any:
                 try:
-                    full_audio.save()
+                    save_kwargs = {"v2_version": 3} if file_path.suffix.lower() == ".mp3" else {}
+                    full_audio.save(**save_kwargs)
                     return True
                 except Exception:
                     return False
@@ -8760,6 +8828,17 @@ class ToolboxWindow(QMainWindow):
             total_capacity_bytes is not None and total_capacity_bytes > size_warning_threshold
         )
 
+        track_count = None
+        if resolved_target and Path(resolved_target).is_dir():
+            try:
+                track_count = sum(1 for _ in iter_audio_files(Path(resolved_target)))
+            except Exception:
+                track_count = None
+
+        if track_count is not None:
+            info = list(info)
+            info.append(("Track Count", f"{track_count}/8192"))
+
         self.info_table.setRowCount(len(info))
         for row, (prop, value) in enumerate(info):
             prop_item = QTableWidgetItem(prop)
@@ -8782,6 +8861,20 @@ class ToolboxWindow(QMainWindow):
                 warning_tip = "Backup your data, and reformat this drive as either FAT or exFAT"
                 prop_item.setToolTip(warning_tip)
                 value_item.setToolTip(warning_tip)
+            elif prop.lower() == "track count":
+                try:
+                    track_total = int(str(value).split("/", 1)[0])
+                except Exception:
+                    track_total = None
+
+                if track_total is not None and track_total > 8192:
+                    prop_item.setBackground(QColor("#7A5E2C"))
+                    prop_item.setForeground(QColor("#FFF9E6"))
+                    value_item.setBackground(QColor("#7A5E2C"))
+                    value_item.setForeground(QColor("#FFF9E6"))
+                    warning_tip = "Maximum supported track count is 8192"
+                    prop_item.setToolTip(warning_tip)
+                    value_item.setToolTip(warning_tip)
 
             if prop.lower() == "total space" and size_warning:
                 value_item.setText(f"{value} (WARNING: Drive size over 256GB)")
@@ -8794,3 +8887,140 @@ class ToolboxWindow(QMainWindow):
                 value_item.setToolTip(warning_tip)
 
         self.statusBar().showMessage("Target information updated")
+
+
+class StreamsInfoDialog(QDialog):
+    """Dialog to display detailed information about all streams in a media file."""
+
+    def __init__(self, file_path: Path, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+        self.setWindowTitle(f"Stream Information - {file_path.name}")
+        self.setModal(True)
+        self.setMinimumWidth(800)
+        self.setMinimumHeight(500)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        # Create tree widget for streams
+        self.streams_tree = QTreeWidget()
+        self.streams_tree.setHeaderLabels(["Property", "Value"])
+        self.streams_tree.setColumnCount(2)
+        self.streams_tree.setColumnWidth(0, 250)
+        self.streams_tree.setColumnWidth(1, 500)
+        self.streams_tree.setAlternatingRowColors(True)
+
+        # Load streams data
+        self._populate_streams()
+
+        layout.addWidget(self.streams_tree)
+
+        # Close button
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        button_layout.addWidget(close_button)
+        layout.addLayout(button_layout)
+
+    def _populate_streams(self):
+        """Populate the tree with stream information."""
+        streams = get_all_streams(self.file_path)
+
+        if streams is None:
+            root = QTreeWidgetItem(self.streams_tree)
+            root.setText(0, "Error")
+            root.setText(1, "Could not probe file streams")
+            return
+
+        if not streams:
+            root = QTreeWidgetItem(self.streams_tree)
+            root.setText(0, "No streams found")
+            return
+
+        for stream_idx, stream in enumerate(streams, 1):
+            # Create a root item for each stream
+            stream_item = QTreeWidgetItem(self.streams_tree)
+            codec_type = stream.get("codec_type", "unknown").upper()
+            stream_index = stream.get("index", "?")
+
+            # Format stream title based on type
+            if codec_type == "AUDIO":
+                channels = stream.get("channels", "?")
+                sample_rate = stream.get("sample_rate", "?")
+                title = f"Stream {stream_index}: {codec_type} ({channels}ch @ {sample_rate}Hz)"
+            elif codec_type == "VIDEO":
+                width = stream.get("width", "?")
+                height = stream.get("height", "?")
+                title = f"Stream {stream_index}: {codec_type} ({width}x{height})"
+            else:
+                title = f"Stream {stream_index}: {codec_type}"
+
+            stream_item.setText(0, title)
+
+            # Add stream properties
+            self._add_stream_property(stream_item, "Index", stream.get("index"))
+            self._add_stream_property(stream_item, "Type", codec_type)
+
+            codec_name = stream.get("codec_name")
+            if codec_name:
+                self._add_stream_property(stream_item, "Codec", codec_name)
+
+            codec_long = stream.get("codec_long_name")
+            if codec_long:
+                self._add_stream_property(stream_item, "Description", codec_long)
+
+            # Audio-specific properties
+            if codec_type == "AUDIO":
+                channels = stream.get("channels")
+                if channels is not None:
+                    self._add_stream_property(stream_item, "Channels", str(channels))
+
+                sample_rate = stream.get("sample_rate")
+                if sample_rate is not None:
+                    self._add_stream_property(
+                        stream_item, "Sample Rate", f"{sample_rate} Hz"
+                    )
+
+                bit_depth = stream.get("bit_depth")
+                if bit_depth is not None:
+                    self._add_stream_property(stream_item, "Bit Depth", f"{bit_depth} bits")
+
+            # Video-specific properties
+            if codec_type == "VIDEO":
+                width = stream.get("width")
+                height = stream.get("height")
+                if width is not None and height is not None:
+                    self._add_stream_property(stream_item, "Resolution", f"{width}x{height}")
+
+            # General properties
+            bitrate = stream.get("bitrate")
+            if bitrate is not None:
+                bitrate_mbps = bitrate / 1_000_000
+                self._add_stream_property(stream_item, "Bitrate", f"{bitrate_mbps:.2f} Mbps")
+
+            duration = stream.get("duration")
+            if duration is not None:
+                mins = int(duration) // 60
+                secs = int(duration) % 60
+                self._add_stream_property(stream_item, "Duration", f"{mins}:{secs:02d}")
+
+            # Tags
+            tags = stream.get("tags", {})
+            if tags:
+                tags_item = QTreeWidgetItem(stream_item)
+                tags_item.setText(0, "Tags")
+                for tag_key, tag_value in tags.items():
+                    self._add_stream_property(tags_item, tag_key, str(tag_value))
+
+            stream_item.setExpanded(True)
+
+    def _add_stream_property(self, parent: QTreeWidgetItem, key: str, value):
+        """Add a property to a stream tree item."""
+        if value is None:
+            return
+        item = QTreeWidgetItem(parent)
+        item.setText(0, key)
+        item.setText(1, str(value))

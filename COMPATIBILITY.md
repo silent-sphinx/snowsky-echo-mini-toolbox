@@ -23,3 +23,7 @@ This document describes exactly how the media compatibility checker evaluates au
 ## EQ Adjustment Requirements
 
 * Built-in support for EQ adjustment of audio sources up to 16bit/192K
+
+## Tag Encoding
+
+* This device does not often work well with unusual encodings for tags, best to stick to UTF-16.

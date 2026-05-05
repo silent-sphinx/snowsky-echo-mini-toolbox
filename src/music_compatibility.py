@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 from collections import OrderedDict
 from pathlib import Path
 
@@ -195,7 +196,191 @@ def _infer_bit_depth_from_sample_fmt(sample_fmt: str | None) -> int | None:
     return _positive_int_or_none(_safe_int(match.group(1)))
 
 
-def _ffprobe_audio_info(path: Path) -> dict[str, int | None | str] | None:
+def _stream_with_fallback_int(stream: dict, *keys: str) -> int | None:
+    values = [stream.get(key) for key in keys]
+    return _positive_int_or_none(_first_valid_int(*values))
+
+
+def _stream_bit_depth(stream: dict) -> int | None:
+    bit_depth = _stream_with_fallback_int(
+        stream,
+        "bits_per_raw_sample",
+        "bits_per_sample",
+    )
+    if bit_depth is not None:
+        return bit_depth
+    return _infer_bit_depth_from_sample_fmt(stream.get("sample_fmt"))
+
+
+def _stream_disposition_default(stream: dict) -> bool:
+    disposition = stream.get("disposition")
+    if not isinstance(disposition, dict):
+        return False
+    value = _safe_int(disposition.get("default"))
+    return bool(value and value > 0)
+
+
+def _pcm_stream_is_within_limits(
+    extension: str,
+    sample_rate: int | None,
+    bit_depth: int | None,
+    flac_block_max: int | None,
+) -> bool:
+    if sample_rate is None or bit_depth is None:
+        return False
+    if sample_rate > 192000 or bit_depth > 24:
+        return False
+    if extension == ".flac":
+        if flac_block_max is None:
+            return False
+        if flac_block_max > FLAC_BLOCK_MAX_LIMIT:
+            return False
+    return True
+
+
+def _stream_selection_score(stream_info: dict, extension: str) -> int:
+    score = 0
+
+    if stream_info.get("is_default"):
+        score += 200
+
+    sample_rate = stream_info.get("sample_rate")
+    bit_depth = stream_info.get("bit_depth")
+    if sample_rate is not None:
+        score += 20
+    if bit_depth is not None:
+        score += 20
+
+    if stream_info.get("codec_name"):
+        score += 10
+
+    if extension in PCM_FORMATS:
+        if _pcm_stream_is_within_limits(
+            extension,
+            sample_rate,
+            bit_depth,
+            stream_info.get("flac_block_max"),
+        ):
+            score += 1000
+        elif sample_rate is not None and bit_depth is not None:
+            score += 100
+
+    # Prefer richer streams when all else is equal.
+    channels = stream_info.get("channels") or 0
+    score += min(int(channels), 16)
+
+    return score
+
+
+def _select_preferred_audio_stream(audio_streams: list[dict], extension: str) -> dict | None:
+    if not audio_streams:
+        return None
+
+    sorted_streams = sorted(
+        audio_streams,
+        key=lambda stream_info: (
+            _stream_selection_score(stream_info, extension),
+            stream_info.get("channels") or 0,
+            stream_info.get("sample_rate") or 0,
+            stream_info.get("bit_depth") or 0,
+            -int(stream_info.get("stream_pos") or 0),
+        ),
+        reverse=True,
+    )
+    return sorted_streams[0]
+
+
+def _attempt_json_recovery_via_remux(path: Path, ffprobe_executable: str) -> bool:
+    """Try to recover from JSON parse failure by remuxing file with ffmpeg to strip bad tags.
+    
+    Creates a temporary clean copy, probes it, and returns True if probe succeeds on clean copy.
+    Original file is never modified. Temp file is cleaned up regardless of outcome.
+    """
+    ffmpeg_path = _resolve_ffmpeg_executable()
+    if ffmpeg_path is None:
+        return False
+
+    logger = logging.getLogger(__name__)
+    temp_path = None
+    try:
+        # Create temp file for clean remux copy.
+        fd, temp_name = tempfile.mkstemp(prefix=".ffprobe_recovery_", suffix=path.suffix, dir=str(path.parent))
+        os.close(fd)
+        temp_path = Path(temp_name)
+
+        # Remux with ffmpeg (copy codec, no re-encode) to strip metadata.
+        cmd = [
+            ffmpeg_path,
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(path),
+            "-c",
+            "copy",
+            "-map_metadata",
+            "-1",
+            str(temp_path),
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            **_subprocess_no_window_kwargs(),
+        )
+        if result.returncode != 0:
+            logger.debug("ffmpeg remux for recovery failed: %s", result.stderr)
+            return False
+
+        # Try probing the clean copy.
+        probe_cmd = [
+            ffprobe_executable,
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=index,codec_type,sample_rate,sample_fmt,bits_per_sample,bits_per_raw_sample,max_block_size,max_blocksize,max_samples_per_frame,codec_name,channels,bit_rate,"
+            "duration,codec_long_name",
+            "-show_entries",
+            "stream_disposition=default",
+            "-show_entries",
+            "format=duration,bit_rate,format_long_name",
+            "-of",
+            "json",
+            str(temp_path),
+        ]
+        probe_result = subprocess.run(
+            probe_cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            **_subprocess_no_window_kwargs(),
+        )
+        if probe_result.returncode != 0:
+            logger.debug("ffprobe of recovered file failed: %s", probe_result.stderr)
+            return False
+
+        # Validate clean JSON parse.
+        try:
+            json.loads(probe_result.stdout)
+            logger.debug("JSON recovery successful for %s", path)
+            return True
+        except Exception:
+            logger.debug("Recovered file still has unparseable JSON")
+            return False
+    except Exception as exc:
+        logger.debug("Exception during recovery remux: %s", exc)
+        return False
+    finally:
+        if temp_path is not None:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+
+
+def _ffprobe_audio_info(path: Path) -> dict[str, object] | None:
     """Extract comprehensive audio metadata using ffprobe.
     
     Returns dict with:
@@ -219,11 +404,11 @@ def _ffprobe_audio_info(path: Path) -> dict[str, int | None | str] | None:
         ffprobe_executable,
         "-v",
         "error",
-        "-select_streams",
-        "a:0",
         "-show_entries",
-        "stream=sample_rate,sample_fmt,bits_per_sample,bits_per_raw_sample,max_block_size,max_blocksize,max_samples_per_frame,codec_name,channels,bit_rate,"
+        "stream=index,codec_type,sample_rate,sample_fmt,bits_per_sample,bits_per_raw_sample,max_block_size,max_blocksize,max_samples_per_frame,codec_name,channels,bit_rate,"
         "duration,codec_long_name",
+        "-show_entries",
+        "stream_disposition=default",
         "-show_entries",
         "format=duration,bit_rate,format_long_name",
         "-show_entries",
@@ -267,6 +452,15 @@ def _ffprobe_audio_info(path: Path) -> dict[str, int | None | str] | None:
         except Exception as exc:
             last_err = f"failed to parse ffprobe JSON output: {exc}"
             logger.debug("ffprobe JSON parse failed for %s: %s", path, exc)
+            # Attempt recovery via remux on first JSON parse failure only.
+            if attempt == 0:
+                logger.debug("Attempting tag recovery via ffmpeg remux for %s", path)
+                try:
+                    if _attempt_json_recovery_via_remux(path, ffprobe_executable):
+                        logger.debug("Recovery succeeded; retrying ffprobe for %s", path)
+                        continue
+                except Exception as recovery_exc:
+                    logger.debug("Tag recovery attempt failed for %s: %s", path, recovery_exc)
             continue
 
         # Success
@@ -275,39 +469,70 @@ def _ffprobe_audio_info(path: Path) -> dict[str, int | None | str] | None:
         return {"error": last_err or "ffprobe failed"}
 
     # Extract stream information
-    streams = payload.get("streams") or []
-    if not streams:
+    raw_streams = payload.get("streams") or []
+    audio_streams: list[dict[str, int | str | bool | None]] = []
+    file_extension = path.suffix.lower()
+    file_flac_block_max = None
+    if file_extension == ".flac":
+        file_flac_block_max = _read_flac_streaminfo_block_max_size(path)
+
+    for stream_pos, stream in enumerate(raw_streams):
+        codec_type = str(stream.get("codec_type", "")).strip().lower()
+        if codec_type and codec_type != "audio":
+            continue
+
+        sample_rate = _stream_with_fallback_int(stream, "sample_rate")
+        channels = _stream_with_fallback_int(stream, "channels")
+        bit_depth = _stream_bit_depth(stream)
+        codec_name = str(stream.get("codec_name", "")).strip().lower() or None
+        codec_long_name = str(stream.get("codec_long_name", "")).strip() or None
+        flac_block_max = _extract_flac_max_block_size(stream, codec_name)
+        if flac_block_max is None and file_extension == ".flac" and codec_name == "flac":
+            flac_block_max = file_flac_block_max
+
+        try:
+            duration_value = float(stream.get("duration", 0))
+            stream_duration = duration_value if duration_value > 0 else None
+        except (ValueError, TypeError):
+            stream_duration = None
+
+        stream_bitrate = _stream_with_fallback_int(stream, "bit_rate")
+
+        audio_streams.append(
+            {
+                "stream_pos": stream_pos,
+                "stream_index": _safe_int(stream.get("index")),
+                "sample_rate": sample_rate,
+                "bit_depth": bit_depth,
+                "flac_block_max": flac_block_max,
+                "codec_name": codec_name,
+                "codec_long_name": codec_long_name,
+                "channels": channels,
+                "bitrate": stream_bitrate,
+                "duration": stream_duration,
+                "is_default": _stream_disposition_default(stream),
+            }
+        )
+
+    if not audio_streams:
         return {"error": "no streams found in ffprobe output"}
 
-    stream = streams[0]
-    
-    # Extract basic audio properties
-    sample_rate = _positive_int_or_none(_safe_int(stream.get("sample_rate")))
-    channels = _positive_int_or_none(_safe_int(stream.get("channels")))
-    
-    # Bit depth extraction with fallback logic
-    bit_depth = _first_valid_int(
-        stream.get("bits_per_raw_sample"),
-        stream.get("bits_per_sample"),
-    )
-    bit_depth = _positive_int_or_none(bit_depth)
-    if bit_depth is None:
-        bit_depth = _infer_bit_depth_from_sample_fmt(stream.get("sample_fmt"))
-    
-    codec_name = str(stream.get("codec_name", "")).strip().lower() or None
-    codec_long_name = str(stream.get("codec_long_name", "")).strip() or None
-    max_block_size = _extract_flac_max_block_size(stream, codec_name)
-    if max_block_size is None and path.suffix.lower() == ".flac":
-        max_block_size = _read_flac_streaminfo_block_max_size(path)
+    selected_stream = _select_preferred_audio_stream(audio_streams, file_extension)
+    if selected_stream is None:
+        return {"error": "unable to select audio stream"}
+
+    sample_rate = selected_stream.get("sample_rate")
+    channels = selected_stream.get("channels")
+    bit_depth = selected_stream.get("bit_depth")
+    codec_name = selected_stream.get("codec_name")
+    codec_long_name = selected_stream.get("codec_long_name")
+    max_block_size = selected_stream.get("flac_block_max")
     
     # Duration and bitrate from stream first, then format
     duration = None
-    try:
-        stream_duration = float(stream.get("duration", 0))
-        if stream_duration > 0:
-            duration = stream_duration
-    except (ValueError, TypeError):
-        pass
+    stream_duration = selected_stream.get("duration")
+    if isinstance(stream_duration, (int, float)) and stream_duration > 0:
+        duration = float(stream_duration)
     
     if duration is None:
         format_info = payload.get("format") or {}
@@ -319,12 +544,9 @@ def _ffprobe_audio_info(path: Path) -> dict[str, int | None | str] | None:
             pass
     
     bit_rate = None
-    try:
-        stream_bitrate = int(stream.get("bit_rate", 0))
-        if stream_bitrate > 0:
-            bit_rate = stream_bitrate
-    except (ValueError, TypeError):
-        pass
+    stream_bitrate = selected_stream.get("bitrate")
+    if isinstance(stream_bitrate, int) and stream_bitrate > 0:
+        bit_rate = stream_bitrate
     
     if bit_rate is None:
         format_info = payload.get("format") or {}
@@ -339,7 +561,10 @@ def _ffprobe_audio_info(path: Path) -> dict[str, int | None | str] | None:
     
     # Extract tags from both stream and format level
     tags = {}
-    stream_tags = stream.get("tags") or {}
+    selected_pos = selected_stream.get("stream_pos")
+    stream_tags = {}
+    if isinstance(selected_pos, int) and 0 <= selected_pos < len(raw_streams):
+        stream_tags = raw_streams[selected_pos].get("tags") or {}
     format_tags = payload.get("format", {}).get("tags") or {}
     
     if stream_tags:
@@ -351,6 +576,7 @@ def _ffprobe_audio_info(path: Path) -> dict[str, int | None | str] | None:
         "sample_rate": sample_rate,
         "bit_depth": bit_depth,
         "flac_block_max": max_block_size,
+        "stream_index": selected_stream.get("stream_index"),
         "codec_name": codec_name,
         "codec_long_name": codec_long_name,
         "channels": channels,
@@ -358,6 +584,9 @@ def _ffprobe_audio_info(path: Path) -> dict[str, int | None | str] | None:
         "duration": duration,
         "format_long_name": format_long_name,
         "tags": tags,
+        "audio_stream_count": len(audio_streams),
+        "total_stream_count": len(raw_streams),
+        "audio_streams": audio_streams,
     }
 
 
@@ -374,6 +603,107 @@ def _map_dsd_multiple(sample_rate: int) -> int | None:
     return best[0] if best else None
 
 
+def get_all_streams(path: Path) -> list[dict[str, object]] | None:
+    """Get all streams in a media file (audio, video, subtitle, etc.) with their specifications.
+    
+    Returns a list of stream dicts, each containing:
+      - index: stream index
+      - codec_type: 'audio', 'video', 'subtitle', etc.
+      - codec_name: codec name
+      - codec_long_name: full codec description
+      - channels: channel count (audio only)
+      - sample_rate: sample rate in Hz (audio only)
+      - bit_depth: bits per sample (audio only)
+      - width, height: resolution (video only)
+      - bitrate: bitrate in bits/second
+      - duration: duration in seconds
+      - tags: metadata tags
+    """
+    logger = logging.getLogger(__name__)
+
+    ffprobe_executable = _resolve_ffprobe_executable()
+    if ffprobe_executable is None:
+        return None
+
+    cmd = [
+        ffprobe_executable,
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=index,codec_type,codec_name,codec_long_name,channels,sample_rate,bits_per_sample,"
+        "width,height,bit_rate,duration",
+        "-show_entries",
+        "stream_tags",
+        "-of",
+        "json",
+        str(path),
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+            **_subprocess_no_window_kwargs(),
+        )
+    except Exception as exc:
+        logger.debug("Failed to get all streams for %s: %s", path, exc)
+        return None
+
+    if result.returncode != 0:
+        logger.debug("ffprobe failed for %s: %s", path, result.stderr)
+        return None
+
+    try:
+        payload = json.loads(result.stdout)
+    except Exception as exc:
+        logger.debug("Failed to parse ffprobe JSON for %s: %s", path, exc)
+        return None
+
+    raw_streams = payload.get("streams") or []
+    streams_info: list[dict[str, object]] = []
+
+    for stream in raw_streams:
+        stream_index = _safe_int(stream.get("index"))
+        codec_type = str(stream.get("codec_type", "unknown")).strip().lower()
+        codec_name = str(stream.get("codec_name", "")).strip() or None
+        codec_long_name = str(stream.get("codec_long_name", "")).strip() or None
+        bitrate = _stream_with_fallback_int(stream, "bit_rate")
+        
+        try:
+            duration_value = float(stream.get("duration", 0))
+            duration = duration_value if duration_value > 0 else None
+        except (ValueError, TypeError):
+            duration = None
+
+        stream_info = {
+            "index": stream_index,
+            "codec_type": codec_type,
+            "codec_name": codec_name,
+            "codec_long_name": codec_long_name,
+            "bitrate": bitrate,
+            "duration": duration,
+            "tags": stream.get("tags") or {},
+        }
+
+        # Audio-specific fields
+        if codec_type == "audio":
+            stream_info["channels"] = _stream_with_fallback_int(stream, "channels")
+            stream_info["sample_rate"] = _stream_with_fallback_int(stream, "sample_rate")
+            stream_info["bit_depth"] = _stream_bit_depth(stream)
+
+        # Video-specific fields
+        if codec_type == "video":
+            stream_info["width"] = _safe_int(stream.get("width"))
+            stream_info["height"] = _safe_int(stream.get("height"))
+
+        streams_info.append(stream_info)
+
+    return streams_info if streams_info else None
+
+
 def _get_audio_codec(path: Path) -> str | None:
     """Extract the actual audio codec name from the file using ffprobe."""
     ffprobe_info = _ffprobe_audio_info(path)
@@ -384,7 +714,7 @@ def _get_audio_codec(path: Path) -> str | None:
     return ffprobe_info.get("codec_name")
 
 
-def _read_audio_metadata(path: Path) -> dict[str, int | None | str]:
+def _read_audio_metadata(path: Path) -> dict[str, object]:
     """Read audio metadata using ffprobe exclusively."""
     ffprobe_info = _ffprobe_audio_info(path)
     if ffprobe_info is None:
@@ -392,7 +722,12 @@ def _read_audio_metadata(path: Path) -> dict[str, int | None | str]:
             "sample_rate": None,
             "bit_depth": None,
             "flac_block_max": None,
+            "stream_index": None,
             "codec_name": None,
+            "channels": None,
+            "audio_stream_count": None,
+            "total_stream_count": None,
+            "audio_streams": [],
         }
 
     # If ffprobe reported an error, return that information for higher-level
@@ -402,15 +737,25 @@ def _read_audio_metadata(path: Path) -> dict[str, int | None | str]:
             "sample_rate": None,
             "bit_depth": None,
             "flac_block_max": None,
+            "stream_index": None,
             "codec_name": None,
+            "channels": None,
+            "audio_stream_count": None,
+            "total_stream_count": None,
             "ffprobe_error": ffprobe_info.get("error"),
+            "audio_streams": [],
         }
 
     return {
         "sample_rate": ffprobe_info.get("sample_rate"),
         "bit_depth": ffprobe_info.get("bit_depth"),
         "flac_block_max": ffprobe_info.get("flac_block_max"),
+        "stream_index": ffprobe_info.get("stream_index"),
         "codec_name": ffprobe_info.get("codec_name"),
+        "channels": ffprobe_info.get("channels"),
+        "audio_stream_count": ffprobe_info.get("audio_stream_count"),
+        "total_stream_count": ffprobe_info.get("total_stream_count"),
+        "audio_streams": ffprobe_info.get("audio_streams") or [],
     }
 
 
@@ -530,6 +875,8 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
             "block_size": block_size_text,
             "dsd_profile": dsd_profile,
             "eq_compatibility": "N/A",
+            "channels": "N/A",
+            "stream_count": "N/A",
         }
 
     if not extension:
@@ -550,6 +897,7 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         sample_rate = metadata.get("sample_rate")
         bit_depth = metadata.get("bit_depth")
         codec_name = metadata.get("codec_name")
+        audio_streams = metadata.get("audio_streams") or []
         eq_sample_rate = sample_rate
         eq_bit_depth = bit_depth
 
@@ -565,16 +913,34 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         if ffprobe_error:
             pass
         else:
-            # Validate codec matches container format
-            codec_valid, codec_error = _validate_codec_for_container(extension, codec_name)
-            if not codec_valid:
-                status = "UNSUPPORTED"
-                category = "unsupported"
-                reason = codec_error
+            # Strict mode: every audio stream in the container must match format rules.
+            if isinstance(audio_streams, list) and audio_streams:
+                invalid_reason = ""
+                for idx, stream in enumerate(audio_streams, start=1):
+                    stream_codec = stream.get("codec_name")
+                    codec_valid, codec_error = _validate_codec_for_container(extension, stream_codec)
+                    if not codec_valid:
+                        invalid_reason = f"Stream {idx}: {codec_error}"
+                        break
+                if invalid_reason:
+                    status = "UNSUPPORTED"
+                    category = "unsupported"
+                    reason = invalid_reason
+                else:
+                    status = "SUPPORTED"
+                    category = "supported"
+                    reason = "All audio streams pass lossy format checks"
             else:
-                status = "SUPPORTED"
-                category = "supported"
-                reason = "Lossy format supported"
+                # Fallback for older metadata payloads.
+                codec_valid, codec_error = _validate_codec_for_container(extension, codec_name)
+                if not codec_valid:
+                    status = "UNSUPPORTED"
+                    category = "unsupported"
+                    reason = codec_error
+                else:
+                    status = "SUPPORTED"
+                    category = "supported"
+                    reason = "Lossy format supported"
     elif extension in PCM_FORMATS:
         metadata = _read_audio_metadata(path)
         ffprobe_error = metadata.get("ffprobe_error")
@@ -582,6 +948,7 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         bit_depth = metadata.get("bit_depth")
         flac_block_max = metadata.get("flac_block_max")
         codec_name = metadata.get("codec_name")
+        audio_streams = metadata.get("audio_streams") or []
         eq_sample_rate = sample_rate
         eq_bit_depth = bit_depth
 
@@ -601,42 +968,83 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         if ffprobe_error:
             pass
         else:
-            missing_pcm_fields: list[str] = []
-            if sample_rate is None:
-                missing_pcm_fields.append("sample rate")
-            if bit_depth is None:
-                missing_pcm_fields.append("bit depth")
+            # Strict mode: every stream must satisfy PCM/FLAC limits.
+            strict_streams = audio_streams if isinstance(audio_streams, list) and audio_streams else [
+                {
+                    "sample_rate": sample_rate,
+                    "bit_depth": bit_depth,
+                    "flac_block_max": flac_block_max,
+                }
+            ]
 
-            if missing_pcm_fields:
-                status = "UNKNOWN"
-                category = "unknown"
-                reason = _short_missing_metadata_reason(missing_pcm_fields)
-            elif extension == ".flac" and flac_block_max is None:
-                status = "UNKNOWN"
-                category = "unknown"
-                reason = "Missing FLAC block size"
-            elif extension == ".flac" and flac_block_max > FLAC_BLOCK_MAX_LIMIT:
+            max_eq_sample_rate = None
+            max_eq_bit_depth = None
+            first_unknown_reason = ""
+            first_unsupported_reason = ""
+
+            for idx, stream in enumerate(strict_streams, start=1):
+                stream_sample_rate = _positive_int_or_none(_safe_int(stream.get("sample_rate")))
+                stream_bit_depth = _positive_int_or_none(_safe_int(stream.get("bit_depth")))
+                stream_flac_block_max = _positive_int_or_none(_safe_int(stream.get("flac_block_max")))
+
+                if stream_sample_rate is not None:
+                    max_eq_sample_rate = stream_sample_rate if max_eq_sample_rate is None else max(max_eq_sample_rate, stream_sample_rate)
+                if stream_bit_depth is not None:
+                    max_eq_bit_depth = stream_bit_depth if max_eq_bit_depth is None else max(max_eq_bit_depth, stream_bit_depth)
+
+                missing_pcm_fields: list[str] = []
+                if stream_sample_rate is None:
+                    missing_pcm_fields.append("sample rate")
+                if stream_bit_depth is None:
+                    missing_pcm_fields.append("bit depth")
+
+                if missing_pcm_fields:
+                    if not first_unknown_reason:
+                        first_unknown_reason = f"Stream {idx}: {_short_missing_metadata_reason(missing_pcm_fields)}"
+                    continue
+
+                if extension == ".flac" and stream_flac_block_max is None:
+                    if not first_unknown_reason:
+                        first_unknown_reason = f"Stream {idx}: Missing FLAC block size"
+                    continue
+
+                if extension == ".flac" and stream_flac_block_max > FLAC_BLOCK_MAX_LIMIT:
+                    if not first_unsupported_reason:
+                        first_unsupported_reason = (
+                            f"Stream {idx}: FLAC block size {stream_flac_block_max} exceeds limit {FLAC_BLOCK_MAX_LIMIT}"
+                        )
+                    continue
+
+                if stream_sample_rate > 192000 or stream_bit_depth > 24:
+                    reason_parts: list[str] = []
+                    if stream_sample_rate > 192000:
+                        reason_parts.append(f"sample rate {stream_sample_rate} > 192000 Hz")
+                    if stream_bit_depth > 24:
+                        reason_parts.append(f"bit depth {stream_bit_depth} > 24-bit")
+                    if not first_unsupported_reason:
+                        first_unsupported_reason = f"Stream {idx}: Exceeds PCM limits: " + ", ".join(reason_parts)
+
+            if first_unsupported_reason:
                 status = "UNSUPPORTED"
                 category = "unsupported"
-                reason = f"FLAC block size {flac_block_max} exceeds limit {FLAC_BLOCK_MAX_LIMIT}"
-            elif sample_rate > 192000 or bit_depth > 24:
-                status = "UNSUPPORTED"
-                category = "unsupported"
-                reason_parts: list[str] = []
-                if sample_rate > 192000:
-                    reason_parts.append(f"sample rate {sample_rate} > 192000 Hz")
-                if bit_depth > 24:
-                    reason_parts.append(f"bit depth {bit_depth} > 24-bit")
-                reason = "Exceeds PCM limits: " + ", ".join(reason_parts)
+                reason = first_unsupported_reason
+            elif first_unknown_reason:
+                status = "UNKNOWN"
+                category = "unknown"
+                reason = first_unknown_reason
             else:
                 status = "SUPPORTED"
                 category = "supported"
-                reason = "Within PCM limits"
+                reason = "All audio streams are within PCM limits"
+
+            eq_sample_rate = max_eq_sample_rate
+            eq_bit_depth = max_eq_bit_depth
     elif extension in DSD_FORMATS:
         metadata = _read_audio_metadata(path)
         ffprobe_error = metadata.get("ffprobe_error")
         sample_rate = metadata.get("sample_rate")
         codec_name = metadata.get("codec_name")
+        audio_streams = metadata.get("audio_streams") or []
         eq_sample_rate = sample_rate
         sample_rate_text = str(sample_rate) if sample_rate is not None else "-"
         codec_text = codec_name if codec_name else "-"
@@ -646,30 +1054,56 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
             category = "unknown"
             reason = f"ffprobe error: {ffprobe_error}"
         else:
-            if sample_rate is None:
+            strict_streams = audio_streams if isinstance(audio_streams, list) and audio_streams else [
+                {"sample_rate": sample_rate}
+            ]
+
+            first_unknown_reason = ""
+            first_unsupported_reason = ""
+            best_profile = None
+
+            for idx, stream in enumerate(strict_streams, start=1):
+                stream_sample_rate = _positive_int_or_none(_safe_int(stream.get("sample_rate")))
+                if stream_sample_rate is None:
+                    if not first_unknown_reason:
+                        first_unknown_reason = f"Stream {idx}: Missing sample rate"
+                    continue
+
+                mapped_multiple = _map_dsd_multiple(stream_sample_rate)
+                if mapped_multiple is None:
+                    if not first_unsupported_reason:
+                        first_unsupported_reason = f"Stream {idx}: Unrecognized DSD sample rate: {stream_sample_rate} Hz"
+                    continue
+
+                if best_profile is None:
+                    best_profile = mapped_multiple
+                else:
+                    best_profile = max(best_profile, mapped_multiple)
+
+                if mapped_multiple > 256:
+                    if not first_unsupported_reason:
+                        first_unsupported_reason = f"Stream {idx}: Exceeds DSD256 (detected DSD{mapped_multiple})"
+                    continue
+
+                if mapped_multiple not in SUPPORTED_DSD_MULTIPLES:
+                    if not first_unsupported_reason:
+                        first_unsupported_reason = f"Stream {idx}: Unsupported DSD profile DSD{mapped_multiple}"
+
+            if best_profile is not None:
+                dsd_profile = f"DSD{best_profile}"
+
+            if first_unsupported_reason:
+                status = "UNSUPPORTED"
+                category = "unsupported"
+                reason = first_unsupported_reason
+            elif first_unknown_reason:
                 status = "UNKNOWN"
                 category = "unknown"
-                reason = "Missing sample rate"
+                reason = first_unknown_reason
             else:
-                mapped_multiple = _map_dsd_multiple(sample_rate)
-                if mapped_multiple is None:
-                    status = "UNSUPPORTED"
-                    category = "unsupported"
-                    reason = f"Unrecognized DSD sample rate: {sample_rate} Hz"
-                else:
-                    dsd_profile = f"DSD{mapped_multiple}"
-                    if mapped_multiple > 256:
-                        status = "UNSUPPORTED"
-                        category = "unsupported"
-                        reason = f"Exceeds DSD256 (detected DSD{mapped_multiple})"
-                    elif mapped_multiple not in SUPPORTED_DSD_MULTIPLES:
-                        status = "UNSUPPORTED"
-                        category = "unsupported"
-                        reason = f"Unsupported DSD profile DSD{mapped_multiple}"
-                    else:
-                        status = "SUPPORTED"
-                        category = "supported"
-                        reason = "Supported DSD profile"
+                status = "SUPPORTED"
+                category = "supported"
+                reason = "All audio streams have supported DSD profiles"
     else:
         status = "UNSUPPORTED"
         category = "unsupported"
@@ -700,6 +1134,8 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         "block_size": block_size_text,
         "dsd_profile": dsd_profile,
         "eq_compatibility": eq_compatibility,
+        "channels": str(metadata.get("channels") or "-") if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS) else "N/A",
+        "stream_count": str(metadata.get("total_stream_count") or "-") if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS) else "N/A",
     }
 
 
@@ -770,6 +1206,8 @@ class MusicCompatibilityScanWorker(QObject):
                         result["block_size"],
                         result["dsd_profile"],
                         result["eq_compatibility"],
+                        result.get("channels", "N/A"),
+                        result.get("stream_count", "N/A"),
                         result["category"],
                     )
                 )

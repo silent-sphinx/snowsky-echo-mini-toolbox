@@ -22,11 +22,12 @@ Please help the community by submitting a bug report—your feedback helps impro
   - [Has the tool failed to fix your media?](#has-the-tool-failed-to-fix-your-media)
   - [Table of Contents](#table-of-contents)
   - [Main Features](#main-features)
-  - [Requirements](#requirements)
   - [Important Notes](#important-notes)
   - [Installation](#installation)
     - [Required Dependencies (Linux Only)](#required-dependencies-linux-only)
     - [Supported Operating Systems](#supported-operating-systems)
+      - [Notice for Windows Users](#notice-for-windows-users)
+        - [Setup Instructions](#setup-instructions)
   - [Build from source](#build-from-source)
   - [Compatibility Rules](#compatibility-rules)
   - [Contributing](#contributing)
@@ -63,18 +64,40 @@ Locate the Releases page for this project and select the correct installation fi
 ### Required Dependencies (Linux Only)
 
 ```bash
-sudo apt-get update && sudo apt-get install -y python3.12 python3.12-venv python3-pip ffmpeg libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1
+sudo apt-get update && sudo apt-get install -y ffmpeg libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1
 ```
 
 ### Supported Operating Systems
 
-Only the following operating systems have an official release, follow 'build from source' instructions for running SMTB on different system architectures.
+The following operating systems & architectures are offically supported.
 
 | Operating System | Architecture | Format |
 | ---- | ---- | ---- |
 | Windows | 64-bit | Installation (.exe) |
 | Linux   | AMD64 (64-bit) | .tar.gz & .deb |
 | MacOS | ARM64 (Apple Silicon) | .dmg |
+
+#### Notice for Windows Users
+
+Unfortunately, Windows Smart App Control blocks executables from small developers with no user override. Disabling SAC is not recommended, so whilst the `.exe` remains available, it is strongly recommended to clone the repository and run the program via Python directly.
+
+##### Setup Instructions
+
+1. Install ffmpeg via winget: `winget install -e --id Gyan.FFmpeg`
+   — or download it manually from https://github.com/BtbN/FFmpeg-Builds/releases
+2. Ensure Python 3.12 is installed
+3. Clone the repository: `git clone https://github.com/silent-sphinx/snowsky-echo-mini-toolbox.git`
+   — or download the `.zip` from the GitHub page
+4. Create a virtual environment and run the program:
+
+```bash
+py -3.12 -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+.\venv\Scripts\python main.py
+```
+
+We apologise for the inconvenience. Microsoft's increasing restrictions on unsigned executables make it genuinely difficult to distribute small community tools easily, and we're actively looking into longer-term solutions.
 
 ## Build from source
 
@@ -99,7 +122,7 @@ pip install -r requirements.txt
 Windows PowerShell:
 
 ```powershell
-py -m venv venv
+py -3.12 -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```

@@ -278,7 +278,7 @@ def write_embedded_album_art(path: Path, jpeg_data: bytes) -> tuple[bool, str]:
 
             source_frame = apic_frames[0] if apic_frames else None
             replacement = APIC(
-                encoding=int(getattr(source_frame, "encoding", 3) if source_frame is not None else 3),
+                encoding=1,
                 mime="image/jpeg",
                 type=int(getattr(source_frame, "type", 3) if source_frame is not None else 3),
                 desc=str(getattr(source_frame, "desc", "") if source_frame is not None else ""),
@@ -287,7 +287,8 @@ def write_embedded_album_art(path: Path, jpeg_data: bytes) -> tuple[bool, str]:
             try:
                 tags.delall("APIC")
                 tags.add(replacement)
-                audio.save()
+                save_kwargs = {"v2_version": 3} if path.suffix.lower() == ".mp3" else {}
+                audio.save(**save_kwargs)
                 return True, "Added ID3 artwork" if not apic_frames else "Updated ID3 artwork"
             except Exception as exc:
                 return False, f"Failed to write ID3 artwork: {exc}"
