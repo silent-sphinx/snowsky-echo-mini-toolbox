@@ -17,7 +17,7 @@ import traceback
 import logging
 import tempfile
 
-from PySide6.QtCore import QDir, QModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot, QTimer, QSettings
+from PySide6.QtCore import QDir, QModelIndex, QPersistentModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot, QTimer, QSettings
 from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPen, QPixmap, QRegion, QClipboard
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -197,6 +197,21 @@ class FileBrowserProxyModel(QSortFilterProxyModel):
         self._directory_sizes_enabled = False
         self._checked_paths: set[str] = set()
         self._show_music_only = False
+        self._batch_update = False
+
+    def begin_batch_update(self):
+        self._batch_update = True
+
+    def end_batch_update(self):
+        self._batch_update = False
+        if self.rowCount() > 0:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(self.rowCount() - 1, self.columnCount() - 1),
+                [Qt.CheckStateRole]
+            )
+        self.selection_changed.emit(self._selected_files_count())
+        self.invalidate()
 
     def clear_checked_paths(self) -> None:
         self._checked_paths.clear()
@@ -352,39 +367,21 @@ class FileBrowserProxyModel(QSortFilterProxyModel):
                 # walking the source tree so folder selection covers contents
                 # even if nodes are collapsed or filtered in the view.
                 for root, dir_names, file_names in os.walk(path):
-                    for dir_name in dir_names:
-                        candidate = str(Path(root) / dir_name)
-                        if Path(candidate).name.startswith("._"):
-                            continue
-                        try:
-                            src_idx = source_model.index(candidate)
-                        except Exception:
-                            src_idx = QModelIndex()
-                        if not src_idx.isValid():
-                            continue
-                        affected_paths.add(candidate)
-
-                    for file_name in file_names:
-                        candidate = str(Path(root) / file_name)
-                        if Path(candidate).name.startswith("._"):
-                            continue
-                        try:
-                            src_idx = source_model.index(candidate)
-                        except Exception:
-                            src_idx = QModelIndex()
-                        if not src_idx.isValid():
-                            continue
-                        affected_paths.add(candidate)
+                    for name in dir_names + file_names:
+                        candidate = str(Path(root) / name)
+                        if not Path(candidate).name.startswith("._"):
+                            affected_paths.add(candidate)
 
             if checked:
                 self._checked_paths.update(affected_paths)
             else:
                 self._checked_paths.difference_update(affected_paths)
 
-            self.dataChanged.emit(index, index, [Qt.CheckStateRole])
-            # Emit only the number of selected files (exclude directories)
-            self.selection_changed.emit(self._selected_files_count())
-            self.invalidate()
+            if not getattr(self, "_batch_update", False):
+                self.dataChanged.emit(index, index, [Qt.CheckStateRole])
+                # Emit only the number of selected files (exclude directories)
+                self.selection_changed.emit(self._selected_files_count())
+                self.invalidate()
             return True
 
         return super().setData(index, value, role)
@@ -561,36 +558,80 @@ class BrowserCheckDelegate(QStyledItemDelegate):
 class BrowserTreeView(QTreeView):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._check_anchor_index = QModelIndex()
+        self._check_anchor_path = ""
 
-    def _toggle_index_range(self, start_index, end_index, check_state) -> None:
+    def _index_path(self, index) -> str:
+        try:
+            model = self.model()
+            src_idx = model.mapToSource(index)
+            return model.sourceModel().filePath(src_idx)
+        except Exception:
+            return ""
+
+    def _toggle_index_range(self, start_path: str, end_index, check_state) -> None:
         model = self.model()
         if model is None:
             return
 
-        current_index = start_index
-        safety_limit = 0
-        while current_index.isValid() and safety_limit < 10000:
-            model.setData(current_index, check_state, Qt.CheckStateRole)
-            if current_index == end_index:
-                return
-            next_index = self.indexBelow(current_index)
-            if not next_index.isValid() or next_index == current_index:
-                break
-            current_index = next_index
-            safety_limit += 1
+        end_path = self._index_path(end_index)
+        if not start_path or not end_path:
+            return
 
-        current_index = end_index
-        safety_limit = 0
-        while current_index.isValid() and safety_limit < 10000:
-            model.setData(current_index, check_state, Qt.CheckStateRole)
-            if current_index == start_index:
-                return
-            next_index = self.indexBelow(current_index)
-            if not next_index.isValid() or next_index == current_index:
+        # Look UP to find start_path
+        first = None
+        last = None
+        
+        current = end_index
+        limit = 0
+        found_above = False
+        while current.isValid() and limit < 1000000:
+            if self._index_path(current) == start_path:
+                found_above = True
+                first = current
+                last = end_index
                 break
-            current_index = next_index
-            safety_limit += 1
+            current = self.indexAbove(current)
+            limit += 1
+            
+        if not found_above:
+            # Look DOWN to find start_path
+            current = end_index
+            limit = 0
+            found_below = False
+            while current.isValid() and limit < 1000000:
+                if self._index_path(current) == start_path:
+                    found_below = True
+                    first = end_index
+                    last = current
+                    break
+                current = self.indexBelow(current)
+                limit += 1
+                
+            if not found_below:
+                # anchor is not visible, fallback to single item
+                first = end_index
+                last = end_index
+
+        last_path = self._index_path(last)
+
+        if hasattr(model, "begin_batch_update"):
+            model.begin_batch_update()
+
+        try:
+            current_index = first
+            safety_limit = 0
+            while current_index.isValid() and safety_limit < 1000000:
+                model.setData(current_index, check_state, Qt.CheckStateRole)
+                if self._index_path(current_index) == last_path:
+                    break
+                next_index = self.indexBelow(current_index)
+                if not next_index.isValid() or next_index == current_index:
+                    break
+                current_index = next_index
+                safety_limit += 1
+        finally:
+            if hasattr(model, "end_batch_update"):
+                model.end_batch_update()
 
     def mouseReleaseEvent(self, event):
         index = self.indexAt(event.pos())
@@ -608,11 +649,15 @@ class BrowserTreeView(QTreeView):
             if box_rect.contains(event.pos()) and (index.flags() & Qt.ItemIsUserCheckable):
                 current_state = index.data(Qt.CheckStateRole)
                 next_state = Qt.Unchecked if current_state == Qt.Checked else Qt.Checked
-                if event.modifiers() & Qt.ShiftModifier and self._check_anchor_index.isValid():
-                    self._toggle_index_range(self._check_anchor_index, index, next_state)
+                
+                clicked_path = self._index_path(index)
+                
+                if event.modifiers() & Qt.ShiftModifier and getattr(self, "_check_anchor_path", ""):
+                    self._toggle_index_range(self._check_anchor_path, index, next_state)
                 else:
                     self.model().setData(index, next_state, Qt.CheckStateRole)
-                self._check_anchor_index = index
+                
+                self._check_anchor_path = clicked_path
                 event.accept()
                 return
 
