@@ -325,11 +325,27 @@ def iter_audio_files(target_path: Path):
 def album_art_scan_result(
     file_path: Path,
     target_path: Path,
-) -> tuple[tuple[str, str, str, str, str], str]:
+) -> tuple[tuple[str, str, str, str, str, str], str]:
     try:
         relative_path = file_path.relative_to(target_path).as_posix()
     except ValueError:
         relative_path = str(file_path)
+
+    metadata_status = ""
+    if mutagen is not None:
+        try:
+            audio = mutagen.File(file_path, easy=True)
+            if audio:
+                artist = audio.get("artist", [""])[0]
+                album = audio.get("album", [""])[0]
+                if not artist and not album:
+                    metadata_status = "Missing Artist/Album"
+                elif not artist:
+                    metadata_status = "Missing Artist"
+                elif not album:
+                    metadata_status = "Missing Album"
+        except Exception:
+            metadata_status = "Tag Read Error"
 
     try:
         art_bytes, art_mime = read_embedded_album_art(file_path)
@@ -341,25 +357,26 @@ def album_art_scan_result(
         return (
             relative_path,
             "Missing Artwork",
-            "N/A",
-            "Missing Artwork",
-            "N/A",
+            "",
+            "",
+            "",
+            metadata_status,
         ), "missing"
 
     if art_mime.lower() != "image/jpeg":
         dims = image_size_from_bytes(art_bytes)
-        resolution = f"{dims[0]} x {dims[1]}" if dims else "Unknown"
+        resolution = f"{dims[0]} x {dims[1]}" if dims else ""
         file_type = art_mime.split("/")[-1].upper() if "/" in art_mime else art_mime.upper()
-        return (relative_path, "Incompatible", "False", file_type, resolution), "incompatible"
+        return (relative_path, "Incompatible", "False", file_type, resolution, metadata_status), "incompatible"
 
     jpeg_type = jpeg_scan_type(art_bytes)
     dims = image_size_from_bytes(art_bytes)
-    resolution = f"{dims[0]} x {dims[1]}" if dims else "Unknown"
+    resolution = f"{dims[0]} x {dims[1]}" if dims else ""
     progressive = "True" if jpeg_type == "Progressive" else "False"
     is_compatible = jpeg_type == "Non-progressive"
     status = "Compatible" if is_compatible else "Incompatible"
     classification = "compatible" if is_compatible else "incompatible"
-    return (relative_path, status, progressive, "JPEG", resolution), classification
+    return (relative_path, status, progressive, "JPEG", resolution, metadata_status), classification
 
 
 class AlbumArtScanWorker(QObject):
@@ -376,7 +393,7 @@ class AlbumArtScanWorker(QObject):
         try:
             audio_files = list(iter_audio_files(self.target_path))
             total_audio = len(audio_files)
-            rows: list[tuple[str, str, str, str, str]] = []
+            rows: list[tuple[str, str, str, str, str, str]] = []
             compatible = 0
             incompatible = 0
             missing_artwork = 0
