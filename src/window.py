@@ -54,6 +54,8 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
+    QStackedWidget,
+    QFrame,
 )
 from PySide6.QtWidgets import QStyle
 from PySide6.QtCore import QEvent
@@ -67,6 +69,7 @@ from .album_art import (
     to_non_progressive_jpeg,
     write_embedded_album_art,
 )
+from .album_art_download import AlbumArtDownloadFetchWorker, AlbumArtDownloadDialog
 from .constants import ALBUM_ART_CACHE_LIMIT, APP_VERSION, AUDIO_FILE_EXTENSIONS
 from .music_compatibility import (
     KNOWN_AUDIO_FORMATS,
@@ -662,6 +665,79 @@ class BrowserTreeView(QTreeView):
                 return
 
         super().mouseReleaseEvent(event)
+
+
+class AlbumArtCheckDelegate(QStyledItemDelegate):
+    def __init__(self, table_widget: QTableWidget):
+        super().__init__(table_widget)
+        self.table = table_widget
+        self._check_anchor_row = -1
+
+    def paint(self, painter, option, index):
+        if not (index.flags() & Qt.ItemIsUserCheckable):
+            super().paint(painter, option, index)
+            return
+
+        check_state = index.data(Qt.CheckStateRole)
+        if check_state not in (Qt.Checked, Qt.PartiallyChecked, Qt.Unchecked):
+            check_state = Qt.Unchecked
+
+        painter.save()
+        style_option = QStyleOptionViewItem(option)
+        self.initStyleOption(style_option, index)
+        style_option.features &= ~QStyleOptionViewItem.HasCheckIndicator
+        style_option.checkState = Qt.Unchecked
+        style_option.icon = QIcon()
+        style_option.text = ""
+
+        widget = option.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawPrimitive(QStyle.PE_PanelItemViewItem, style_option, painter, widget)
+
+        box_size = min(14, max(12, option.rect.height() - 6))
+        box_x = option.rect.left() + (option.rect.width() - box_size) // 2
+        box_y = option.rect.top() + max(0, (option.rect.height() - box_size) // 2)
+        
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        box_rect = option.rect.adjusted(0, 0, 0, 0)
+        box_rect.setRect(box_x, box_y, box_size, box_size)
+        
+        painter.setPen(QPen(QColor("#FFFFFF"), 1))
+        painter.setBrush(QColor("#FFFFFF") if check_state == Qt.Checked else QColor("#1F1F1F"))
+        painter.drawRect(box_rect.adjusted(0, 0, -1, -1))
+        
+        if check_state == Qt.Checked:
+            painter.setPen(QPen(QColor("#1F1F1F"), 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            start_x = box_rect.left() + box_rect.width() * 0.20
+            start_y = box_rect.top() + box_rect.height() * 0.54
+            mid_x = box_rect.left() + box_rect.width() * 0.42
+            mid_y = box_rect.bottom() - box_rect.height() * 0.22
+            end_x = box_rect.right() - box_rect.width() * 0.16
+            end_y = box_rect.top() + box_rect.height() * 0.24
+            painter.drawLine(int(start_x), int(start_y), int(mid_x), int(mid_y))
+            painter.drawLine(int(mid_x), int(mid_y), int(end_x), int(end_y))
+            
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index):
+        if event.type() == QEvent.MouseButtonRelease:
+            if index.flags() & Qt.ItemIsUserCheckable:
+                current_state = index.data(Qt.CheckStateRole)
+                next_state = Qt.Unchecked if current_state == Qt.Checked else Qt.Checked
+                
+                modifiers = QApplication.keyboardModifiers()
+                if modifiers & Qt.ShiftModifier and self._check_anchor_row != -1:
+                    start_row = self._check_anchor_row
+                    end_row = index.row()
+                    step = 1 if start_row <= end_row else -1
+                    for r in range(start_row, end_row + step, step):
+                        model.setData(model.index(r, 0), next_state, Qt.CheckStateRole)
+                else:
+                    model.setData(index, next_state, Qt.CheckStateRole)
+                    
+                self._check_anchor_row = index.row()
+                return True
+        return super().editorEvent(event, model, option, index)
 
 
 class DirectorySizeScanWorker(QObject):
@@ -1965,38 +2041,111 @@ class ToolboxWindow(QMainWindow):
         album_art_layout.setSpacing(10)
 
         album_art_controls = QHBoxLayout()
-        self.album_art_scan_btn = QPushButton("Scan Album Art Compatibility")
-        self.album_art_scan_btn.clicked.connect(self.scan_album_art_compatibility)
-        self.album_art_fix_btn = QPushButton("Fix Incompatible Files")
+        
+        self.album_art_search_input = QLineEdit()
+        self.album_art_search_input.setPlaceholderText(
+            "Search album art results (file, status, file type, resolution...)"
+        )
+        self.album_art_search_input.setClearButtonEnabled(True)
+        self.album_art_search_input.textChanged.connect(
+            self._apply_album_art_table_filter
+        )
+        album_art_controls.addWidget(self.album_art_search_input, 1)
+
+        self.album_art_refresh_btn = QPushButton("Refresh")
+        self.album_art_refresh_btn.setToolTip("Re-scan album art compatibility")
+        self.album_art_refresh_btn.clicked.connect(self.scan_album_art_compatibility)
+        album_art_controls.addWidget(self.album_art_refresh_btn)
+
+        self.album_art_fix_btn = QPushButton("Convert Embedded Artwork")
         self.album_art_fix_btn.setEnabled(False)
         self.album_art_fix_btn.clicked.connect(self.fix_incompatible_files)
-        album_art_controls.addWidget(self.album_art_scan_btn)
         album_art_controls.addWidget(self.album_art_fix_btn)
+
+        self.album_art_download_btn = QPushButton("Download Album Art")
+        self.album_art_download_btn.setEnabled(False)
+        self.album_art_download_btn.clicked.connect(self.download_album_art)
+        album_art_controls.addWidget(self.album_art_download_btn)
+
         album_art_controls.addStretch(1)
 
-        self.album_art_summary_label = QLabel("No scan run yet.")
-        self.album_art_summary_label.setObjectName("targetSummary")
+        self.album_art_stats_container = QWidget()
+        stats_layout = QHBoxLayout(self.album_art_stats_container)
+        stats_layout.setContentsMargins(0, 0, 0, 0)
+        stats_layout.setSpacing(10)
+
+        def create_stat_box(title):
+            box = QFrame()
+            box.setObjectName("statBox")
+            box_layout = QVBoxLayout(box)
+            box_layout.setContentsMargins(10, 10, 10, 10)
+            box_layout.setSpacing(2)
+            
+            title_lbl = QLabel(title)
+            title_lbl.setObjectName("statTitle")
+            title_lbl.setAlignment(Qt.AlignCenter)
+            
+            val_lbl = QLabel("-")
+            val_lbl.setObjectName("statValue")
+            val_lbl.setAlignment(Qt.AlignCenter)
+            
+            box_layout.addWidget(title_lbl)
+            box_layout.addWidget(val_lbl)
+            return box, val_lbl
+
+        self.stat_scanned_box, self.stat_scanned_lbl = create_stat_box("Scanned Files")
+        self.stat_compat_box, self.stat_compat_lbl = create_stat_box("Compatible")
+        self.stat_incompat_box, self.stat_incompat_lbl = create_stat_box("Incompatible")
+        self.stat_missing_box, self.stat_missing_lbl = create_stat_box("Missing Artwork")
+
+        stats_layout.addWidget(self.stat_scanned_box)
+        stats_layout.addWidget(self.stat_compat_box)
+        stats_layout.addWidget(self.stat_incompat_box)
+        stats_layout.addWidget(self.stat_missing_box)
+
+        self.album_art_stack = QStackedWidget()
+        self.album_art_progress_page = QWidget()
+        progress_layout = QVBoxLayout(self.album_art_progress_page)
+        progress_layout.addStretch(1)
 
         self.album_art_progress = QProgressBar()
         self.album_art_progress.setRange(0, 1)
         self.album_art_progress.setValue(0)
         self.album_art_progress.setFormat("Idle")
         self.album_art_progress.setTextVisible(True)
+        self.album_art_progress.setMinimumHeight(30) # Make it a bit thicker
 
-        self.album_art_table = QTableWidget(0, 5)
+        progress_layout.addWidget(self.album_art_progress)
+        progress_layout.addStretch(1)
+
+        self.album_art_table = QTableWidget(0, 8)
         self.album_art_table.setHorizontalHeaderLabels(
-            ["File", "Status", "Progressive", "File Type", "Resolution"]
+            ["", "File", "Status", "Progressive", "File Type", "Resolution", "Metadata Status", "Search Term (For Downloads)"]
         )
         self.album_art_table.verticalHeader().setVisible(False)
-        self._configure_resizable_table_columns(self.album_art_table, [420, 140, 120, 120, 140])
+        self.album_art_table.setItemDelegateForColumn(0, AlbumArtCheckDelegate(self.album_art_table))
+        self._configure_resizable_table_columns(self.album_art_table, [40, 220, 120, 110, 110, 110, 160, 200])
+        self.album_art_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
         self.album_art_table.setAlternatingRowColors(True)
         self.album_art_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.album_art_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.album_art_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
+        self.album_art_table.horizontalHeader().setSectionsClickable(True)
+        self.album_art_table.horizontalHeader().sectionClicked.connect(self._sort_album_art_table)
 
-        album_art_layout.addLayout(album_art_controls)
-        album_art_layout.addWidget(self.album_art_summary_label)
-        album_art_layout.addWidget(self.album_art_progress)
-        album_art_layout.addWidget(self.album_art_table, 1)
+        self.album_art_results_page = QWidget()
+        results_layout = QVBoxLayout(self.album_art_results_page)
+        results_layout.setContentsMargins(0, 0, 0, 0)
+        results_layout.setSpacing(10)
+        
+        results_layout.addLayout(album_art_controls)
+        results_layout.addWidget(self.album_art_stats_container)
+        results_layout.addWidget(self.album_art_table, 1)
+
+        self.album_art_stack.addWidget(self.album_art_progress_page)
+        self.album_art_stack.addWidget(self.album_art_results_page)
+        self.album_art_stack.setCurrentIndex(0)
+
+        album_art_layout.addWidget(self.album_art_stack, 1)
 
         music_compatibility_tab = QWidget()
         music_compatibility_layout = QVBoxLayout(music_compatibility_tab)
@@ -2012,21 +2161,6 @@ class ToolboxWindow(QMainWindow):
         self.music_compatibility_cancel_btn.setEnabled(False)
         self.music_compatibility_cancel_btn.clicked.connect(self.cancel_music_compatibility_scan)
         music_compatibility_controls.addWidget(self.music_compatibility_cancel_btn)
-
-        self.music_compatibility_quick_filter_combo = QComboBox()
-        self.music_compatibility_quick_filter_combo.addItem("All", "all")
-        self.music_compatibility_quick_filter_combo.addItem("Unsupported", "unsupported")
-        self.music_compatibility_quick_filter_combo.addItem("Unknown", "unknown")
-        self.music_compatibility_quick_filter_combo.addItem("Supported", "supported")
-        self.music_compatibility_quick_filter_combo.addItem("Skipped", "skipped")
-        self.music_compatibility_quick_filter_combo.addItem("EQ Not Compatible", "eq_not_compatible")
-        self.music_compatibility_quick_filter_combo.addItem("Actionable For Convert", "actionable")
-        self.music_compatibility_quick_filter_combo.currentIndexChanged.connect(
-            lambda _index: self._apply_music_compatibility_table_filter(
-                self.music_compatibility_search_input.text()
-            )
-        )
-        music_compatibility_controls.addWidget(self.music_compatibility_quick_filter_combo)
 
         self.music_compatibility_search_input = QLineEdit()
         self.music_compatibility_search_input.setPlaceholderText(
@@ -2494,7 +2628,7 @@ class ToolboxWindow(QMainWindow):
 
         self._about_tab_index = self.tabs.addTab(about_tab, "About Folder/Drive")
         self._directory_tab_index = self.tabs.addTab(browser_tab, "Music Browser")
-        self.tabs.addTab(album_art_tab, "Album Art")
+        self._album_art_tab_index = self.tabs.addTab(album_art_tab, "Album Art")
         self._music_compatibility_tab_index = self.tabs.addTab(
             music_compatibility_tab, "Music Compatibility"
         )
@@ -2502,8 +2636,13 @@ class ToolboxWindow(QMainWindow):
         self._file_rename_tab_index = self.tabs.addTab(file_rename_tab, "File Rename")
         self._cleanup_tab_index = self.tabs.addTab(cleanup_tab, "File Cleanup")
         self._backup_restore_tab_index = self.tabs.addTab(backup_restore_tab, "Backup/Restore")
-        self.tabs.setTabEnabled(self._directory_tab_index, False)
+        
+        for i in range(self.tabs.count()):
+            if i != self._about_tab_index:
+                self.tabs.setTabEnabled(i, False)
+
         self.tabs.currentChanged.connect(self.on_tab_changed)
+        self._album_art_initial_scan_done = False
 
         self._build_help_pane()
         
@@ -2671,19 +2810,23 @@ class ToolboxWindow(QMainWindow):
                 "After selecting a music file, you can view its metadata and properties on the right-hand side of the screen. Any field marked with a pencil icon can be modified, and the remove button beside it will delete that metadata field."
             ),
             "Album Art": (
-                "Detect embedded artwork that may cause compatibility issues and convert it to a supported JPEG non-progressive format.\n\n"
+                "Detect embedded artwork that may cause compatibility issues, automatically fetch missing artwork from the web, and convert it all to a supported JPEG non-progressive format.\n\n"
                 "Recommended Workflow:\n"
-                "1) Click 'Scan Album Art Compatibility.'\n"
-                "2) Review the Status, Progressive, File Type, and Resolution columns.\n"
-                "3) Use 'Fix Incompatible Files' for batch repairs, or right-click individual files in the Directory Browser for targeted fixes.\n"
-                "4) Re-scan after repairs to confirm the results.\n\n"
-                "How to Interpret Results:\n"
-                "- Compatible: Artwork is already in a supported format.\n"
-                "- Incompatible: Art format or scan type requires conversion.\n"
-                "- Missing Artwork: No embedded image was found.\n\n"
+                "1) Select your target directory and navigate to the Album Art tab; a scan will run automatically.\n"
+                "2) Review the table for any Incompatible art or Missing Artwork.\n"
+                "3) For missing artwork, tick their checkboxes and hit 'Download Album Art' to fetch covers from MusicBrainz.\n"
+                "4) For incompatible artwork, tick their checkboxes and hit 'Convert Embedded Artwork'.\n"
+                "5) The table will automatically refresh after applying changes to confirm they were successful.\n\n"
+                "Batch Downloading & Metadata:\n"
+                "- Download Album Art relies on the file having correct Artist and Album tags. If these are missing, the 'Metadata Status' column will display a warning.\n"
+                "- If a file is missing tags (or has messy tags), you can manually override the search query. Double-click the 'Search Term (For Downloads)' column for that row and type your query (e.g. 'The Beatles Abbey Road').\n\n"
+                "Filtering & Selection:\n"
+                "- Use the search bar to filter results by file name, status, file type, or resolution.\n"
+                "- Click column headers to sort the table.\n"
+                "- Hold Shift and click to select a range of checkboxes quickly.\n\n"
                 "Tips:\n"
                 "- Always maintain a backup before performing large batch edits.\n"
-                "- If a file fails verification after writing, check the metadata tags and file permissions."
+                "- If a file fails verification after writing, check the file permissions."
             ),  
             "Music Compatibility": (
                 "Evaluate every music file in the target directory against Echo Mini playback rules.\n\n"
@@ -2903,6 +3046,21 @@ class ToolboxWindow(QMainWindow):
             }
             QTabBar::tab:hover {
                 background-color: #3A3A3A;
+            }
+            QFrame#statBox {
+                background-color: #2D2D2D;
+                border: 1px solid #3C3C3C;
+                border-radius: 6px;
+            }
+            QLabel#statTitle {
+                color: #A0A0A0;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QLabel#statValue {
+                color: #FFFFFF;
+                font-size: 18px;
+                font-weight: 700;
             }
             QLineEdit, QComboBox, QTableWidget, QPlainTextEdit {
                 background-color: #1F1F1F;
@@ -3305,15 +3463,15 @@ class ToolboxWindow(QMainWindow):
         event.accept()
 
     def _update_directory_tab_access(self) -> None:
-        if self._directory_tab_index < 0:
-            return
-
         has_selected_drive = self._selected_drive_path() is not None
         has_selected_directory = self._selected_target_directory_path() is not None
         has_browser_target = has_selected_drive or has_selected_directory
-        self.tabs.setTabEnabled(self._directory_tab_index, has_browser_target)
+        
+        for i in range(self.tabs.count()):
+            if i != self._about_tab_index:
+                self.tabs.setTabEnabled(i, has_browser_target)
 
-        if not has_browser_target and self.tabs.currentIndex() == self._directory_tab_index:
+        if not has_browser_target and self.tabs.currentIndex() != self._about_tab_index:
             if self._about_tab_index >= 0:
                 self.tabs.setCurrentIndex(self._about_tab_index)
 
@@ -4533,7 +4691,6 @@ class ToolboxWindow(QMainWindow):
             self._set_album_art_tab(None, "")
             self._set_embedded_lyrics_text("Select an audio file to view embedded lyrics.", "")
             self._show_audio_details_panel()
-            self._reset_album_art_results()
             return
 
         resolved = str(Path(target).expanduser().resolve())
@@ -4550,7 +4707,6 @@ class ToolboxWindow(QMainWindow):
         self._set_album_art_tab(None, "")
         self._set_embedded_lyrics_text("Select an audio file to view embedded lyrics.", "")
         self._show_audio_details_panel()
-        self._reset_album_art_results()
 
         if self._directory_scan_armed and self.tabs.currentIndex() == self._directory_tab_index:
             self._start_directory_size_scan(resolved)
@@ -4558,6 +4714,12 @@ class ToolboxWindow(QMainWindow):
     @Slot(int)
     def on_tab_changed(self, index: int) -> None:
         self._update_help_for_tab(index)
+        
+        if index == self._album_art_tab_index and not self._album_art_initial_scan_done:
+            self._album_art_initial_scan_done = True
+            target = self.path_input.text().strip()
+            if target:
+                self.scan_album_art_compatibility()
 
         if index != self._directory_tab_index:
             return
@@ -4886,13 +5048,47 @@ class ToolboxWindow(QMainWindow):
             return self.browser_proxy_model.mapToSource(index)
         return index
 
+    def _sort_album_art_table(self, logical_index: int) -> None:
+        if logical_index == 0:
+            return # Don't sort the checkbox column
+            
+        header = self.album_art_table.horizontalHeader()
+        order = header.sortIndicatorOrder()
+        self.album_art_table.setSortingEnabled(True)
+        self.album_art_table.sortByColumn(logical_index, order)
+        # Turn off automatic sorting so it doesn't mess with row insertions
+        self.album_art_table.setSortingEnabled(False)
+        header.setSortIndicator(logical_index, order)
+
+    def _apply_album_art_table_filter(self, query: str) -> None:
+        if not hasattr(self, "album_art_table"):
+            return
+
+        normalized_query = query.strip().lower()
+        filter_all = not normalized_query
+
+        for row in range(self.album_art_table.rowCount()):
+            text_match = filter_all
+            if not filter_all:
+                for col in range(1, self.album_art_table.columnCount()):
+                    item = self.album_art_table.item(row, col)
+                    if item and normalized_query in item.text().lower():
+                        text_match = True
+                        break
+
+            self.album_art_table.setRowHidden(row, not text_match)
+
     def _reset_album_art_results(self) -> None:
-        self.album_art_summary_label.setText("No scan run yet.")
+        self.stat_scanned_lbl.setText("-")
+        self.stat_compat_lbl.setText("-")
+        self.stat_incompat_lbl.setText("-")
+        self.stat_missing_lbl.setText("-")
         self.album_art_table.setRowCount(0)
         self.album_art_progress.setRange(0, 1)
         self.album_art_progress.setValue(0)
         self.album_art_progress.setFormat("Idle")
         self.album_art_fix_btn.setEnabled(False)
+        self.album_art_download_btn.setEnabled(False)
         self._last_scan_target = None
         self._last_incompatible_files = []
 
@@ -5550,30 +5746,33 @@ class ToolboxWindow(QMainWindow):
 
         target = self.path_input.text().strip()
         if not target:
-            self.album_art_summary_label.setText("Choose a global target before scanning.")
             self.album_art_table.setRowCount(0)
             self.album_art_progress.setRange(0, 1)
             self.album_art_progress.setValue(0)
             self.album_art_progress.setFormat("Idle")
+            self.album_art_stack.setCurrentIndex(0)
             return
 
         target_path = Path(target).expanduser()
         if not target_path.exists() or not target_path.is_dir():
-            self.album_art_summary_label.setText("Global target path is invalid.")
             self.album_art_table.setRowCount(0)
             self.album_art_progress.setRange(0, 1)
             self.album_art_progress.setValue(0)
             self.album_art_progress.setFormat("Idle")
+            self.album_art_stack.setCurrentIndex(0)
             return
 
         self._last_scan_target = str(target_path.resolve())
         self._last_incompatible_files = []
         self.album_art_table.setRowCount(0)
-        self.album_art_summary_label.setText("Preparing scan...")
+        self.stat_scanned_lbl.setText("-")
+        self.stat_compat_lbl.setText("-")
+        self.stat_incompat_lbl.setText("-")
+        self.stat_missing_lbl.setText("-")
+        self.album_art_stack.setCurrentIndex(0)
         self.album_art_progress.setRange(0, 1)
         self.album_art_progress.setValue(0)
         self.album_art_progress.setFormat("Preparing scan...")
-        self.album_art_scan_btn.setEnabled(False)
         self.album_art_fix_btn.setEnabled(False)
         self._scan_thread = QThread(self)
         self._scan_worker = AlbumArtScanWorker(target_path)
@@ -5612,48 +5811,73 @@ class ToolboxWindow(QMainWindow):
 
         if total_audio > 0:
             self.album_art_progress.setFormat(f"Scanning {scanned_audio}/{total_audio}")
-            self.album_art_summary_label.setText(
-                "Scanned audio files: "
-                f"{scanned_audio}/{total_audio} | Compatible: {compatible} | "
-                f"Incompatible: {incompatible} | Missing Artwork: {missing_artwork}"
-            )
+            self.stat_scanned_lbl.setText(f"{scanned_audio}/{total_audio}")
+            self.stat_compat_lbl.setText(str(compatible))
+            self.stat_incompat_lbl.setText(str(incompatible))
+            self.stat_missing_lbl.setText(str(missing_artwork))
         else:
             self.album_art_progress.setFormat("No audio files found")
-            self.album_art_summary_label.setText("No audio files found in target.")
 
     @Slot(list, int, int, int, int)
     def _on_album_art_scan_finished(
         self,
-        rows: list[tuple[str, str, str, str, str]],
+        rows: list[tuple[str, str, str, str, str, str]],
         scanned_audio: int,
         compatible: int,
         incompatible: int,
         missing_artwork: int,
     ) -> None:
-        self.album_art_scan_btn.setEnabled(True)
         self._last_incompatible_files = [
-            file_name for file_name, status, _progressive, _file_type, _resolution in rows if status == "Incompatible"
         ]
         self.album_art_fix_btn.setEnabled(True)
+        self.album_art_download_btn.setEnabled(True)
 
         self.album_art_table.setUpdatesEnabled(False)
+        self.album_art_table.setSortingEnabled(False)
         try:
             self.album_art_table.setRowCount(len(rows))
-            for row_index, (file_name, status, progressive, file_type, resolution) in enumerate(rows):
-                self.album_art_table.setItem(row_index, 0, QTableWidgetItem(file_name))
-                self.album_art_table.setItem(row_index, 1, QTableWidgetItem(status))
-                self.album_art_table.setItem(row_index, 2, QTableWidgetItem(progressive))
-                self.album_art_table.setItem(row_index, 3, QTableWidgetItem(file_type))
-                self.album_art_table.setItem(row_index, 4, QTableWidgetItem(resolution))
-        finally:
+            for row_index, (file_name, status, progressive, file_type, resolution, meta_status) in enumerate(rows):
+                check_item = QTableWidgetItem()
+                check_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
+                check_item.setCheckState(Qt.Checked if status == "Incompatible" else Qt.Unchecked)
+                
+                meta_item = QTableWidgetItem(meta_status)
+                if "Missing" in meta_status:
+                    meta_item.setForeground(QColor("#E57373"))
+
+                items = [
+                    check_item,
+                    QTableWidgetItem(file_name),
+                    QTableWidgetItem(status),
+                    QTableWidgetItem(progressive),
+                    QTableWidgetItem(file_type),
+                    QTableWidgetItem(resolution),
+                    meta_item,
+                    QTableWidgetItem(""),  # Search Term column
+                ]
+                
+                for col_index, item in enumerate(items):
+                    if col_index in (1, 2, 3, 4, 5, 6):
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    if status == "Incompatible":
+                        item.setBackground(QColor("#4A1010"))
+                    elif status == "Missing Artwork":
+                        item.setBackground(QColor("#6B3E00"))
+                    self.album_art_table.setItem(row_index, col_index, item)
+
             self.album_art_table.setUpdatesEnabled(True)
             self.album_art_table.viewport().update()
+        except Exception:
+            self.album_art_table.setUpdatesEnabled(True)
+
+        self.album_art_stack.setCurrentIndex(1)
+        self.statusBar().showMessage("Album art compatibility scan completed")
+        self._apply_album_art_table_filter(self.album_art_search_input.text())
 
         if scanned_audio == 0:
             self.album_art_progress.setRange(0, 1)
             self.album_art_progress.setValue(0)
             self.album_art_progress.setFormat("Complete: no audio files found")
-            self.album_art_summary_label.setText("No audio files found in target.")
         else:
             self.album_art_progress.setRange(0, scanned_audio)
             self.album_art_progress.setValue(scanned_audio)
@@ -5661,22 +5885,20 @@ class ToolboxWindow(QMainWindow):
                 f"Complete: {compatible} compatible, {incompatible} incompatible, "
                 f"{missing_artwork} missing artwork"
             )
-            self.album_art_summary_label.setText(
-                f"Scanned audio files: {scanned_audio} | Compatible: {compatible} | "
-                f"Incompatible: {incompatible} | Missing Artwork: {missing_artwork}"
-            )
-
-        self.statusBar().showMessage("Album art compatibility scan completed")
+            self.stat_scanned_lbl.setText(f"{scanned_audio}/{scanned_audio}")
+            self.stat_compat_lbl.setText(str(compatible))
+            self.stat_incompat_lbl.setText(str(incompatible))
+            self.stat_missing_lbl.setText(str(missing_artwork))
 
     @Slot(str)
     def _on_album_art_scan_failed(self, error: str) -> None:
-        self.album_art_scan_btn.setEnabled(True)
         self.album_art_fix_btn.setEnabled(False)
+        self.album_art_download_btn.setEnabled(False)
         self._last_incompatible_files = []
         self.album_art_progress.setRange(0, 1)
         self.album_art_progress.setValue(0)
         self.album_art_progress.setFormat("Scan failed")
-        self.album_art_summary_label.setText(f"Album art scan failed: {error}")
+        self.album_art_stack.setCurrentIndex(0)
         self.statusBar().showMessage("Album art compatibility scan failed")
 
     def scan_music_compatibility(self) -> None:
@@ -6400,32 +6622,9 @@ class ToolboxWindow(QMainWindow):
     @Slot(str)
     def _apply_music_compatibility_table_filter(self, query: str) -> None:
         normalized_query = query.strip().lower()
-        quick_filter = str(self.music_compatibility_quick_filter_combo.currentData() or "all")
         filter_all = not normalized_query
 
         for row in range(self.music_compatibility_table.rowCount()):
-            quick_filter_match = True
-            status_item = self.music_compatibility_table.item(row, 3)
-            eq_item = self.music_compatibility_table.item(row, 9)
-            status_text = status_item.text().strip().upper() if status_item is not None else ""
-            eq_text = eq_item.text().strip().lower() if eq_item is not None else ""
-
-            if quick_filter == "unsupported":
-                quick_filter_match = status_text == "UNSUPPORTED"
-            elif quick_filter == "unknown":
-                quick_filter_match = status_text == "UNKNOWN"
-            elif quick_filter == "supported":
-                quick_filter_match = status_text == "SUPPORTED"
-            elif quick_filter == "skipped":
-                quick_filter_match = status_text == "SKIPPED"
-            elif quick_filter == "eq_not_compatible":
-                quick_filter_match = eq_text == "not compatible"
-            elif quick_filter == "actionable":
-                quick_filter_match = status_text == "UNSUPPORTED" or eq_text in {
-                    "not compatible",
-                    "unknown",
-                }
-
             text_match = True
             if not filter_all:
                 text_match = False
@@ -6437,7 +6636,7 @@ class ToolboxWindow(QMainWindow):
                         text_match = True
                         break
 
-            self.music_compatibility_table.setRowHidden(row, not (quick_filter_match and text_match))
+            self.music_compatibility_table.setRowHidden(row, not text_match)
 
     @Slot(list, int, int, int, int, int, int)
     def _on_music_compatibility_scan_finished(
@@ -6498,6 +6697,8 @@ class ToolboxWindow(QMainWindow):
                 reason_item.setToolTip(reason)
 
                 for col, item in enumerate(items):
+                    if category == "unsupported":
+                        item.setBackground(QColor("#4A1010"))
                     self.music_compatibility_table.setItem(row_index, col, item)
 
                 if category == "supported":
@@ -7628,35 +7829,209 @@ class ToolboxWindow(QMainWindow):
 
         self.statusBar().showMessage(f"LRC conversion complete: {exported} files", 5000)
 
+    def download_album_art(self) -> None:
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            self.statusBar().showMessage("Wait for the current album art scan to complete")
+            return
+
+        target_text = self.path_input.text().strip()
+        if not target_text:
+            QMessageBox.information(self, "No Target", "Please select a target directory.")
+            return
+            
+        target_path = Path(target_text).expanduser()
+        selected_files: list[tuple[Path, str]] = []
+        for row in range(self.album_art_table.rowCount()):
+            check_state = self.album_art_table.model().data(self.album_art_table.model().index(row, 0), Qt.CheckStateRole)
+            if check_state == Qt.Checked:
+                file_name_item = self.album_art_table.item(row, 1)
+                search_term_item = self.album_art_table.item(row, 7)
+                if file_name_item:
+                    file_name = file_name_item.text()
+                    search_term = search_term_item.text().strip() if search_term_item else ""
+                    candidate = Path(file_name)
+                    if not candidate.is_absolute():
+                        candidate = target_path / file_name
+                    selected_files.append((candidate, search_term))
+
+        if not selected_files:
+            QMessageBox.information(
+                self,
+                "Nothing To Download",
+                "No files were selected.",
+            )
+            return
+
+        self._download_progress = QProgressDialog("Initializing download...", "Cancel", 0, len(selected_files), self)
+        self._download_progress.setWindowTitle("Download Album Art")
+        self._download_progress.setWindowModality(Qt.ApplicationModal)
+        self._download_progress.setMinimumDuration(0)
+        self._download_progress.setAutoClose(True)
+        self._download_progress.setValue(0)
+
+        self._download_thread = QThread()
+        self._download_worker = AlbumArtDownloadFetchWorker(selected_files)
+        self._download_worker.moveToThread(self._download_thread)
+
+        def update_progress(curr, tot, msg):
+            self._download_progress.setMaximum(tot)
+            self._download_progress.setValue(curr - 1)
+            self._download_progress.setLabelText(msg)
+
+        self._download_worker.progress.connect(update_progress)
+        self._download_worker.finished.connect(self._on_album_art_download_finished)
+        self._download_worker.failed.connect(self._on_album_art_download_failed)
+        
+        self._download_worker.finished.connect(self._download_thread.quit)
+        self._download_worker.failed.connect(self._download_thread.quit)
+        self._download_worker.finished.connect(self._download_worker.deleteLater)
+        self._download_worker.failed.connect(self._download_worker.deleteLater)
+        self._download_thread.finished.connect(self._download_thread.deleteLater)
+
+        self._download_progress.canceled.connect(self._download_thread.requestInterruption)
+
+        self._download_thread.started.connect(self._download_worker.run)
+        self._download_thread.start()
+
+    @Slot(list)
+    def _on_album_art_download_finished(self, results: list[dict]) -> None:
+        self._download_progress.setValue(self._download_progress.maximum())
+        
+        # Open verification dialog
+        dialog = AlbumArtDownloadDialog(results, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+            
+        items_to_apply = dialog.verified_items
+        if not items_to_apply:
+            return
+            
+        progress = QProgressDialog("Applying album art...", "Cancel", 0, len(items_to_apply), self)
+        progress.setWindowTitle("Apply Album Art")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setValue(0)
+
+        applied_count = 0
+        failed_count = 0
+
+        for index, item in enumerate(items_to_apply, start=1):
+            if progress.wasCanceled():
+                break
+
+            file_path = item["path"]
+            progress.setLabelText(f"Applying {index}/{len(items_to_apply)}: {file_path.name}")
+            progress.setValue(index - 1)
+            QApplication.processEvents()
+
+            image_data = item["image_data"]
+            if not image_data:
+                continue
+
+            jpeg_data = to_non_progressive_jpeg(image_data)
+            if not jpeg_data:
+                failed_count += 1
+                continue
+
+            ok, msg = write_embedded_album_art(file_path, jpeg_data)
+            if ok:
+                applied_count += 1
+            else:
+                failed_count += 1
+
+        progress.setValue(len(items_to_apply))
+        
+        QMessageBox.information(
+            self,
+            "Download Album Art Complete",
+            f"Successfully applied: {applied_count}\nFailed: {failed_count}"
+        )
+        
+        self.scan_album_art_compatibility()
+
+    @Slot(str)
+    def _on_album_art_download_failed(self, error: str) -> None:
+        self._download_progress.setValue(self._download_progress.maximum())
+        QMessageBox.critical(self, "Download Failed", f"An error occurred:\n{error}")
+
     def fix_incompatible_files(self) -> None:
         if self._scan_thread is not None and self._scan_thread.isRunning():
             self.statusBar().showMessage("Wait for the current album art scan to complete")
             return
 
-        if not self._last_scan_target:
-            QMessageBox.information(
-                self,
-                "No Completed Scan",
-                "Run Scan Album Art Compatibility first.",
-            )
+        target_text = self.path_input.text().strip()
+        if not target_text:
+            QMessageBox.information(self, "No Target", "Please select a target directory.")
             return
+            
+        target_path = Path(target_text).expanduser()
+        selected_files_info: list[tuple[Path, str]] = []
+        for row in range(self.album_art_table.rowCount()):
+            check_state = self.album_art_table.model().data(self.album_art_table.model().index(row, 0), Qt.CheckStateRole)
+            status_item = self.album_art_table.item(row, 2)
+            if check_state == Qt.Checked and status_item and status_item.text() == "Incompatible":
+                file_name_item = self.album_art_table.item(row, 1)
+                if file_name_item:
+                    file_name = file_name_item.text()
+                    candidate = Path(file_name)
+                    if not candidate.is_absolute():
+                        candidate = target_path / file_name
+                    selected_files_info.append((candidate, file_name))
 
-        if not self._last_incompatible_files:
+        if not selected_files_info:
             QMessageBox.information(
                 self,
                 "Nothing To Fix",
-                "No incompatible files were found in the last completed scan.",
+                "No 'Incompatible' files were selected for conversion.",
             )
             return
 
-        target_path = Path(self._last_scan_target)
-        files_to_fix: list[Path] = []
-        for file_name in self._last_incompatible_files:
-            candidate = Path(file_name)
-            if not candidate.is_absolute():
-                candidate = target_path / file_name
-            files_to_fix.append(candidate)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Confirm Conversion")
+        dialog.setMinimumSize(600, 400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        warning_lbl = QLabel(
+            "You are about to modify the embedded artwork for the following files.\n"
+            "This process rewrites the file and may cause irreversible data corruption if interrupted.\n"
+            "Are you sure you want to proceed?"
+        )
+        warning_lbl.setWordWrap(True)
+        warning_lbl.setStyleSheet("color: #FF5555; font-weight: bold;")
+        layout.addWidget(warning_lbl)
+        
+        table = QTableWidget(len(selected_files_info), 1)
+        table.setHorizontalHeaderLabels(["Selected File"])
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.NoSelection)
+        table.verticalHeader().setVisible(False)
+        
+        for i, (_, file_name) in enumerate(selected_files_info):
+            table.setItem(i, 0, QTableWidgetItem(file_name))
+            
+        layout.addWidget(table)
+        
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+        
+        confirm_btn = QPushButton("Proceed with Conversion")
+        confirm_btn.setStyleSheet("background-color: #4A1010; color: white;")
+        confirm_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(confirm_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        if dialog.exec() != QDialog.Accepted:
+            return
 
+        files_to_fix: list[Path] = [p for p, _ in selected_files_info]
         total_files = len(files_to_fix)
         progress = QProgressDialog("Fixing incompatible files...", "Cancel", 0, total_files, self)
         progress.setWindowTitle("Fix Incompatible Files")
@@ -7714,7 +8089,6 @@ class ToolboxWindow(QMainWindow):
         )
 
         # Refresh compatibility results after applying fixes.
-        self.path_input.setText(self._last_scan_target)
         self.scan_album_art_compatibility()
 
     def _insert_file_properties_section_row(self, row_index: int, title: str, section_key: str) -> None:
