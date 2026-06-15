@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from .models import DriveOption
+from .music_compatibility import _subprocess_no_window_kwargs
 
 
 logger = logging.getLogger(__name__)
@@ -140,6 +141,7 @@ def filesystem_type(path: str) -> str:
                 ["diskutil", "info", "-plist", resolved],
                 capture_output=True,
                 check=False,
+                **_subprocess_no_window_kwargs(),
             )
             if result.returncode == 0 and result.stdout:
                 data = plistlib.loads(result.stdout)
@@ -160,6 +162,7 @@ def filesystem_type(path: str) -> str:
             capture_output=True,
             text=True,
             check=False,
+            **_subprocess_no_window_kwargs(),
         )
         if result.returncode == 0:
             lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
@@ -176,6 +179,7 @@ def filesystem_type(path: str) -> str:
             capture_output=True,
             text=True,
             check=False,
+            **_subprocess_no_window_kwargs(),
         )
         if result.returncode == 0:
             fs_name = result.stdout.strip()
@@ -236,7 +240,7 @@ def attempt_unmount_mountpoint(mountpoint: str) -> tuple[bool, str]:
             # Use diskutil for macOS
             for cmd in (["diskutil", "unmount", mountpoint], ["diskutil", "unmountDisk", mountpoint]):
                 try:
-                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    result = subprocess.run(cmd, capture_output=True, text=True, **_subprocess_no_window_kwargs())
                 except Exception as exc:
                     return False, f"Failed to run diskutil: {exc}"
                 if result.returncode == 0:
@@ -250,7 +254,7 @@ def attempt_unmount_mountpoint(mountpoint: str) -> tuple[bool, str]:
             try:
                 findmnt = shutil.which("findmnt")
                 if findmnt:
-                    res = subprocess.run([findmnt, "-n", "-o", "SOURCE", "--target", mountpoint], capture_output=True, text=True)
+                    res = subprocess.run([findmnt, "-n", "-o", "SOURCE", "--target", mountpoint], capture_output=True, text=True, **_subprocess_no_window_kwargs())
                     if res.returncode == 0 and res.stdout:
                         device = res.stdout.strip()
             except Exception:
@@ -259,7 +263,7 @@ def attempt_unmount_mountpoint(mountpoint: str) -> tuple[bool, str]:
             # Prefer udisksctl if present and we discovered a device
             if device and shutil.which("udisksctl"):
                 try:
-                    res = subprocess.run(["udisksctl", "unmount", "-b", device], capture_output=True, text=True)
+                    res = subprocess.run(["udisksctl", "unmount", "-b", device], capture_output=True, text=True, **_subprocess_no_window_kwargs())
                     if res.returncode == 0:
                         return True, ""
                     # fallthrough to try umount
@@ -268,7 +272,7 @@ def attempt_unmount_mountpoint(mountpoint: str) -> tuple[bool, str]:
 
             # Fallback to system umount
             try:
-                res = subprocess.run(["umount", mountpoint], capture_output=True, text=True)
+                res = subprocess.run(["umount", mountpoint], capture_output=True, text=True, **_subprocess_no_window_kwargs())
                 if res.returncode == 0:
                     return True, ""
                 return False, (res.stderr or res.stdout or "umount returned non-zero")
@@ -289,7 +293,7 @@ def attempt_unmount_mountpoint(mountpoint: str) -> tuple[bool, str]:
                     "-Command",
                     f"(New-Object -ComObject Shell.Application).Namespace(17).ParseName('{drive_norm}').InvokeVerb('Eject')",
                 ]
-                res = subprocess.run(ps_cmd, capture_output=True, text=True, shell=False)
+                res = subprocess.run(ps_cmd, capture_output=True, text=True, shell=False, **_subprocess_no_window_kwargs())
                 if res.returncode == 0:
                     return True, ""
                 # If COM eject failed, try WMI Dismount (may require privileges)
@@ -304,7 +308,7 @@ def attempt_unmount_mountpoint(mountpoint: str) -> tuple[bool, str]:
                             " if($v) {$v.Dismount($false,$false); exit 0} else { exit 2 }"
                         ),
                     ]
-                    res2 = subprocess.run(ps_cmd2, capture_output=True, text=True, shell=False)
+                    res2 = subprocess.run(ps_cmd2, capture_output=True, text=True, shell=False, **_subprocess_no_window_kwargs())
                     if res2.returncode == 0:
                         return True, ""
                     return False, (res2.stderr or res2.stdout or "PowerShell unmount failed")
