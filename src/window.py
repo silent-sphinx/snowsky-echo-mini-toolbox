@@ -1802,6 +1802,7 @@ class ToolboxWindow(QMainWindow):
         self._lyrics_manager_tab_index = -1
         self._file_rename_tab_index = -1
         self._cleanup_tab_index = -1
+        self._metadata_manager_tab_index = -1
         self._directory_tab_index = -1
         self._backup_restore_tab_index = -1
         self._directory_scan_armed = False
@@ -2593,6 +2594,105 @@ class ToolboxWindow(QMainWindow):
         cleanup_layout.addWidget(self.cleanup_summary_label)
         cleanup_layout.addWidget(self.cleanup_table, 1)
 
+        metadata_manager_tab = QWidget()
+        metadata_manager_layout = QVBoxLayout(metadata_manager_tab)
+        metadata_manager_layout.setContentsMargins(10, 10, 10, 10)
+        metadata_manager_layout.setSpacing(10)
+
+        self.metadata_manager_chk_title = QCheckBox("Missing: Title")
+        self.metadata_manager_chk_title.setChecked(True)
+        self.metadata_manager_chk_title.stateChanged.connect(lambda: self._apply_metadata_manager_table_filter())
+        self.metadata_manager_chk_artist = QCheckBox("Missing: Artist")
+        self.metadata_manager_chk_artist.setChecked(True)
+        self.metadata_manager_chk_artist.stateChanged.connect(lambda: self._apply_metadata_manager_table_filter())
+        self.metadata_manager_chk_album = QCheckBox("Missing: Album")
+        self.metadata_manager_chk_album.setChecked(True)
+        self.metadata_manager_chk_album.stateChanged.connect(lambda: self._apply_metadata_manager_table_filter())
+
+        metadata_manager_controls = QHBoxLayout()
+        self.metadata_manager_search_input = QLineEdit()
+        self.metadata_manager_search_input.setPlaceholderText("Filter results by text...")
+        self.metadata_manager_search_input.setClearButtonEnabled(True)
+        self.metadata_manager_search_input.textChanged.connect(self._apply_metadata_manager_table_filter)
+        metadata_manager_controls.addWidget(self.metadata_manager_search_input, 1)
+
+        self.metadata_manager_scan_btn = QPushButton("Refresh")
+        self.metadata_manager_scan_btn.clicked.connect(self.scan_missing_metadata)
+        metadata_manager_controls.addWidget(self.metadata_manager_scan_btn)
+
+        metadata_manager_controls.addWidget(self.metadata_manager_chk_title)
+        metadata_manager_controls.addWidget(self.metadata_manager_chk_artist)
+        metadata_manager_controls.addWidget(self.metadata_manager_chk_album)
+
+        self.metadata_manager_stats_container = QWidget()
+        mm_stats_layout = QHBoxLayout(self.metadata_manager_stats_container)
+        mm_stats_layout.setContentsMargins(0, 0, 0, 0)
+        mm_stats_layout.setSpacing(10)
+
+        self.stat_mm_scanned_box, self.stat_mm_scanned_lbl = create_stat_box("Scanned Files")
+        self.stat_mm_missing_box, self.stat_mm_missing_lbl = create_stat_box("Missing Metadata")
+        self.stat_mm_title_box, self.stat_mm_title_lbl = create_stat_box("Missing Title")
+        self.stat_mm_artist_box, self.stat_mm_artist_lbl = create_stat_box("Missing Artist")
+        self.stat_mm_album_box, self.stat_mm_album_lbl = create_stat_box("Missing Album")
+        
+        mm_stats_layout.addWidget(self.stat_mm_scanned_box)
+        mm_stats_layout.addWidget(self.stat_mm_missing_box)
+        mm_stats_layout.addWidget(self.stat_mm_title_box)
+        mm_stats_layout.addWidget(self.stat_mm_artist_box)
+        mm_stats_layout.addWidget(self.stat_mm_album_box)
+        mm_stats_layout.addStretch(1)
+
+        self.metadata_manager_stack = QStackedWidget()
+        
+        self.metadata_manager_progress_page = QWidget()
+        mm_progress_layout = QVBoxLayout(self.metadata_manager_progress_page)
+        mm_progress_layout.addStretch(1)
+
+        self.metadata_manager_progress_label = QLabel("Idle")
+        self.metadata_manager_progress_label.setAlignment(Qt.AlignCenter)
+        self.metadata_manager_progress_label.setMinimumWidth(400)
+        mm_progress_layout.addWidget(self.metadata_manager_progress_label, alignment=Qt.AlignCenter)
+
+        self.metadata_manager_progress = QProgressBar()
+        self.metadata_manager_progress.setRange(0, 1)
+        self.metadata_manager_progress.setValue(0)
+        self.metadata_manager_progress.setFormat("Idle")
+        self.metadata_manager_progress.setTextVisible(True)
+        self.metadata_manager_progress.setMinimumHeight(30)
+        mm_progress_layout.addWidget(self.metadata_manager_progress)
+
+        self.metadata_manager_cancel_btn = QPushButton("Cancel Scan")
+        self.metadata_manager_cancel_btn.setEnabled(False)
+        self.metadata_manager_cancel_btn.clicked.connect(self.cancel_metadata_manager_scan)
+        mm_progress_layout.addWidget(self.metadata_manager_cancel_btn, alignment=Qt.AlignCenter)
+
+        mm_progress_layout.addStretch(1)
+
+        self.metadata_manager_table = QTableWidget(0, 5)
+        self.metadata_manager_table.setHorizontalHeaderLabels(
+            ["File Path", "File Name", "Title", "Artist", "Album"]
+        )
+        self.metadata_manager_table.verticalHeader().setVisible(False)
+        self._configure_resizable_table_columns(self.metadata_manager_table, [250, 250, 200, 150, 150])
+        self.metadata_manager_table.setAlternatingRowColors(True)
+        self.metadata_manager_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.metadata_manager_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
+        self.metadata_manager_table.itemChanged.connect(self._on_metadata_manager_item_changed)
+
+        self.metadata_manager_results_page = QWidget()
+        mm_results_layout = QVBoxLayout(self.metadata_manager_results_page)
+        mm_results_layout.setContentsMargins(0, 0, 0, 0)
+        mm_results_layout.setSpacing(10)
+        mm_results_layout.addLayout(metadata_manager_controls)
+        mm_results_layout.addWidget(self.metadata_manager_stats_container)
+        mm_results_layout.addWidget(self.metadata_manager_table, 1)
+
+        self.metadata_manager_stack.addWidget(self.metadata_manager_progress_page)
+        self.metadata_manager_stack.addWidget(self.metadata_manager_results_page)
+        self.metadata_manager_stack.setCurrentIndex(1)
+
+        metadata_manager_layout.addWidget(self.metadata_manager_stack, 1)
+
         backup_restore_tab = QWidget()
         backup_restore_layout = QVBoxLayout(backup_restore_tab)
         backup_restore_layout.setContentsMargins(10, 10, 10, 10)
@@ -2677,6 +2777,7 @@ class ToolboxWindow(QMainWindow):
         self._lyrics_manager_tab_index = self.tabs.addTab(lyrics_manager_tab, "Lyrics Manager")
         self._file_rename_tab_index = self.tabs.addTab(file_rename_tab, "File Rename")
         self._cleanup_tab_index = self.tabs.addTab(cleanup_tab, "File Cleanup")
+        self._metadata_manager_tab_index = self.tabs.addTab(metadata_manager_tab, "Metadata Manager")
         self._backup_restore_tab_index = self.tabs.addTab(backup_restore_tab, "Backup/Restore")
         
         for i in range(self.tabs.count()):
@@ -2686,6 +2787,7 @@ class ToolboxWindow(QMainWindow):
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self._album_art_initial_scan_done = False
         self._music_compatibility_initial_scan_done = False
+        self._metadata_manager_initial_scan_done = False
 
         self._build_help_pane()
         
@@ -2913,6 +3015,15 @@ class ToolboxWindow(QMainWindow):
                 "- Permission errors usually indicate protected files or mount constraints.\n\n"
                 "Best Practice:\n"
                 "Run cleanup in phases, validating player behavior after each stage."
+            ),
+            "Metadata Manager": (
+                "Scan audio files for missing core metadata (Title, Artist, Album) and manage them interactively.\n\n"
+                "Features:\n"
+                "1) Run 'Refresh' to discover audio files with missing tags.\n"
+                "2) Click or double-click directly into the table cells to edit metadata inline.\n"
+                "3) Use the '➔' button in the Title column to quickly copy the file name into the title field.\n"
+                "4) Use the checkboxes and text search bar to filter your view in real-time.\n"
+                "5) Edited metadata is automatically saved to the file when you press Enter or click away."
             ),
             "Backup/Restore": (
                 "Protect and migrate your library by converting your media into a ZIP file or migrating it to an alternative storage device.\n\n"
@@ -4476,6 +4587,221 @@ class ToolboxWindow(QMainWindow):
             return extension
         return "(no extension)"
 
+    def cancel_metadata_manager_scan(self) -> None:
+        self._metadata_manager_scan_cancelled = True
+        self.metadata_manager_cancel_btn.setEnabled(False)
+        self.metadata_manager_progress_label.setText("Cancelling scan...")
+
+    def scan_missing_metadata(self) -> None:
+        if mutagen is None:
+            QMessageBox.warning(
+                self,
+                "Metadata Unavailable",
+                "Mutagen is required to read track metadata.",
+            )
+            return
+
+        target = self.path_input.text().strip()
+        if not target:
+            self.metadata_manager_table.setRowCount(0)
+            self.metadata_manager_progress.setRange(0, 1)
+            self.metadata_manager_progress.setValue(0)
+            self.metadata_manager_progress.setFormat("Idle")
+            self.metadata_manager_stack.setCurrentIndex(1)
+            QMessageBox.information(
+                self,
+                "No Target",
+                "Choose a folder or drive before scanning.",
+            )
+            return
+
+        target_path = Path(target).expanduser()
+        if not target_path.exists() or not target_path.is_dir():
+            self.metadata_manager_table.setRowCount(0)
+            self.metadata_manager_progress.setRange(0, 1)
+            self.metadata_manager_progress.setValue(0)
+            self.metadata_manager_progress.setFormat("Idle")
+            self.metadata_manager_stack.setCurrentIndex(1)
+            QMessageBox.warning(
+                self,
+                "Invalid Target",
+                "The selected target path is not a valid folder.",
+            )
+            return
+
+        resolved_target = target_path.resolve()
+
+        self.metadata_manager_table.setRowCount(0)
+        self.metadata_manager_stack.setCurrentIndex(0)
+        self.metadata_manager_progress.setRange(0, 0)
+        self.metadata_manager_progress.setFormat("Discovering audio files...")
+        self.metadata_manager_cancel_btn.setEnabled(True)
+        self._metadata_manager_scan_cancelled = False
+
+        self.stat_mm_scanned_lbl.setText("-")
+        self.stat_mm_missing_lbl.setText("-")
+        self.stat_mm_title_lbl.setText("-")
+        self.stat_mm_artist_lbl.setText("-")
+        self.stat_mm_album_lbl.setText("-")
+
+        results: list[tuple[str, str, str, str, str]] = []
+        audio_files: list[Path] = []
+
+        for root_dir, _dir_names, file_names in os.walk(str(resolved_target)):
+            for file_name in file_names:
+                if file_name.startswith("."):
+                    continue
+
+                file_path = Path(root_dir) / file_name
+                if file_path.suffix.lower() not in AUDIO_FILE_EXTENSIONS:
+                    continue
+
+                audio_files.append(file_path)
+
+                if len(audio_files) % 50 == 0:
+                    self.metadata_manager_progress_label.setText(f"Discovering audio files... {len(audio_files)} found")
+                    QApplication.processEvents()
+                    if self._metadata_manager_scan_cancelled:
+                        break
+
+            if self._metadata_manager_scan_cancelled:
+                break
+
+        if self._metadata_manager_scan_cancelled:
+            self.metadata_manager_progress_label.setText("Idle")
+            self.metadata_manager_progress.setRange(0, 1)
+            self.metadata_manager_progress.setValue(0)
+            self.metadata_manager_progress.setFormat("Idle")
+            self.metadata_manager_stack.setCurrentIndex(1)
+            self.stat_mm_scanned_lbl.setText("Cancelled")
+            self.stat_mm_missing_lbl.setText("Cancelled")
+            self.stat_mm_title_lbl.setText("Cancelled")
+            self.stat_mm_artist_lbl.setText("Cancelled")
+            self.stat_mm_album_lbl.setText("Cancelled")
+            return
+
+        total_audio = len(audio_files)
+        if total_audio == 0:
+            self.metadata_manager_progress_label.setText("Idle")
+            self.metadata_manager_progress.setRange(0, 1)
+            self.metadata_manager_progress.setValue(0)
+            self.metadata_manager_progress.setFormat("Idle")
+            self.metadata_manager_stack.setCurrentIndex(1)
+            self.metadata_manager_table.setRowCount(0)
+            self.stat_mm_scanned_lbl.setText("0")
+            self.stat_mm_missing_lbl.setText("0")
+            self.stat_mm_title_lbl.setText("0")
+            self.stat_mm_artist_lbl.setText("0")
+            self.stat_mm_album_lbl.setText("0")
+            return
+
+        self.metadata_manager_progress.setRange(0, total_audio)
+        self.metadata_manager_progress.setValue(0)
+        self.metadata_manager_progress.setFormat("%v / %m")
+
+        for i, file_path in enumerate(audio_files):
+            if i % 10 == 0 or i == total_audio - 1:
+                self.metadata_manager_progress.setValue(i)
+                self.metadata_manager_progress_label.setText(f"Reading metadata for: {file_path.name}")
+                QApplication.processEvents()
+                if self._metadata_manager_scan_cancelled:
+                    break
+            
+            try:
+                audio = mutagen.File(str(file_path), easy=True)
+                if audio is not None:
+                    title = audio.get("title", [])
+                    artist = audio.get("artist", [])
+                    album = audio.get("album", [])
+
+                    title_str = title[0].strip() if title and title[0].strip() else ""
+                    artist_str = artist[0].strip() if artist and artist[0].strip() else ""
+                    album_str = album[0].strip() if album and album[0].strip() else ""
+
+                    if not title_str or not artist_str or not album_str:
+                        results.append((str(file_path.parent), file_path.name, title_str, artist_str, album_str))
+                else:
+                    results.append((str(file_path.parent), file_path.name, "", "", ""))
+            except Exception:
+                results.append((str(file_path.parent), file_path.name, "", "", ""))
+
+        if self._metadata_manager_scan_cancelled:
+            self.metadata_manager_progress_label.setText("Idle")
+            self.metadata_manager_progress.setRange(0, 1)
+            self.metadata_manager_progress.setValue(0)
+            self.metadata_manager_progress.setFormat("Idle")
+            self.metadata_manager_stack.setCurrentIndex(1)
+            self.stat_mm_scanned_lbl.setText("Cancelled")
+            self.stat_mm_missing_lbl.setText("Cancelled")
+            return
+
+        self.metadata_manager_progress_label.setText("Idle")
+        self.metadata_manager_progress.setRange(0, 1)
+        self.metadata_manager_progress.setValue(0)
+        self.metadata_manager_progress.setFormat("Idle")
+        self.metadata_manager_stack.setCurrentIndex(1)
+
+        self.metadata_manager_table.setUpdatesEnabled(False)
+        self.metadata_manager_table.blockSignals(True)
+        self.metadata_manager_table.setRowCount(len(results))
+        for row, row_data in enumerate(results):
+            for col, text in enumerate(row_data):
+                if col == 2:
+                    item = QTableWidgetItem("")
+                    item.setData(Qt.UserRole, text)
+                else:
+                    item = QTableWidgetItem(text)
+                
+                if col < 2:
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if col >= 2 and not text:
+                    item.setBackground(QColor("#7A2C2C"))
+                self.metadata_manager_table.setItem(row, col, item)
+
+                if col == 2:
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    
+                    cell_widget = QWidget()
+                    cell_widget.setStyleSheet("background: transparent;")
+                    cell_layout = QHBoxLayout(cell_widget)
+                    cell_layout.setContentsMargins(0, 0, 0, 0)
+                    cell_layout.setSpacing(6)
+                    
+                    btn = QPushButton()
+                    btn.setIcon(cell_widget.style().standardIcon(QStyle.SP_ArrowRight))
+                    btn.setFlat(True)
+                    btn.setFixedSize(24, 24)
+                    btn.setToolTip("Use file name as title")
+                    
+                    edit = QLineEdit(text)
+                    edit.setStyleSheet("border: none; background: transparent;")
+                    
+                    cell_layout.addWidget(btn)
+                    cell_layout.addWidget(edit)
+                    
+                    self.metadata_manager_table.setCellWidget(row, col, cell_widget)
+                    
+                    file_name = row_data[1]
+                    
+                    def update_item_text(*args, e=edit, it=item):
+                        if it.data(Qt.UserRole) != e.text():
+                            it.setData(Qt.UserRole, e.text())
+
+                    def copy_name(*args, e=edit, it=item, fname=file_name):
+                        stem = Path(fname).stem
+                        e.setText(stem)
+                        update_item_text(e=e, it=it)
+                        
+                    btn.clicked.connect(copy_name)
+                    edit.editingFinished.connect(update_item_text)
+        self.metadata_manager_table.blockSignals(False)
+        self.metadata_manager_table.setUpdatesEnabled(True)
+        self.metadata_manager_table.viewport().update()
+
+        self.stat_mm_scanned_lbl.setText(str(total_audio))
+        
+        self._apply_metadata_manager_table_filter()
+
     def scan_file_cleanup_breakdown(self) -> None:
         target = self.path_input.text().strip()
         if not target:
@@ -4762,6 +5088,12 @@ class ToolboxWindow(QMainWindow):
             target = self.path_input.text().strip()
             if target:
                 self.scan_music_compatibility()
+
+        if index == self._metadata_manager_tab_index and not self._metadata_manager_initial_scan_done:
+            self._metadata_manager_initial_scan_done = True
+            target = self.path_input.text().strip()
+            if target:
+                self.scan_missing_metadata()
 
         if index != self._directory_tab_index:
             return
@@ -5101,6 +5433,127 @@ class ToolboxWindow(QMainWindow):
         # Turn off automatic sorting so it doesn't mess with row insertions
         self.album_art_table.setSortingEnabled(False)
         header.setSortIndicator(logical_index, order)
+
+    def _on_metadata_manager_item_changed(self, item: QTableWidgetItem) -> None:
+        row = item.row()
+        col = item.column()
+        if col < 2:
+            return
+            
+        file_path_item = self.metadata_manager_table.item(row, 0)
+        file_name_item = self.metadata_manager_table.item(row, 1)
+        if not file_path_item or not file_name_item:
+            return
+            
+        full_path = Path(file_path_item.text()) / file_name_item.text()
+        
+        if col == 2:
+            new_val = item.data(Qt.UserRole)
+        else:
+            new_val = item.text()
+            
+        if new_val is None:
+            new_val = ""
+        else:
+            new_val = new_val.strip()
+            
+        field_map = {2: "title", 3: "artist", 4: "album"}
+        field = field_map.get(col)
+        
+        if not field:
+            return
+            
+        try:
+            audio = mutagen.File(str(full_path), easy=True)
+            if audio is not None:
+                if new_val:
+                    audio[field] = [new_val]
+                else:
+                    audio.pop(field, None)
+                audio.save()
+        except Exception as e:
+            self.statusBar().showMessage(f"Failed to update {field} for {file_name_item.text()}: {e}", 5000)
+            return
+
+        self.metadata_manager_table.blockSignals(True)
+        if not new_val:
+            item.setBackground(QColor("#7A2C2C"))
+        else:
+            item.setBackground(QBrush())
+        self.metadata_manager_table.blockSignals(False)
+
+    def _apply_metadata_manager_table_filter(self, query: str = None) -> None:
+        if not hasattr(self, "metadata_manager_table"):
+            return
+
+        if query is None or isinstance(query, bool):
+            query = self.metadata_manager_search_input.text()
+
+        normalized_query = query.strip().lower()
+        filter_text_all = not normalized_query
+
+        check_title = self.metadata_manager_chk_title.isChecked()
+        check_artist = self.metadata_manager_chk_artist.isChecked()
+        check_album = self.metadata_manager_chk_album.isChecked()
+
+        visible_count = 0
+        missing_title_count = 0
+        missing_artist_count = 0
+        missing_album_count = 0
+
+        for row in range(self.metadata_manager_table.rowCount()):
+            text_match = filter_text_all
+            if not filter_text_all:
+                for col in range(self.metadata_manager_table.columnCount()):
+                    item = self.metadata_manager_table.item(row, col)
+                    if item:
+                        val = item.data(Qt.UserRole) if col == 2 else item.text()
+                        if val is None: val = ""
+                        if normalized_query in val.lower():
+                            text_match = True
+                            break
+
+            title_item = self.metadata_manager_table.item(row, 2)
+            title_val = title_item.data(Qt.UserRole) if title_item else ""
+            if title_val is None: title_val = ""
+            title_empty = not title_val.strip()
+            
+            artist_item = self.metadata_manager_table.item(row, 3)
+            artist_empty = not artist_item.text() if artist_item else True
+            
+            album_item = self.metadata_manager_table.item(row, 4)
+            album_empty = not album_item.text() if album_item else True
+
+            checkbox_match = False
+            if check_title and title_empty:
+                checkbox_match = True
+            if check_artist and artist_empty:
+                checkbox_match = True
+            if check_album and album_empty:
+                checkbox_match = True
+
+            should_show = text_match and checkbox_match
+            self.metadata_manager_table.setRowHidden(row, not should_show)
+            if should_show:
+                visible_count += 1
+                if title_empty:
+                    missing_title_count += 1
+                if artist_empty:
+                    missing_artist_count += 1
+                if album_empty:
+                    missing_album_count += 1
+                
+        if hasattr(self, "stat_mm_missing_lbl"):
+            if self.metadata_manager_table.rowCount() == 0 and self.stat_mm_scanned_lbl.text() == "0":
+                self.stat_mm_missing_lbl.setText("0")
+                self.stat_mm_title_lbl.setText("0")
+                self.stat_mm_artist_lbl.setText("0")
+                self.stat_mm_album_lbl.setText("0")
+            elif self.stat_mm_scanned_lbl.text() not in ["-", "Cancelled"]:
+                self.stat_mm_missing_lbl.setText(str(visible_count))
+                self.stat_mm_title_lbl.setText(str(missing_title_count))
+                self.stat_mm_artist_lbl.setText(str(missing_artist_count))
+                self.stat_mm_album_lbl.setText(str(missing_album_count))
 
     def _apply_album_art_table_filter(self, query: str) -> None:
         if not hasattr(self, "album_art_table"):
