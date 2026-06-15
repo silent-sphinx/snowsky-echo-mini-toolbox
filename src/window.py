@@ -17,8 +17,8 @@ import traceback
 import logging
 import tempfile
 
-from PySide6.QtCore import QDir, QModelIndex, QPersistentModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot, QTimer, QSettings
-from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPen, QPixmap, QRegion, QClipboard
+from PySide6.QtCore import QDir, QModelIndex, QPersistentModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot, QTimer, QSettings, QAbstractTableModel
+from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPalette, QPen, QPixmap, QRegion, QClipboard
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QTabWidget,
     QTableWidget,
+    QTableView,
     QTableWidgetItem,
     QStyleOptionViewItem,
     QTreeView,
@@ -59,6 +60,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtWidgets import QStyle
 from PySide6.QtCore import QEvent
+
+from .music_compatibility_model import MusicCompatibilityTableModel
 
 from .album_art import (
     AlbumArtScanWorker,
@@ -667,10 +670,10 @@ class BrowserTreeView(QTreeView):
         super().mouseReleaseEvent(event)
 
 
-class AlbumArtCheckDelegate(QStyledItemDelegate):
-    def __init__(self, table_widget: QTableWidget):
-        super().__init__(table_widget)
-        self.table = table_widget
+class TableCheckDelegate(QStyledItemDelegate):
+    def __init__(self, table_view: QAbstractItemView):
+        super().__init__(table_view)
+        self.table = table_view
         self._check_anchor_row = -1
 
     def paint(self, painter, option, index):
@@ -2123,7 +2126,7 @@ class ToolboxWindow(QMainWindow):
             ["", "File", "Status", "Progressive", "File Type", "Resolution", "Metadata Status", "Search Term (For Downloads)"]
         )
         self.album_art_table.verticalHeader().setVisible(False)
-        self.album_art_table.setItemDelegateForColumn(0, AlbumArtCheckDelegate(self.album_art_table))
+        self.album_art_table.setItemDelegateForColumn(0, TableCheckDelegate(self.album_art_table))
         self._configure_resizable_table_columns(self.album_art_table, [40, 220, 120, 110, 110, 110, 160, 200])
         self.album_art_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
         self.album_art_table.setAlternatingRowColors(True)
@@ -2153,14 +2156,6 @@ class ToolboxWindow(QMainWindow):
         music_compatibility_layout.setSpacing(10)
 
         music_compatibility_controls = QHBoxLayout()
-        self.music_compatibility_scan_btn = QPushButton("Scan Music Compatibility")
-        self.music_compatibility_scan_btn.clicked.connect(self.scan_music_compatibility)
-        music_compatibility_controls.addWidget(self.music_compatibility_scan_btn)
-
-        self.music_compatibility_cancel_btn = QPushButton("Cancel Scan")
-        self.music_compatibility_cancel_btn.setEnabled(False)
-        self.music_compatibility_cancel_btn.clicked.connect(self.cancel_music_compatibility_scan)
-        music_compatibility_controls.addWidget(self.music_compatibility_cancel_btn)
 
         self.music_compatibility_search_input = QLineEdit()
         self.music_compatibility_search_input.setPlaceholderText(
@@ -2172,70 +2167,115 @@ class ToolboxWindow(QMainWindow):
         )
         music_compatibility_controls.addWidget(self.music_compatibility_search_input, 1)
 
+        self.music_compatibility_scan_btn = QPushButton("Refresh")
+        self.music_compatibility_scan_btn.clicked.connect(self.scan_music_compatibility)
+        music_compatibility_controls.addWidget(self.music_compatibility_scan_btn)
+
         self.music_compatibility_convert_btn = QPushButton("Convert Incompatible Music")
         self.music_compatibility_convert_btn.setEnabled(False)
         self.music_compatibility_convert_btn.clicked.connect(self.open_music_conversion_dialog)
         music_compatibility_controls.addWidget(self.music_compatibility_convert_btn)
 
-        self.music_compatibility_summary_label = QLabel("No compatibility scan run yet.")
-        self.music_compatibility_summary_label.setObjectName("targetSummary")
+        music_compatibility_controls.addStretch(1)
+
+        self.music_compatibility_stats_container = QWidget()
+        mc_stats_layout = QHBoxLayout(self.music_compatibility_stats_container)
+        mc_stats_layout.setContentsMargins(0, 0, 0, 0)
+        mc_stats_layout.setSpacing(10)
+
+        self.stat_mc_scanned_box, self.stat_mc_scanned_lbl = create_stat_box("Scanned Files")
+        self.stat_mc_supported_box, self.stat_mc_supported_lbl = create_stat_box("Supported")
+        self.stat_mc_eq_compatible_box, self.stat_mc_eq_compatible_lbl = create_stat_box("EQ Compatible")
+        self.stat_mc_unsupported_box, self.stat_mc_unsupported_lbl = create_stat_box("Unsupported")
+        self.stat_mc_unknown_box, self.stat_mc_unknown_lbl = create_stat_box("Unknown")
+        self.stat_mc_skipped_box, self.stat_mc_skipped_lbl = create_stat_box("Skipped")
+
+        mc_stats_layout.addWidget(self.stat_mc_scanned_box)
+        mc_stats_layout.addWidget(self.stat_mc_supported_box)
+        mc_stats_layout.addWidget(self.stat_mc_eq_compatible_box)
+        mc_stats_layout.addWidget(self.stat_mc_unsupported_box)
+        mc_stats_layout.addWidget(self.stat_mc_unknown_box)
+        mc_stats_layout.addWidget(self.stat_mc_skipped_box)
+
+        self.music_compatibility_stack = QStackedWidget()
+        
+        self.music_compatibility_progress_page = QWidget()
+        mc_progress_layout = QVBoxLayout(self.music_compatibility_progress_page)
+        mc_progress_layout.addStretch(1)
+
+        self.music_compatibility_progress_label = QLabel("Idle")
+        self.music_compatibility_progress_label.setAlignment(Qt.AlignCenter)
+        # Prevent the label from jumping around if the text is too long or short
+        self.music_compatibility_progress_label.setMinimumWidth(400)
+        
+        mc_progress_layout.addWidget(self.music_compatibility_progress_label, alignment=Qt.AlignCenter)
 
         self.music_compatibility_progress = QProgressBar()
         self.music_compatibility_progress.setRange(0, 1)
         self.music_compatibility_progress.setValue(0)
         self.music_compatibility_progress.setFormat("Idle")
         self.music_compatibility_progress.setTextVisible(True)
+        self.music_compatibility_progress.setMinimumHeight(30)
 
-        self.music_compatibility_table = QTableWidget(0, 12)
-        self.music_compatibility_table.setHorizontalHeaderLabels(
-            [
-                "File",
-                "Extension",
-                "Codec",
-                "Status",
-                "Reason",
-                "Sample Rate (Hz)",
-                "Bit Depth",
-                "Block Size",
-                "DSD",
-                "EQ Compatibility",
-                "Channels",
-                "Streams",
-            ]
-        )
-        eq_header_item = self.music_compatibility_table.horizontalHeaderItem(9)
-        if eq_header_item is not None:
-            eq_header_item.setToolTip(
-                "Indicates equaliser compatibility only. The file can still play, but if marked not compatible the equaliser will be disabled."
-            )
-        channels_header_item = self.music_compatibility_table.horizontalHeaderItem(10)
-        if channels_header_item is not None:
-            channels_header_item.setToolTip(
-                "Audio channel count from the selected audio stream. Multi-channel FLACs shown here."
-            )
-        streams_header_item = self.music_compatibility_table.horizontalHeaderItem(11)
-        if streams_header_item is not None:
-            streams_header_item.setToolTip(
-                "Total number of streams in the container (audio, video, artwork, etc.)."
-            )
+        mc_progress_layout.addWidget(self.music_compatibility_progress)
+
+        self.music_compatibility_cancel_btn = QPushButton("Cancel Scan")
+        self.music_compatibility_cancel_btn.setEnabled(False)
+        self.music_compatibility_cancel_btn.clicked.connect(self.cancel_music_compatibility_scan)
+        mc_progress_layout.addWidget(self.music_compatibility_cancel_btn, alignment=Qt.AlignCenter)
+
+        mc_progress_layout.addStretch(1)
+
+        self.music_compatibility_table = QTableView()
+        self.music_compatibility_table_model = MusicCompatibilityTableModel()
+        
+        self.music_compatibility_proxy_model = QSortFilterProxyModel()
+        self.music_compatibility_proxy_model.setSourceModel(self.music_compatibility_table_model)
+        self.music_compatibility_proxy_model.setFilterCaseSensitivity(Qt.CaseInsensitive)
+        # Filter all columns
+        self.music_compatibility_proxy_model.setFilterKeyColumn(-1)
+        
+        self.music_compatibility_table.setModel(self.music_compatibility_proxy_model)
+
         self.music_compatibility_table.verticalHeader().setVisible(False)
+        self.music_compatibility_table.setItemDelegateForColumn(0, TableCheckDelegate(self.music_compatibility_table))
         self._configure_resizable_table_columns(
             self.music_compatibility_table,
-            [320, 100, 90, 120, 300, 140, 90, 100, 90, 140, 90, 80],
+            [40, 320, 120, 300, 140, 90, 140, 90, 90, 100, 100, 90, 80, 160],
         )
+        self.music_compatibility_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
         self.music_compatibility_table.setAlternatingRowColors(True)
-        self.music_compatibility_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.music_compatibility_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.music_compatibility_table.setSelectionMode(QTableView.NoSelection)
+        self.music_compatibility_table.setEditTriggers(QTableView.DoubleClicked | QTableView.EditKeyPressed)
         self.music_compatibility_table.setSortingEnabled(True)
+        
+        # Prevent sorting by the checkbox column
+        self.music_compatibility_table.horizontalHeader().setSectionsClickable(True)
+        self.music_compatibility_table.horizontalHeader().sectionClicked.connect(
+            lambda col: None if col == 0 else self.music_compatibility_table.sortByColumn(col, self.music_compatibility_table.horizontalHeader().sortIndicatorOrder())
+        )
         self.music_compatibility_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.music_compatibility_table.customContextMenuRequested.connect(
             self._on_music_compatibility_table_context_menu
         )
+        self.music_compatibility_table_model.dataChanged.connect(
+            self._update_music_compatibility_convert_button_state
+        )
 
-        music_compatibility_layout.addLayout(music_compatibility_controls)
-        music_compatibility_layout.addWidget(self.music_compatibility_summary_label)
-        music_compatibility_layout.addWidget(self.music_compatibility_progress)
-        music_compatibility_layout.addWidget(self.music_compatibility_table, 1)
+        self.music_compatibility_results_page = QWidget()
+        mc_results_layout = QVBoxLayout(self.music_compatibility_results_page)
+        mc_results_layout.setContentsMargins(0, 0, 0, 0)
+        mc_results_layout.setSpacing(10)
+        
+        mc_results_layout.addLayout(music_compatibility_controls)
+        mc_results_layout.addWidget(self.music_compatibility_stats_container)
+        mc_results_layout.addWidget(self.music_compatibility_table, 1)
+
+        self.music_compatibility_stack.addWidget(self.music_compatibility_progress_page)
+        self.music_compatibility_stack.addWidget(self.music_compatibility_results_page)
+        self.music_compatibility_stack.setCurrentIndex(0)
+
+        music_compatibility_layout.addWidget(self.music_compatibility_stack, 1)
 
         lyrics_manager_tab = QWidget()
         lyrics_manager_layout = QVBoxLayout(lyrics_manager_tab)
@@ -2643,6 +2683,7 @@ class ToolboxWindow(QMainWindow):
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self._album_art_initial_scan_done = False
+        self._music_compatibility_initial_scan_done = False
 
         self._build_help_pane()
         
@@ -2831,16 +2872,9 @@ class ToolboxWindow(QMainWindow):
             "Music Compatibility": (
                 "Evaluate every music file in the target directory against Echo Mini playback rules.\n\n"
                 "It is recommended to connect your microSD card directly to your computer using a USB reader, rather than plugging in the Snowsky Echo Mini itself, as the device uses a slower interface.\n\n"
-                "Status Guidance:\n"
-                "- Supported: The file is expected to play correctly.\n"
-                "- Unsupported: The format or attributes conflict with device rules.\n"
-                "- Unknown: Metadata was incomplete or inconclusive.\n"
-                "- Skipped: The file was not recognized as a valid audio candidate.\n\n"
-                "Compatibility Rules:\n"
-                "Equalizer Compatibility:\n"
-                "For files to be compatible with the internal equalizer they will need to meet additional constraints.\n"
-                "- >=16-bit depth\n"
-                "- >=192 kHz sample rate\n"
+                "There are two forms of compatibility. Compatible with the device itself, and compatible with the device's built in Equalizer. If you do not use the Equalizer, you can ignore the EQ compatibility column. EQ compatibility will degrade the sound quality of the audio, but it is not noticable by most users. \n\n"
+                "Once the scan is completed you will be presented with compatible files.\n\n"
+                "Please select all files you wish to make compatible by using the tickbox on each row (Shift + Click to select a range) and select 'Convert Incompatible Music'."
             ),
             "Lyrics Manager": (
                 "To add lyrics to your audio files, you will need a supplementary .lrc file; the Snowsky Echo Mini does not support embedded lyric data.\n\n"
@@ -4721,6 +4755,12 @@ class ToolboxWindow(QMainWindow):
             if target:
                 self.scan_album_art_compatibility()
 
+        if index == self._music_compatibility_tab_index and not self._music_compatibility_initial_scan_done:
+            self._music_compatibility_initial_scan_done = True
+            target = self.path_input.text().strip()
+            if target:
+                self.scan_music_compatibility()
+
         if index != self._directory_tab_index:
             return
 
@@ -5911,11 +5951,11 @@ class ToolboxWindow(QMainWindow):
 
         target = self.path_input.text().strip()
         if not target:
-            self.music_compatibility_summary_label.setText("Choose a target before scanning compatibility.")
-            self.music_compatibility_table.setRowCount(0)
+            self.music_compatibility_table_model.update_data([])
             self.music_compatibility_progress.setRange(0, 1)
             self.music_compatibility_progress.setValue(0)
             self.music_compatibility_progress.setFormat("Idle")
+            self.music_compatibility_stack.setCurrentIndex(0)
             QMessageBox.information(
                 self,
                 "No Target",
@@ -5926,11 +5966,11 @@ class ToolboxWindow(QMainWindow):
 
         target_path = Path(target).expanduser()
         if not target_path.exists() or not target_path.is_dir():
-            self.music_compatibility_summary_label.setText("Target path is invalid.")
-            self.music_compatibility_table.setRowCount(0)
+            self.music_compatibility_table_model.update_data([])
             self.music_compatibility_progress.setRange(0, 1)
             self.music_compatibility_progress.setValue(0)
             self.music_compatibility_progress.setFormat("Idle")
+            self.music_compatibility_stack.setCurrentIndex(0)
             QMessageBox.warning(
                 self,
                 "Invalid Target",
@@ -5941,8 +5981,14 @@ class ToolboxWindow(QMainWindow):
 
         resolved_target = Path(target_path.resolve())
         self._music_compatibility_scan_target = resolved_target
-        self.music_compatibility_table.setRowCount(0)
-        self.music_compatibility_summary_label.setText("Preparing compatibility scan...")
+        self.music_compatibility_table_model.update_data([])
+        self.stat_mc_scanned_lbl.setText("-")
+        self.stat_mc_supported_lbl.setText("-")
+        self.stat_mc_eq_compatible_lbl.setText("-")
+        self.stat_mc_unsupported_lbl.setText("-")
+        self.stat_mc_unknown_lbl.setText("-")
+        self.stat_mc_skipped_lbl.setText("-")
+        self.music_compatibility_stack.setCurrentIndex(0)
         self.music_compatibility_progress.setRange(0, 1)
         self.music_compatibility_progress.setValue(0)
         self.music_compatibility_progress.setFormat("Preparing scan...")
@@ -5996,13 +6042,18 @@ class ToolboxWindow(QMainWindow):
             return
 
         resolved_target = target_path.resolve()
-        has_actionable_results = (
-            self._last_music_compatibility_unsupported_count > 0
-            or self._last_music_compatibility_eq_incompatible_count > 0
-        )
+        
+        has_checked_files = False
+        if self.music_compatibility_proxy_model.rowCount() > 0:
+            for row in range(self.music_compatibility_proxy_model.rowCount()):
+                check_state = self.music_compatibility_proxy_model.data(self.music_compatibility_proxy_model.index(row, 0), Qt.CheckStateRole)
+                if check_state == Qt.Checked:
+                    has_checked_files = True
+                    break
+
         self.music_compatibility_convert_btn.setEnabled(
             self._last_music_compatibility_scan_target == resolved_target
-            and has_actionable_results
+            and has_checked_files
             and not self._music_conversion_busy
         )
 
@@ -6032,21 +6083,29 @@ class ToolboxWindow(QMainWindow):
         self.music_compatibility_progress.setFormat(
             f"Scan cancelled at {scanned}/{total if total > 0 else 0}"
         )
-        self.music_compatibility_summary_label.setText(
-            f"Scan cancelled | Scanned: {scanned}/{total} | Supported: {supported} | Unsupported: {unsupported} | "
-            f"Unknown: {unknown} | Skipped: {skipped}"
-        )
+        self.stat_mc_scanned_lbl.setText(f"{scanned}/{total}")
+        self.stat_mc_supported_lbl.setText(str(supported))
+        self.stat_mc_eq_compatible_lbl.setText(str(supported - eq_incompatible))
+        self.stat_mc_unsupported_lbl.setText(str(unsupported))
+        self.stat_mc_unknown_lbl.setText(str(unknown))
+        self.stat_mc_skipped_lbl.setText(str(skipped))
+        self.music_compatibility_stack.setCurrentIndex(1)
         self.statusBar().showMessage("Music compatibility scan cancelled", 5000)
         self._update_music_compatibility_convert_button_state()
 
     def open_music_conversion_dialog(self) -> None:
-        dialog = QDialog(self)
+        if hasattr(self, "_music_conversion_dialog") and self._music_conversion_dialog.isVisible():
+            self._music_conversion_dialog.raise_()
+            self._music_conversion_dialog.activateWindow()
+            return
+
+        self._music_conversion_dialog = QDialog()
+        dialog = self._music_conversion_dialog
         dialog.setObjectName("musicConvertDialog")
         dialog.setWindowTitle("Convert Incompatible Music")
-        dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
-        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setWindowModality(Qt.ApplicationModal)
         dialog.setAttribute(Qt.WA_StyledBackground, True)
-        dialog.setMinimumWidth(560)
+        dialog.setMinimumWidth(460)
         dialog.setStyleSheet(
             """
             QDialog#musicConvertDialog {
@@ -6078,74 +6137,50 @@ class ToolboxWindow(QMainWindow):
         )
 
         layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(6)
 
         title_label = QLabel("Convert Incompatible Music")
         title_label.setObjectName("sectionLabel")
 
-        intro_label = QLabel(
-            "This tool converts your existing audio files into formats compatible with the Snowsky Echo Mini. In some cases, this process may reduce the audio quality to meet device limitations. If your original files are important, it’s recommended to back them up before proceeding."
+        # Count selected files
+        selected_count = 0
+        model = self.music_compatibility_proxy_model
+        for row in range(model.rowCount()):
+            if model.data(model.index(row, 0), Qt.CheckStateRole) == Qt.Checked:
+                selected_count += 1
+
+        summary_label = QLabel(
+            f"{selected_count} file{'s' if selected_count != 1 else ''} selected for conversion. "
+            "Files will be converted to the highest quality compatible FLAC."
         )
-        intro_label.setWordWrap(True)
+        summary_label.setWordWrap(True)
 
-        eq_checkbox = QCheckBox("Make files EQ compatible (optional)")
 
-        dry_run_checkbox = QCheckBox("Dry run only (preview changes, do not write files)")
+        eq_checkbox = QCheckBox("Also make EQ compatible")
+        eq_checkbox.setToolTip("Downsample to ≤16-bit / ≤192 kHz so the built-in equalizer works. Slightly reduces quality.")
+
         backup_checkbox = QCheckBox("Back up originals before conversion")
 
-        speed_profile_label = QLabel("Speed profile")
-        speed_profile_label.setObjectName("targetSummary")
-
-        speed_profile_combo = QComboBox()
-        speed_profile_combo.addItem("Fast (recommended)", "fast")
-        speed_profile_combo.addItem("Balanced", "balanced")
-        speed_profile_combo.addItem("Smallest files", "smallest")
-        for profile_index in range(speed_profile_combo.count()):
-            profile_key = str(speed_profile_combo.itemData(profile_index))
-            profile_title, _compression_level, profile_help_text = self._conversion_profile_config(
-                profile_key
-            )
-            speed_profile_combo.setItemData(
-                profile_index,
-                f"{profile_title}: {profile_help_text}",
-                Qt.ToolTipRole,
-            )
-        speed_profile_combo.setCurrentIndex(0)
-
-        def _update_speed_profile_tooltip() -> None:
-            selected_index = speed_profile_combo.currentIndex()
-            selected_tooltip = speed_profile_combo.itemData(selected_index, Qt.ToolTipRole)
-            speed_profile_combo.setToolTip(str(selected_tooltip or ""))
-
-        mode_label = QLabel()
-        mode_label.setWordWrap(True)
-        mode_label.setObjectName("targetSummary")
-
-        quality_warning = QLabel(
-            "Warning: Making files EQ compatible degrades audio quality further."
-        )
-        quality_warning.setWordWrap(True)
-        quality_warning.setObjectName("targetSummary")
-
-        overwrite_warning = QLabel()
-        overwrite_warning.setWordWrap(True)
-        overwrite_warning.setObjectName("targetSummary")
-
-        backup_path_label = QLabel("Backup folder")
-        backup_path_label.setObjectName("targetSummary")
-
         backup_path_input = QLineEdit()
-        backup_path_input.setPlaceholderText("Backup folder (optional unless backup is enabled)")
-        backup_path_browse_btn = QPushButton("Choose Backup Folder")
+        backup_path_input.setPlaceholderText("Choose a backup folder...")
+        backup_path_browse_btn = QPushButton("Browse")
 
         backup_path_row = QHBoxLayout()
+        backup_path_row.setContentsMargins(22, 0, 0, 0)
         backup_path_row.addWidget(backup_path_input, 1)
         backup_path_row.addWidget(backup_path_browse_btn)
 
+        backup_path_container = QWidget()
+        backup_path_container.setLayout(backup_path_row)
+        backup_path_container.setVisible(False)
+
+        dry_run_checkbox = QCheckBox("Dry run (preview only)")
+        dry_run_checkbox.setToolTip("Show what would be converted without writing any files.")
+
         def _choose_backup_folder() -> None:
             selected = QFileDialog.getExistingDirectory(
-                self,
+                dialog,
                 "Choose Backup Folder",
                 str(Path.home()),
             )
@@ -6154,11 +6189,38 @@ class ToolboxWindow(QMainWindow):
 
         backup_path_browse_btn.clicked.connect(_choose_backup_folder)
 
-        def _update_backup_controls() -> None:
-            backup_enabled = backup_checkbox.isChecked() and not dry_run_checkbox.isChecked()
-            backup_path_label.setVisible(backup_enabled)
-            backup_path_input.setVisible(backup_enabled)
-            backup_path_browse_btn.setVisible(backup_enabled)
+        def _update_backup_visibility() -> None:
+            is_dry_run = dry_run_checkbox.isChecked()
+            backup_checkbox.setEnabled(not is_dry_run)
+            font = backup_checkbox.font()
+            font.setStrikeOut(is_dry_run)
+            backup_checkbox.setFont(font)
+            backup_path_container.setVisible(
+                backup_checkbox.isChecked() and not is_dry_run
+            )
+
+        backup_checkbox.toggled.connect(lambda _: _update_backup_visibility())
+        dry_run_checkbox.toggled.connect(lambda _: _update_backup_visibility())
+
+        def _update_summary_text() -> None:
+            if eq_checkbox.isChecked():
+                summary_label.setText(
+                    f"{selected_count} file{'s' if selected_count != 1 else ''} selected for conversion. "
+                    "Files will be converted to EQ-compatible output (≤16-bit / ≤192 kHz FLAC)."
+                )
+            else:
+                summary_label.setText(
+                    f"{selected_count} file{'s' if selected_count != 1 else ''} selected for conversion. "
+                    "Files will be converted to the highest quality compatible FLAC."
+                )
+
+        eq_checkbox.toggled.connect(lambda _: _update_summary_text())
+
+        # Separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        separator.setStyleSheet("color: #3C3C3C;")
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
@@ -6167,111 +6229,62 @@ class ToolboxWindow(QMainWindow):
         button_row.addWidget(cancel_btn)
         button_row.addWidget(confirm_btn)
 
-        def _update_conversion_mode_text(eq_mode_enabled: bool) -> None:
-            if eq_mode_enabled:
-                mode_label.setText(
-                    "Highest quality supported EQ-compatible output."
-                )
-                overwrite_warning.setText(
-                    "Warning: This action will convert and overwrite files to the highest quality supported EQ-compatible output."
-                )
-                quality_warning.setVisible(True)
-            else:
-                mode_label.setText("Highest quality compatible FLAC output.")
-                overwrite_warning.setText(
-                    "Warning: This action will convert and overwrite files to the highest quality compatible FLAC."
-                )
-                quality_warning.setVisible(False)
-
-            if dry_run_checkbox.isChecked():
-                overwrite_warning.setText(
-                    "Dry run: no files will be changed. The operation will only preview what would be converted."
-                )
-
-        _update_conversion_mode_text(eq_checkbox.isChecked())
-        _update_speed_profile_tooltip()
-        _update_backup_controls()
-        eq_checkbox.toggled.connect(_update_conversion_mode_text)
-        dry_run_checkbox.toggled.connect(lambda _checked: _update_conversion_mode_text(eq_checkbox.isChecked()))
-        dry_run_checkbox.toggled.connect(lambda _checked: _update_backup_controls())
-        backup_checkbox.toggled.connect(lambda _checked: _update_backup_controls())
-        speed_profile_combo.currentIndexChanged.connect(lambda _index: _update_speed_profile_tooltip())
         cancel_btn.clicked.connect(dialog.reject)
 
         def _confirm_conversion_request() -> None:
-            selected_profile = str(speed_profile_combo.currentData())
-            profile_title, _compression_level, _profile_help_text = self._conversion_profile_config(
-                selected_profile
+            if backup_checkbox.isChecked() and not dry_run_checkbox.isChecked():
+                backup_text = backup_path_input.text().strip()
+                if not backup_text:
+                    QMessageBox.warning(
+                        dialog,
+                        "Backup Folder Required",
+                        "Choose a backup folder or disable backup before starting conversion.",
+                    )
+                    return
+
+            selected_profile = "fast"
+
+            backup_root: Path | None = None
+            if backup_checkbox.isChecked() and not dry_run_checkbox.isChecked():
+                backup_candidate = Path(backup_path_input.text().strip()).expanduser()
+                try:
+                    backup_root = backup_candidate.resolve()
+                except Exception:
+                    backup_root = backup_candidate
+
+            dialog.accept()
+            self.convert_incompatible_music(
+                eq_checkbox.isChecked(),
+                selected_profile,
+                dry_run=dry_run_checkbox.isChecked(),
+                backup_root=backup_root,
             )
-
-            if eq_checkbox.isChecked():
-                confirm_text = (
-                    "This will convert and overwrite files to the highest quality supported EQ-compatible output.\n"
-                    "Making files EQ compatible will degrade audio quality further.\n\n"
-                    f"Speed profile: {profile_title}\n\n"
-                    "Do you want to continue?"
-                )
-            else:
-                confirm_text = (
-                    "This will convert and overwrite files to the highest quality compatible FLAC.\n\n"
-                    f"Speed profile: {profile_title}\n\n"
-                    "Do you want to continue?"
-                )
-
-            confirm = QMessageBox.warning(
-                self,
-                "Confirm Conversion",
-                confirm_text,
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if confirm == QMessageBox.Yes:
-                backup_root: Path | None = None
-                if backup_checkbox.isChecked() and not dry_run_checkbox.isChecked():
-                    backup_text = backup_path_input.text().strip()
-                    if not backup_text:
-                        QMessageBox.warning(
-                            self,
-                            "Backup Folder Required",
-                            "Choose a backup folder or disable backup before starting conversion.",
-                        )
-                        return
-                    backup_candidate = Path(backup_text).expanduser()
-                    try:
-                        backup_root = backup_candidate.resolve()
-                    except Exception:
-                        backup_root = backup_candidate
-
-                dialog.accept()
-                self.convert_incompatible_music(
-                    eq_checkbox.isChecked(),
-                    selected_profile,
-                    dry_run=dry_run_checkbox.isChecked(),
-                    backup_root=backup_root,
-                )
 
         confirm_btn.clicked.connect(_confirm_conversion_request)
 
         layout.addWidget(title_label)
-        layout.addWidget(intro_label)
+        layout.addWidget(summary_label)
+        layout.addSpacing(6)
         layout.addWidget(eq_checkbox)
-        layout.addWidget(dry_run_checkbox)
         layout.addWidget(backup_checkbox)
-        layout.addWidget(backup_path_label)
-        layout.addLayout(backup_path_row)
-        layout.addWidget(speed_profile_label)
-        layout.addWidget(speed_profile_combo)
-        layout.addWidget(mode_label)
-        layout.addWidget(quality_warning)
-        layout.addWidget(overwrite_warning)
+        layout.addWidget(backup_path_container)
+        layout.addWidget(dry_run_checkbox)
         layout.addStretch(1)
+        layout.addWidget(separator)
         layout.addLayout(button_row)
 
-        fixed_size = dialog.sizeHint()
-        dialog.setFixedSize(fixed_size)
-        dialog.setMask(QRegion(dialog.rect()))
+        dialog.setFixedWidth(520)
+        dialog.setMinimumHeight(280)
 
-        dialog.exec()
+        # Center on parent window
+        parent_geo = self.frameGeometry()
+        dialog.adjustSize()
+        dialog_size = dialog.size()
+        cx = parent_geo.x() + (parent_geo.width() - dialog_size.width()) // 2
+        cy = parent_geo.y() + (parent_geo.height() - dialog_size.height()) // 2
+        dialog.move(cx, cy)
+
+        dialog.show()
 
     def _set_conversion_ui_locked(self, locked: bool) -> None:
         enabled = not locked
@@ -6311,21 +6324,22 @@ class ToolboxWindow(QMainWindow):
         include_unknown_for_eq: bool = True,
     ) -> list[dict[str, object]]:
         candidates: list[dict[str, object]] = []
-        for row in range(self.music_compatibility_table.rowCount()):
-            file_item = self.music_compatibility_table.item(row, 0)
-            status_item = self.music_compatibility_table.item(row, 3)
-            sample_rate_item = self.music_compatibility_table.item(row, 5)
-            bit_depth_item = self.music_compatibility_table.item(row, 6)
-            eq_item = self.music_compatibility_table.item(row, 9)
-
-            if file_item is None or status_item is None:
+        for row in range(self.music_compatibility_proxy_model.rowCount()):
+            check_state = self.music_compatibility_proxy_model.data(self.music_compatibility_proxy_model.index(row, 0), Qt.CheckStateRole)
+            if check_state != Qt.Checked:
                 continue
 
-            status_text = status_item.text().strip().upper()
-            eq_text = eq_item.text().strip().lower() if eq_item is not None else ""
+            file_name = self.music_compatibility_proxy_model.data(self.music_compatibility_proxy_model.index(row, 1), Qt.DisplayRole)
+            status_text = self.music_compatibility_proxy_model.data(self.music_compatibility_proxy_model.index(row, 2), Qt.DisplayRole).strip().upper()
+            sample_rate = self.music_compatibility_proxy_model.data(self.music_compatibility_proxy_model.index(row, 6), Qt.DisplayRole)
+            bit_depth = self.music_compatibility_proxy_model.data(self.music_compatibility_proxy_model.index(row, 7), Qt.DisplayRole)
+            eq_text = self.music_compatibility_proxy_model.data(self.music_compatibility_proxy_model.index(row, 4), Qt.DisplayRole).strip().lower()
 
-            should_convert = status_text == "UNSUPPORTED"
-            eq_actionable_states = {"not compatible"}
+            if not file_name or not status_text:
+                continue
+
+            should_convert = True
+            eq_actionable_states = {"not eq compatible"}
             if include_unknown_for_eq:
                 eq_actionable_states.add("unknown")
 
@@ -6337,9 +6351,9 @@ class ToolboxWindow(QMainWindow):
 
             candidates.append(
                 {
-                    "relative_file": file_item.text().strip(),
-                    "sample_rate": sample_rate_item.text().strip() if sample_rate_item else "",
-                    "bit_depth": bit_depth_item.text().strip() if bit_depth_item else "",
+                    "relative_file": file_name.strip(),
+                    "sample_rate": sample_rate.strip() if sample_rate else "",
+                    "bit_depth": bit_depth.strip() if bit_depth else "",
                 }
             )
 
@@ -6602,46 +6616,40 @@ class ToolboxWindow(QMainWindow):
         unknown: int,
         skipped: int,
         eq_incompatible: int,
+        current_file: str,
     ) -> None:
         total_for_ui = max(total, 1)
         self.music_compatibility_progress.setRange(0, total_for_ui)
         self.music_compatibility_progress.setValue(min(scanned, total_for_ui))
         self.music_compatibility_cancel_btn.setEnabled(True)
+        
+        if current_file:
+            self.music_compatibility_progress_label.setText(f"Scanning: {current_file}")
+            self.music_compatibility_progress.setFormat("%p%")
+        else:
+            self.music_compatibility_progress_label.setText("Idle")
+            self.music_compatibility_progress.setFormat("Idle")
 
         if total == 0:
             self.music_compatibility_progress.setFormat("No files found")
-            self.music_compatibility_summary_label.setText("No files found in target.")
             return
 
         self.music_compatibility_progress.setFormat(f"Scanning {scanned}/{total}")
-        self.music_compatibility_summary_label.setText(
-            f"Scanned: {scanned}/{total} | Supported: {supported} | Unsupported: {unsupported} | "
-            f"Unknown: {unknown} | Skipped: {skipped}"
-        )
+        self.stat_mc_scanned_lbl.setText(f"{scanned}/{total}")
+        self.stat_mc_supported_lbl.setText(str(supported))
+        self.stat_mc_eq_compatible_lbl.setText(str(supported - eq_incompatible))
+        self.stat_mc_unsupported_lbl.setText(str(unsupported))
+        self.stat_mc_unknown_lbl.setText(str(unknown))
+        self.stat_mc_skipped_lbl.setText(str(skipped))
 
     @Slot(str)
     def _apply_music_compatibility_table_filter(self, query: str) -> None:
-        normalized_query = query.strip().lower()
-        filter_all = not normalized_query
-
-        for row in range(self.music_compatibility_table.rowCount()):
-            text_match = True
-            if not filter_all:
-                text_match = False
-                for col in range(self.music_compatibility_table.columnCount()):
-                    item = self.music_compatibility_table.item(row, col)
-                    if item is None:
-                        continue
-                    if normalized_query in item.text().lower():
-                        text_match = True
-                        break
-
-            self.music_compatibility_table.setRowHidden(row, not text_match)
+        self.music_compatibility_proxy_model.setFilterRegularExpression(query)
 
     @Slot(list, int, int, int, int, int, int)
     def _on_music_compatibility_scan_finished(
         self,
-        rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str, str, str]],
+        rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str, str, str, str, str]],
         supported: int,
         unsupported: int,
         unknown: int,
@@ -6649,125 +6657,56 @@ class ToolboxWindow(QMainWindow):
         total_files: int,
         eq_incompatible: int,
     ) -> None:
+        self.music_compatibility_stack.setCurrentIndex(1)
         self._last_music_compatibility_scan_target = self._music_compatibility_scan_target
         self._last_music_compatibility_unsupported_count = unsupported
         self._last_music_compatibility_eq_incompatible_count = eq_incompatible
         self._music_compatibility_scan_target = None
         self.music_compatibility_scan_btn.setEnabled(True)
         self.music_compatibility_cancel_btn.setEnabled(False)
+        
+        self.music_compatibility_table_model.update_data(rows)
         self._update_music_compatibility_convert_button_state()
-
-        self.music_compatibility_table.setSortingEnabled(False)
-        self.music_compatibility_table.setUpdatesEnabled(False)
-        try:
-            self.music_compatibility_table.setRowCount(len(rows))
-            for row_index, row in enumerate(rows):
-                (
-                    file_name,
-                    extension,
-                    codec,
-                    status,
-                    reason,
-                    sample_rate,
-                    bit_depth,
-                    block_size,
-                    dsd_profile,
-                    eq_compatibility,
-                    channels,
-                    stream_count,
-                    category,
-                ) = row
-
-                items = [
-                    QTableWidgetItem(file_name),
-                    QTableWidgetItem(extension),
-                    QTableWidgetItem(codec),
-                    QTableWidgetItem(status),
-                    QTableWidgetItem(reason),
-                    QTableWidgetItem(sample_rate),
-                    QTableWidgetItem(bit_depth),
-                    QTableWidgetItem(block_size),
-                    QTableWidgetItem(dsd_profile),
-                    QTableWidgetItem(eq_compatibility),
-                    QTableWidgetItem(channels),
-                    QTableWidgetItem(stream_count),
-                ]
-
-                reason_item = items[4]
-                reason_item.setToolTip(reason)
-
-                for col, item in enumerate(items):
-                    if category == "unsupported":
-                        item.setBackground(QColor("#4A1010"))
-                    self.music_compatibility_table.setItem(row_index, col, item)
-
-                if category == "supported":
-                    status_bg = QColor("#2E7D32")
-                    status_fg = QColor("#F2FFF2")
-                elif category == "unsupported":
-                    status_bg = QColor("#7A2C2C")
-                    status_fg = QColor("#FFF0F0")
-                elif category == "unknown":
-                    status_bg = QColor("#7A5E2C")
-                    status_fg = QColor("#FFF9E6")
-                else:
-                    status_bg = QColor("#3C3C3C")
-                    status_fg = QColor("#E2E2E2")
-
-                status_item = self.music_compatibility_table.item(row_index, 3)
-                if status_item is not None:
-                    status_item.setBackground(status_bg)
-                    status_item.setForeground(status_fg)
-
-                eq_item = self.music_compatibility_table.item(row_index, 9)
-                if eq_item is not None:
-                    eq_text = eq_item.text().strip().lower()
-                    if eq_text == "not compatible":
-                        eq_item.setBackground(QColor("#7A2C2C"))
-                        eq_item.setForeground(QColor("#FFF0F0"))
-                    elif eq_text == "compatible":
-                        eq_item.setBackground(QColor("#2E7D32"))
-                        eq_item.setForeground(QColor("#F2FFF2"))
-                    elif eq_text == "unknown":
-                        eq_item.setBackground(QColor("#7A5E2C"))
-                        eq_item.setForeground(QColor("#FFF9E6"))
-        finally:
-            self.music_compatibility_table.setUpdatesEnabled(True)
-            self.music_compatibility_table.setSortingEnabled(True)
-            self.music_compatibility_table.viewport().update()
-
         self._apply_music_compatibility_table_filter(self.music_compatibility_search_input.text())
-
+        
         if total_files == 0:
             self.music_compatibility_progress.setRange(0, 1)
             self.music_compatibility_progress.setValue(0)
-            self.music_compatibility_progress.setFormat("Complete: no files found")
-            self.music_compatibility_summary_label.setText("No files found in target.")
+            self.music_compatibility_progress.setFormat("No files found")
+            self.stat_mc_scanned_lbl.setText("0/0")
+            self.stat_mc_supported_lbl.setText("0")
+            self.stat_mc_eq_compatible_lbl.setText("0")
+            self.stat_mc_unsupported_lbl.setText("0")
+            self.stat_mc_unknown_lbl.setText("0")
+            self.stat_mc_skipped_lbl.setText("0")
         else:
             self.music_compatibility_progress.setRange(0, total_files)
             self.music_compatibility_progress.setValue(total_files)
             self.music_compatibility_progress.setFormat(
                 f"Complete: {supported} supported, {unsupported} unsupported, {unknown} unknown"
             )
-            self.music_compatibility_summary_label.setText(
-                f"Files analyzed: {total_files} | Supported: {supported} | Unsupported: {unsupported} | "
-                f"Unknown: {unknown} | Skipped: {skipped}"
-            )
+            self.stat_mc_scanned_lbl.setText(f"{total_files}/{total_files}")
+            self.stat_mc_supported_lbl.setText(str(supported))
+            self.stat_mc_eq_compatible_lbl.setText(str(supported - eq_incompatible))
+            self.stat_mc_unsupported_lbl.setText(str(unsupported))
+            self.stat_mc_unknown_lbl.setText(str(unknown))
+            self.stat_mc_skipped_lbl.setText(str(skipped))
 
         self.statusBar().showMessage("Music compatibility scan completed", 5000)
 
     def _on_music_compatibility_table_context_menu(self, pos):
         """Handle right-click context menu on the music compatibility table."""
-        item = self.music_compatibility_table.itemAt(pos)
-        if item is None:
+        index = self.music_compatibility_table.indexAt(pos)
+        if not index.isValid():
             return
 
-        row = item.row()
-        file_item = self.music_compatibility_table.item(row, 0)
-        if file_item is None:
+        row = index.row()
+        # File is at column 1
+        file_index = self.music_compatibility_proxy_model.index(row, 1)
+        if not file_index.isValid():
             return
 
-        file_name = file_item.text()
+        file_name = self.music_compatibility_proxy_model.data(file_index, Qt.DisplayRole)
         if not file_name:
             return
 
@@ -6802,8 +6741,8 @@ class ToolboxWindow(QMainWindow):
         self.music_compatibility_convert_btn.setEnabled(False)
         self.music_compatibility_progress.setRange(0, 1)
         self.music_compatibility_progress.setValue(0)
-        self.music_compatibility_progress.setFormat("Scan failed")
-        self.music_compatibility_summary_label.setText(f"Compatibility scan failed: {error}")
+        self.music_compatibility_progress.setFormat(f"Scan failed: {error}")
+        self.music_compatibility_stack.setCurrentIndex(0)
         self.statusBar().showMessage("Music compatibility scan failed", 5000)
 
     def scan_embedded_lyrics(self) -> None:

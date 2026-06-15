@@ -11,6 +11,38 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal, Slot
 import logging
 
+EMOJI_PATTERN = re.compile(
+    r'['
+    r'\U0001f300-\U0001f64f'
+    r'\U0001f680-\U0001f6ff'
+    r'\U0001f900-\U0001f9ff'
+    r'\U0001fa70-\U0001faff'
+    r'\u2600-\u26ff'
+    r'\u2700-\u27bf'
+    r']'
+)
+
+ASIAN_SCRIPTS_PATTERN = re.compile(
+    r'['
+    r'\u0900-\u097f'
+    r'\u0980-\u09ff'
+    r'\u1780-\u17ff\u19e0-\u19ff'
+    r'\u1000-\u109f\uaa60-\uaa7f\ua9e0-\ua9ff'
+    r']'
+)
+
+
+def _evaluate_file_name_compatibility(filename: str) -> tuple[str, str]:
+    issues = []
+    if EMOJI_PATTERN.search(filename):
+        issues.append("Emojis are unsupported")
+    if ASIAN_SCRIPTS_PATTERN.search(filename):
+        issues.append("Complex Asian scripts (e.g. Hindi, Bengali, Khmer, Burmese) are unsupported")
+
+    if issues:
+        return "INCOMPATIBLE", ", ".join(issues)
+    return "COMPATIBLE", "File name is compatible"
+
 
 LOSSY_FORMATS = {".mp3", ".ogg", ".m4a", ".wma"}
 PCM_FORMATS = {".wav", ".flac", ".ape"}
@@ -855,7 +887,7 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
     reason = "Non-audio file type"
     sample_rate_text = "-"
     bit_depth_text = "-"
-    block_size_text = "N/A"
+    block_size_text = "-"
     dsd_profile = "-"
     codec_text = "-"
     eq_sample_rate = None
@@ -874,9 +906,11 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
             "bit_depth": bit_depth_text,
             "block_size": block_size_text,
             "dsd_profile": dsd_profile,
-            "eq_compatibility": "N/A",
-            "channels": "N/A",
-            "stream_count": "N/A",
+            "eq_compatibility": "-",
+            "channels": "-",
+            "stream_count": "-",
+            "filename_compatibility": "-",
+            "filename_compatibility_reason": "-",
         }
 
     if not extension:
@@ -907,7 +941,7 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
             category = "unknown"
             reason = f"ffprobe error: {ffprobe_error}"
         sample_rate_text = str(sample_rate) if sample_rate is not None else "-"
-        bit_depth_text = str(bit_depth) if bit_depth is not None else "N/A"
+        bit_depth_text = str(bit_depth) if bit_depth is not None else "-"
         
         # If ffprobe failed, surface that and skip further validation
         if ffprobe_error:
@@ -962,7 +996,7 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         if extension == ".flac":
             block_size_text = str(flac_block_max) if flac_block_max is not None else "-"
         else:
-            block_size_text = "N/A"
+            block_size_text = "-"
 
         # If ffprobe failed, surface that and skip deeper PCM validation.
         if ffprobe_error:
@@ -1110,17 +1144,19 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         reason = f"Recognized audio format not supported: {extension}"
 
     if category == "skipped":
-        eq_compatibility = "N/A"
+        eq_compatibility = "-"
     else:
         exceeds_eq_sample_rate = eq_sample_rate is not None and eq_sample_rate > 192000
         exceeds_eq_bit_depth = eq_bit_depth is not None and eq_bit_depth > 16
 
         if exceeds_eq_sample_rate or exceeds_eq_bit_depth:
-            eq_compatibility = "Not Compatible"
+            eq_compatibility = "Not EQ Compatible"
         elif eq_sample_rate is None or eq_bit_depth is None:
             eq_compatibility = "UNKNOWN"
         else:
-            eq_compatibility = "Compatible"
+            eq_compatibility = "EQ Compatible"
+
+    filename_comp_status, filename_comp_reason = _evaluate_file_name_compatibility(path.name)
 
     return {
         "file": relative_path,
@@ -1134,13 +1170,15 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         "block_size": block_size_text,
         "dsd_profile": dsd_profile,
         "eq_compatibility": eq_compatibility,
-        "channels": str(metadata.get("channels") or "-") if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS) else "N/A",
-        "stream_count": str(metadata.get("total_stream_count") or "-") if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS) else "N/A",
+        "channels": str(metadata.get("channels") or "-") if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS) else "-",
+        "stream_count": str(metadata.get("total_stream_count") or "-") if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS) else "-",
+        "filename_compatibility": filename_comp_status,
+        "filename_compatibility_reason": filename_comp_reason,
     }
 
 
 class MusicCompatibilityScanWorker(QObject):
-    progress = Signal(int, int, int, int, int, int, int)
+    progress = Signal(int, int, int, int, int, int, int, str)
     finished = Signal(list, int, int, int, int, int, int)
     cancelled = Signal(int, int, int, int, int, int, int)
     failed = Signal(str)
@@ -1186,7 +1224,7 @@ class MusicCompatibilityScanWorker(QObject):
             eq_incompatible = 0
             rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str]] = []
 
-            self.progress.emit(0, total_files, supported, unsupported, unknown, skipped, eq_incompatible)
+            self.progress.emit(0, total_files, supported, unsupported, unknown, skipped, eq_incompatible, "")
 
             for index, file_path in enumerate(candidate_files, start=1):
                 if self._cancel_requested:
@@ -1206,8 +1244,10 @@ class MusicCompatibilityScanWorker(QObject):
                         result["block_size"],
                         result["dsd_profile"],
                         result["eq_compatibility"],
-                        result.get("channels", "N/A"),
-                        result.get("stream_count", "N/A"),
+                        result.get("channels", "-"),
+                        result.get("stream_count", "-"),
+                        result.get("filename_compatibility", "-"),
+                        result.get("filename_compatibility_reason", "-"),
                         result["category"],
                     )
                 )
@@ -1222,12 +1262,11 @@ class MusicCompatibilityScanWorker(QObject):
                 else:
                     skipped += 1
 
-                # Count EQ-incompatible supported files
-                if category == "supported" and result["eq_compatibility"].lower() == "not compatible":
+                # Count EQ-incompatible (and unknown) supported files
+                if category == "supported" and result["eq_compatibility"].lower() != "eq compatible":
                     eq_incompatible += 1
 
-                if index == total_files or index % 25 == 0:
-                    self.progress.emit(index, total_files, supported, unsupported, unknown, skipped, eq_incompatible)
+                self.progress.emit(index, total_files, supported, unsupported, unknown, skipped, eq_incompatible, file_path.name)
 
             self.finished.emit(rows, supported, unsupported, unknown, skipped, total_files, eq_incompatible)
         except Exception as exc:
