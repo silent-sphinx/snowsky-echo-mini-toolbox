@@ -1,5 +1,6 @@
 import argparse
 import sys
+import os
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
@@ -28,6 +29,9 @@ def _asset_path(*parts: str) -> Path:
 
 def main() -> int:
     args = parse_args()
+    
+    # Suppress harmless font OpenType warnings that appear for unsupported unicode scripts
+    os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false"
 
     QApplication.setStyle("Fusion")
     app = QApplication(sys.argv)
