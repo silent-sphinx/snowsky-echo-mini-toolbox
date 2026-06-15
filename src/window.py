@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFileSystemModel,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -1797,6 +1798,7 @@ class ToolboxWindow(QMainWindow):
         self._dir_size_scan_worker: DirectorySizeScanWorker | None = None
         self._dir_size_scan_target: str | None = None
         self._pending_dir_size_scan_target: str | None = None
+        self._main_menu_tab_index = -1
         self._about_tab_index = -1
         self._music_compatibility_tab_index = -1
         self._lyrics_manager_tab_index = -1
@@ -2768,6 +2770,78 @@ class ToolboxWindow(QMainWindow):
         backup_restore_layout.addWidget(transfer_section)
         backup_restore_layout.addStretch(1)
 
+        main_menu_tab = QScrollArea()
+        main_menu_tab.setWidgetResizable(True)
+        main_menu_tab.setFrameShape(QFrame.NoFrame)
+        main_menu_content = QWidget()
+        main_menu_outer_layout = QVBoxLayout(main_menu_content)
+        main_menu_outer_layout.setContentsMargins(20, 20, 20, 20)
+        main_menu_outer_layout.setSpacing(20)
+        
+        welcome_text = (
+            "Welcome to the Snowsky Echo Mini Toolbox, your one-stop shop for organizing and converting your music media. "
+            "To start, select the location of your media by browsing or choosing one of the mounted drives at the top of the interface.\n\n"
+            "It is recommended to connect your microSD card directly to your computer using a USB reader, rather than plugging in the Snowsky Echo Mini itself, as the device uses a slower interface."
+        )
+        welcome_lbl = QLabel(welcome_text)
+        welcome_lbl.setWordWrap(True)
+        welcome_lbl.setStyleSheet("font-size: 14px; color: #E3E3E3; line-height: 1.4;")
+        main_menu_outer_layout.addWidget(welcome_lbl)
+        
+        main_menu_layout = QGridLayout()
+        main_menu_layout.setSpacing(15)
+        
+        tools = [
+            ("ℹ️ About Folder/Drive", "View details and properties of the selected target.", "_about_tab_index"),
+            ("📁 Music Browser", "Browse and manage music files with an integrated player.", "_directory_tab_index"),
+            ("🖼️ Album Art", "Scan, download, and update embedded album artwork.", "_album_art_tab_index"),
+            ("🎵 Music Compatibility", "Check and fix audio format compatibility issues.", "_music_compatibility_tab_index"),
+            ("🎤 Lyrics Manager", "Download and embed synchronized lyrics (LRC).", "_lyrics_manager_tab_index"),
+            ("🏷️ File Rename", "Bulk rename files based on rules and metadata.", "_file_rename_tab_index"),
+            ("🧹 File Cleanup", "Clean up unwanted and unsupported files.", "_cleanup_tab_index"),
+            ("📝 Metadata Manager", "Edit audio tags and properties in bulk.", "_metadata_manager_tab_index"),
+            ("💾 Backup/Restore", "Backup to zip or transfer files to another drive.", "_backup_restore_tab_index"),
+        ]
+        
+        row, col = 0, 0
+        for title, desc, attr_name in tools:
+            tile = QPushButton()
+            tile.setObjectName("mainMenuTile")
+            tile.setCursor(Qt.PointingHandCursor)
+            tile.setMinimumHeight(100)
+            
+            tile_layout = QVBoxLayout(tile)
+            tile_layout.setContentsMargins(15, 15, 15, 15)
+            tile_layout.setSpacing(8)
+            
+            title_lbl = QLabel(title)
+            title_lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
+            title_lbl.setStyleSheet("font-size: 15px; font-weight: bold; color: #E3E3E3;")
+            
+            desc_lbl = QLabel(desc)
+            desc_lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
+            desc_lbl.setWordWrap(True)
+            desc_lbl.setStyleSheet("color: #A0A0A0; font-size: 12px;")
+            
+            tile_layout.addWidget(title_lbl)
+            tile_layout.addWidget(desc_lbl)
+            tile_layout.addStretch()
+            
+            tile.clicked.connect(lambda checked=False, a=attr_name: self.tabs.setCurrentIndex(getattr(self, a)) if getattr(self, a, -1) != -1 and self.tabs.isTabEnabled(getattr(self, a)) else None)
+            
+            main_menu_layout.addWidget(tile, row, col)
+            col += 1
+            if col > 2:
+                col = 0
+                row += 1
+                
+        main_menu_layout.setRowStretch(row + 1, 1)
+        main_menu_outer_layout.addLayout(main_menu_layout)
+        main_menu_outer_layout.addStretch(1)
+        main_menu_content.setLayout(main_menu_outer_layout)
+        main_menu_tab.setWidget(main_menu_content)
+
+        self._main_menu_tab_index = self.tabs.addTab(main_menu_tab, "Main Menu")
         self._about_tab_index = self.tabs.addTab(about_tab, "About Folder/Drive")
         self._directory_tab_index = self.tabs.addTab(browser_tab, "Music Browser")
         self._album_art_tab_index = self.tabs.addTab(album_art_tab, "Album Art")
@@ -2781,7 +2855,7 @@ class ToolboxWindow(QMainWindow):
         self._backup_restore_tab_index = self.tabs.addTab(backup_restore_tab, "Backup/Restore")
         
         for i in range(self.tabs.count()):
-            if i != self._about_tab_index:
+            if i not in (self._main_menu_tab_index, self._about_tab_index):
                 self.tabs.setTabEnabled(i, False)
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
@@ -2807,6 +2881,7 @@ class ToolboxWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.status_version_label)
         self.statusBar().addPermanentWidget(self.status_credit_label)
         self.statusBar().showMessage("Ready")
+        self.tabs.setCurrentIndex(self._main_menu_tab_index)
         # UI build complete
 
     def _on_path_input_editing_finished(self) -> None:
@@ -2939,8 +3014,6 @@ class ToolboxWindow(QMainWindow):
 
         help_by_tab = {
             "About Folder/Drive": (
-                "Welcome to the Snowsky Echo Mini Toolbox, your one-stop shop for organizing and converting your music media. To start, select the location of your media by browsing or choosing one of the mounted drives at the top of the interface.\n\n"
-                "It is recommended to connect your microSD card directly to your computer using a USB reader, rather than plugging in the Snowsky Echo Mini itself, as the device uses a slower interface.\n\n"
                 "The 'About Drive/Folder' tool is useful for ensuring that your microSD card is compatible with your Echo Mini.\n\n"
                 "Please note that editing file metadata is likely to corrupt its record in your favourites.\n\n"
                 "Filesystem Rules:\n"
@@ -3198,6 +3271,19 @@ class ToolboxWindow(QMainWindow):
                 background-color: #2D2D2D;
                 border: 1px solid #3C3C3C;
                 border-radius: 6px;
+            }
+            QPushButton#mainMenuTile {
+                background-color: #2D2D2D;
+                border: 1px solid #3C3C3C;
+                border-radius: 6px;
+                text-align: left;
+            }
+            QPushButton#mainMenuTile:hover {
+                background-color: #383838;
+                border: 1px solid #5A5A5A;
+            }
+            QPushButton#mainMenuTile:pressed {
+                background-color: #262626;
             }
             QLabel#statTitle {
                 color: #A0A0A0;
@@ -3615,12 +3701,12 @@ class ToolboxWindow(QMainWindow):
         has_browser_target = has_selected_drive or has_selected_directory
         
         for i in range(self.tabs.count()):
-            if i != self._about_tab_index:
+            if i not in (self._main_menu_tab_index, self._about_tab_index):
                 self.tabs.setTabEnabled(i, has_browser_target)
 
-        if not has_browser_target and self.tabs.currentIndex() != self._about_tab_index:
-            if self._about_tab_index >= 0:
-                self.tabs.setCurrentIndex(self._about_tab_index)
+        if not has_browser_target and self.tabs.currentIndex() not in (self._main_menu_tab_index, self._about_tab_index):
+            if self._main_menu_tab_index >= 0:
+                self.tabs.setCurrentIndex(self._main_menu_tab_index)
 
     def _set_cleanup_idle(self, message: str) -> None:
         self.cleanup_summary_label.setText(message)
@@ -5075,6 +5161,11 @@ class ToolboxWindow(QMainWindow):
 
     @Slot(int)
     def on_tab_changed(self, index: int) -> None:
+        if index == self._main_menu_tab_index:
+            self.help_container.hide()
+        else:
+            self.help_container.show()
+            
         self._update_help_for_tab(index)
         
         if index == self._album_art_tab_index and not self._album_art_initial_scan_done:
@@ -5108,8 +5199,8 @@ class ToolboxWindow(QMainWindow):
             self.browser_root_label.setText("")
             self.browser_tree.setEnabled(False)
             self.browser_size_progress.hide()
-            if self._about_tab_index >= 0:
-                self.tabs.setCurrentIndex(self._about_tab_index)
+            if self._main_menu_tab_index >= 0:
+                self.tabs.setCurrentIndex(self._main_menu_tab_index)
             return
 
         self._directory_scan_armed = True

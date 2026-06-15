@@ -5,7 +5,7 @@
 [![UI](https://img.shields.io/badge/UI-PySide6-41CD52)](https://doc.qt.io/qtforpython-6/)
 ![Status](https://img.shields.io/badge/status-active%20development-2ea44f)
 
-An easy desktop app to prepare your music folders and USB drives for the Snowsky Echo Mini.
+An easy (unofficial) desktop app to prepare your music folders and USB drives for the Snowsky Echo Mini.
 
 ![Overview](Overview.png)
 
@@ -34,6 +34,8 @@ Please help the community by submitting a bug report—your feedback helps impro
 
 ## Main Features
 
+- Main Menu:
+  - A welcome dashboard with quick access tiles to all available tools.
 - Music Compatibility:
   - Checks if your media is compatible with the Snowsky Echo Mini.
   - Automatically convert your incompatible media to a compatible audio format.
@@ -45,6 +47,8 @@ Please help the community by submitting a bug report—your feedback helps impro
 - Lyrics Manager:
   - Scans embedded lyrics.
   - Can create .lrc lyric files and do LRCLIB bulk lookup.
+- Metadata Manager:
+  - Edit audio tags and properties in bulk.
 - File Rename:
   - Suggests cleaner file names from metadata before you apply changes.
 - File Cleanup:
