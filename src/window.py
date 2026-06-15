@@ -79,6 +79,7 @@ from .music_compatibility import (
     MusicCompatibilityScanWorker,
     _ffprobe_audio_info,
     _resolve_ffmpeg_executable,
+    _subprocess_no_window_kwargs,
     get_all_streams,
 )
 from .models import DriveOption
@@ -1229,6 +1230,7 @@ class MusicConversionWorker(QObject):
                 command,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
+                **_subprocess_no_window_kwargs(),
             )
         except Exception as exc:
             return False, str(exc)
