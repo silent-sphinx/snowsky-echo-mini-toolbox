@@ -2116,6 +2116,11 @@ class ToolboxWindow(QMainWindow):
         progress_layout = QVBoxLayout(self.album_art_progress_page)
         progress_layout.addStretch(1)
 
+        self.album_art_progress_label = QLabel("Idle")
+        self.album_art_progress_label.setAlignment(Qt.AlignCenter)
+        self.album_art_progress_label.setMinimumWidth(400)
+        progress_layout.addWidget(self.album_art_progress_label, alignment=Qt.AlignCenter)
+
         self.album_art_progress = QProgressBar()
         self.album_art_progress.setRange(0, 1)
         self.album_art_progress.setValue(0)
@@ -2124,6 +2129,12 @@ class ToolboxWindow(QMainWindow):
         self.album_art_progress.setMinimumHeight(30) # Make it a bit thicker
 
         progress_layout.addWidget(self.album_art_progress)
+
+        self.album_art_cancel_btn = QPushButton("Cancel Scan")
+        self.album_art_cancel_btn.setEnabled(False)
+        self.album_art_cancel_btn.clicked.connect(self.cancel_album_art_scan)
+        progress_layout.addWidget(self.album_art_cancel_btn, alignment=Qt.AlignCenter)
+
         progress_layout.addStretch(1)
 
         self.album_art_table = QTableWidget(0, 8)
@@ -6336,6 +6347,7 @@ class ToolboxWindow(QMainWindow):
             self.album_art_progress.setRange(0, 1)
             self.album_art_progress.setValue(0)
             self.album_art_progress.setFormat("Idle")
+            self.album_art_progress_label.setText("Idle")
             self.album_art_stack.setCurrentIndex(0)
             return
 
@@ -6345,6 +6357,7 @@ class ToolboxWindow(QMainWindow):
             self.album_art_progress.setRange(0, 1)
             self.album_art_progress.setValue(0)
             self.album_art_progress.setFormat("Idle")
+            self.album_art_progress_label.setText("Idle")
             self.album_art_stack.setCurrentIndex(0)
             return
 
@@ -6359,18 +6372,23 @@ class ToolboxWindow(QMainWindow):
         self.album_art_progress.setRange(0, 1)
         self.album_art_progress.setValue(0)
         self.album_art_progress.setFormat("Preparing scan...")
+        self.album_art_progress_label.setText("Preparing scan...")
         self.album_art_fix_btn.setEnabled(False)
+        self.album_art_cancel_btn.setEnabled(False)
         self._scan_thread = QThread(self)
         self._scan_worker = AlbumArtScanWorker(target_path)
         self._scan_worker.moveToThread(self._scan_thread)
 
+        self.album_art_cancel_btn.setEnabled(True)
         self._scan_thread.started.connect(self._scan_worker.run)
         self._scan_worker.progress.connect(self._on_album_art_scan_progress)
         self._scan_worker.finished.connect(self._on_album_art_scan_finished)
         self._scan_worker.failed.connect(self._on_album_art_scan_failed)
+        self._scan_worker.cancelled.connect(self._on_album_art_scan_cancelled)
 
         self._scan_worker.finished.connect(self._scan_thread.quit)
         self._scan_worker.failed.connect(self._scan_thread.quit)
+        self._scan_worker.cancelled.connect(self._scan_thread.quit)
         self._scan_thread.finished.connect(self._scan_worker.deleteLater)
         self._scan_thread.finished.connect(self._scan_thread.deleteLater)
         self._scan_thread.finished.connect(self._clear_scan_worker_refs)
@@ -6382,7 +6400,7 @@ class ToolboxWindow(QMainWindow):
         self._scan_worker = None
         self._scan_thread = None
 
-    @Slot(int, int, int, int, int)
+    @Slot(int, int, int, int, int, str)
     def _on_album_art_scan_progress(
         self,
         scanned_audio: int,
@@ -6390,10 +6408,14 @@ class ToolboxWindow(QMainWindow):
         compatible: int,
         incompatible: int,
         missing_artwork: int,
+        current_file: str,
     ) -> None:
         total_for_ui = max(total_audio, 1)
         self.album_art_progress.setRange(0, total_for_ui)
         self.album_art_progress.setValue(min(scanned_audio, total_for_ui))
+
+        if current_file:
+            self.album_art_progress_label.setText(f"Scanning: {current_file}")
 
         if total_audio > 0:
             self.album_art_progress.setFormat(f"Scanning {scanned_audio}/{total_audio}")
@@ -6456,6 +6478,8 @@ class ToolboxWindow(QMainWindow):
         except Exception:
             self.album_art_table.setUpdatesEnabled(True)
 
+        self.album_art_cancel_btn.setEnabled(False)
+        self.album_art_progress_label.setText("Idle")
         self.album_art_stack.setCurrentIndex(1)
         self.statusBar().showMessage("Album art compatibility scan completed")
         self._apply_album_art_table_filter(self.album_art_search_input.text())
@@ -6480,12 +6504,44 @@ class ToolboxWindow(QMainWindow):
     def _on_album_art_scan_failed(self, error: str) -> None:
         self.album_art_fix_btn.setEnabled(False)
         self.album_art_download_btn.setEnabled(False)
+        self.album_art_cancel_btn.setEnabled(False)
         self._last_incompatible_files = []
         self.album_art_progress.setRange(0, 1)
         self.album_art_progress.setValue(0)
         self.album_art_progress.setFormat("Scan failed")
+        self.album_art_progress_label.setText("Scan failed")
         self.album_art_stack.setCurrentIndex(0)
         self.statusBar().showMessage("Album art compatibility scan failed")
+
+    @Slot(int, int, int, int, int)
+    def _on_album_art_scan_cancelled(
+        self,
+        scanned_audio: int,
+        total_audio: int,
+        compatible: int,
+        incompatible: int,
+        missing_artwork: int,
+    ) -> None:
+        self.album_art_fix_btn.setEnabled(False)
+        self.album_art_download_btn.setEnabled(False)
+        self.album_art_cancel_btn.setEnabled(False)
+        self._last_incompatible_files = []
+        
+        self.album_art_progress.setRange(0, max(total_audio, 1))
+        self.album_art_progress.setValue(scanned_audio)
+        self.album_art_progress.setFormat("Scan cancelled")
+        self.album_art_progress_label.setText("Scan cancelled")
+        self.album_art_stack.setCurrentIndex(0)
+        self.statusBar().showMessage("Album art compatibility scan cancelled")
+
+    def cancel_album_art_scan(self) -> None:
+        worker = self._scan_worker
+        thread = self._scan_thread
+        if worker is None or thread is None or not thread.isRunning():
+            return
+
+        worker.request_cancel()
+        self.album_art_cancel_btn.setEnabled(False)
 
     def scan_music_compatibility(self) -> None:
         if (

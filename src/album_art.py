@@ -380,13 +380,18 @@ def album_art_scan_result(
 
 
 class AlbumArtScanWorker(QObject):
-    progress = Signal(int, int, int, int, int)
+    progress = Signal(int, int, int, int, int, str)
     finished = Signal(list, int, int, int, int)
+    cancelled = Signal(int, int, int, int, int)
     failed = Signal(str)
 
     def __init__(self, target_path: Path):
         super().__init__()
         self.target_path = target_path
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
 
     @Slot()
     def run(self) -> None:
@@ -399,9 +404,13 @@ class AlbumArtScanWorker(QObject):
             missing_artwork = 0
             scanned_audio = 0
 
-            self.progress.emit(0, total_audio, compatible, incompatible, missing_artwork)
+            self.progress.emit(0, total_audio, compatible, incompatible, missing_artwork, "")
 
             for file_path in audio_files:
+                if self._cancel_requested:
+                    self.cancelled.emit(scanned_audio, total_audio, compatible, incompatible, missing_artwork)
+                    return
+
                 row, classification = album_art_scan_result(file_path, self.target_path)
                 rows.append(row)
 
@@ -420,6 +429,7 @@ class AlbumArtScanWorker(QObject):
                         compatible,
                         incompatible,
                         missing_artwork,
+                        file_path.name
                     )
 
             self.finished.emit(rows, scanned_audio, compatible, incompatible, missing_artwork)
