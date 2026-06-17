@@ -736,7 +736,8 @@ class TableCheckDelegate(QStyledItemDelegate):
                     end_row = index.row()
                     step = 1 if start_row <= end_row else -1
                     for r in range(start_row, end_row + step, step):
-                        model.setData(model.index(r, 0), next_state, Qt.CheckStateRole)
+                        if not self.table.isRowHidden(r):
+                            model.setData(model.index(r, 0), next_state, Qt.CheckStateRole)
                 else:
                     model.setData(index, next_state, Qt.CheckStateRole)
                     
@@ -1765,6 +1766,74 @@ class BulkMetadataEditDialog(QDialog):
         self.accept()
 
 
+from PySide6.QtWidgets import QDialogButtonBox
+
+class LyricsConversionPreviewDialog(QDialog):
+    def __init__(self, audio_files: list[Path], resolved_target: Path, scan_results: list[dict[str, object]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Convert Embedded Lyrics - Preview")
+        self.resize(800, 600)
+        
+        layout = QVBoxLayout(self)
+        
+        scan_map = {}
+        for res in scan_results:
+            scan_map[str(res.get("relative_path"))] = (res.get("embedded") == "Yes")
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["File", "Embedded Lyrics", "Destination LRC"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        
+        self.valid_files = []
+        
+        self.table.setRowCount(len(audio_files))
+        for row, file_path in enumerate(audio_files):
+            try:
+                relative_path = file_path.relative_to(resolved_target).as_posix()
+            except Exception:
+                relative_path = str(file_path)
+                
+            has_lyrics = scan_map.get(relative_path, False)
+            dest_name = file_path.with_suffix(".lrc").name
+            
+            file_item = QTableWidgetItem(relative_path)
+            status_item = QTableWidgetItem("Ready" if has_lyrics else "No Embedded Lyrics")
+            dest_item = QTableWidgetItem(dest_name if has_lyrics else "-")
+            
+            if has_lyrics:
+                self.valid_files.append(file_path)
+                status_item.setBackground(QColor("#2E7D32"))
+                status_item.setForeground(QColor("#F2FFF2"))
+            else:
+                status_item.setBackground(QColor("#7A2C2C"))
+                status_item.setForeground(QColor("#FFF0F0"))
+                file_item.setForeground(QColor("#888888"))
+                dest_item.setForeground(QColor("#888888"))
+                
+            self.table.setItem(row, 0, file_item)
+            self.table.setItem(row, 1, status_item)
+            self.table.setItem(row, 2, dest_item)
+            
+        layout.addWidget(QLabel(f"Found {len(self.valid_files)} valid files with embedded lyrics out of {len(audio_files)} selected."))
+        layout.addWidget(self.table)
+        
+        button_box = QDialogButtonBox()
+        self.convert_btn = button_box.addButton("Convert Valid Files", QDialogButtonBox.AcceptRole)
+        self.convert_btn.setEnabled(len(self.valid_files) > 0)
+        button_box.addButton("Cancel", QDialogButtonBox.RejectRole)
+        
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        
+        layout.addWidget(button_box)
+        
+    def get_valid_files(self) -> list[Path]:
+        return self.valid_files
+
 class ToolboxWindow(QMainWindow):
     def __init__(self, initial_path: str | None = None):
         super().__init__()
@@ -1798,6 +1867,11 @@ class ToolboxWindow(QMainWindow):
         self._dir_size_scan_worker: DirectorySizeScanWorker | None = None
         self._dir_size_scan_target: str | None = None
         self._pending_dir_size_scan_target: str | None = None
+
+        self._lrclib_rate_limit_until: float = 0.0
+        self._lrclib_rate_limit_backoff: float = 2.0
+        import threading
+        self._lrclib_lock = threading.Lock()
         self._main_menu_tab_index = -1
         self._about_tab_index = -1
         self._music_compatibility_tab_index = -1
@@ -2085,6 +2159,7 @@ class ToolboxWindow(QMainWindow):
         def create_stat_box(title):
             box = QFrame()
             box.setObjectName("statBox")
+            box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             box_layout = QVBoxLayout(box)
             box_layout.setContentsMargins(10, 10, 10, 10)
             box_layout.setSpacing(2)
@@ -2299,14 +2374,38 @@ class ToolboxWindow(QMainWindow):
         lyrics_manager_layout.setSpacing(10)
 
         lyrics_manager_controls = QHBoxLayout()
-        self.lyrics_manager_scan_btn = QPushButton("Scan Lyrics")
+        
+        self.lyrics_manager_search_input = QLineEdit()
+        self.lyrics_manager_search_input.setPlaceholderText(
+            "Search lyrics results (file, embedded status, lrc status, lookup status...)"
+        )
+        self.lyrics_manager_search_input.setClearButtonEnabled(True)
+        self.lyrics_manager_search_input.textChanged.connect(
+            self._apply_lyrics_manager_table_filter
+        )
+        lyrics_manager_controls.addWidget(self.lyrics_manager_search_input, 1)
+
+        self.lyrics_manager_filter_combo = QComboBox()
+        self.lyrics_manager_filter_combo.addItems([
+            "Show All",
+            "Has Embedded Lyrics Only",
+            "Missing All Lyrics",
+            "Has LRC Sidecar",
+            "Errors"
+        ])
+        self.lyrics_manager_filter_combo.currentIndexChanged.connect(
+            lambda _: self._apply_lyrics_manager_table_filter(self.lyrics_manager_search_input.text())
+        )
+        lyrics_manager_controls.addWidget(self.lyrics_manager_filter_combo)
+
+        self.lyrics_manager_scan_btn = QPushButton("Refresh")
         self.lyrics_manager_scan_btn.clicked.connect(self.scan_embedded_lyrics)
-        self.lyrics_manager_bulk_lookup_btn = QPushButton("Bulk Lookup")
+        self.lyrics_manager_bulk_lookup_btn = QPushButton("Find Lyrics")
         self.lyrics_manager_bulk_lookup_btn.clicked.connect(self.bulk_lookup_lyrics)
-        self.lyrics_manager_export_lrc_btn = QPushButton("Convert Embedded Lyrics To .lrc")
+        self.lyrics_manager_export_lrc_btn = QPushButton("Convert Embedded Lyrics")
         self.lyrics_manager_export_lrc_btn.clicked.connect(self.convert_embedded_lyrics_to_lrc)
         self.lyrics_manager_apply_lookup_btn = QPushButton("Apply Lookup Results")
-        self.lyrics_manager_apply_lookup_btn.setEnabled(False)
+        self.lyrics_manager_apply_lookup_btn.setVisible(False)
         self.lyrics_manager_apply_lookup_btn.clicked.connect(self.apply_bulk_lookup_results)
         lyrics_manager_controls.addWidget(self.lyrics_manager_scan_btn)
         lyrics_manager_controls.addWidget(self.lyrics_manager_bulk_lookup_btn)
@@ -2314,27 +2413,78 @@ class ToolboxWindow(QMainWindow):
         lyrics_manager_controls.addWidget(self.lyrics_manager_apply_lookup_btn)
         lyrics_manager_controls.addStretch(1)
 
-        self.lyrics_manager_summary_label = QLabel("No lyrics scan run yet.")
-        self.lyrics_manager_summary_label.setObjectName("targetSummary")
+        self.lyrics_manager_stack = QStackedWidget()
+
+        self.lyrics_manager_progress_page = QWidget()
+        lm_progress_layout = QVBoxLayout(self.lyrics_manager_progress_page)
+        lm_progress_layout.addStretch(1)
+
+        self.lyrics_manager_progress_label = QLabel("Idle")
+        self.lyrics_manager_progress_label.setAlignment(Qt.AlignCenter)
+        self.lyrics_manager_progress_label.setMinimumWidth(400)
+        lm_progress_layout.addWidget(self.lyrics_manager_progress_label, alignment=Qt.AlignCenter)
 
         self.lyrics_manager_progress = QProgressBar()
         self.lyrics_manager_progress.setRange(0, 1)
         self.lyrics_manager_progress.setValue(0)
         self.lyrics_manager_progress.setFormat("Idle")
         self.lyrics_manager_progress.setTextVisible(True)
+        self.lyrics_manager_progress.setMinimumHeight(30)
+        lm_progress_layout.addWidget(self.lyrics_manager_progress)
 
-        self.lyrics_manager_table = QTableWidget(0, 3)
+        self.lyrics_manager_cancel_btn = QPushButton("Cancel Scan")
+        self.lyrics_manager_cancel_btn.setEnabled(False)
+        self.lyrics_manager_cancel_btn.clicked.connect(self.cancel_lyrics_manager_scan)
+        lm_progress_layout.addWidget(self.lyrics_manager_cancel_btn, alignment=Qt.AlignCenter)
+
+        lm_progress_layout.addStretch(1)
+
+        self.lyrics_manager_stats_container = QWidget()
+        lm_stats_layout = QHBoxLayout(self.lyrics_manager_stats_container)
+        lm_stats_layout.setContentsMargins(0, 0, 0, 0)
+        lm_stats_layout.setSpacing(10)
+
+        self.stat_lm_scanned_box, self.stat_lm_scanned_lbl = create_stat_box("Scanned Files")
+        self.stat_lm_embedded_box, self.stat_lm_embedded_lbl = create_stat_box("Embedded")
+        self.stat_lm_missing_box, self.stat_lm_missing_lbl = create_stat_box("Missing Embedded")
+        self.stat_lm_lrc_box, self.stat_lm_lrc_lbl = create_stat_box("Matching LRC")
+        self.stat_lm_errors_box, self.stat_lm_errors_lbl = create_stat_box("Errors")
+
+        lm_stats_layout.addWidget(self.stat_lm_scanned_box)
+        lm_stats_layout.addWidget(self.stat_lm_embedded_box)
+        lm_stats_layout.addWidget(self.stat_lm_missing_box)
+        lm_stats_layout.addWidget(self.stat_lm_lrc_box)
+        lm_stats_layout.addWidget(self.stat_lm_errors_box)
+
+        self.lyrics_manager_table = QTableWidget(0, 4)
         self.lyrics_manager_table.verticalHeader().setVisible(False)
+        self.lyrics_manager_table.setItemDelegateForColumn(0, TableCheckDelegate(self.lyrics_manager_table))
         self._configure_lyrics_manager_scan_table()
+        self.lyrics_manager_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
         self.lyrics_manager_table.setAlternatingRowColors(True)
-        self.lyrics_manager_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.lyrics_manager_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.lyrics_manager_table.setSortingEnabled(True)
+        self.lyrics_manager_table.setSelectionMode(QTableWidget.NoSelection)
+        self.lyrics_manager_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
+        self.lyrics_manager_table.horizontalHeader().setSortIndicator(1, Qt.AscendingOrder)
+        self.lyrics_manager_table.horizontalHeader().setSortIndicatorShown(False)
+        self.lyrics_manager_table.horizontalHeader().setSectionsClickable(True)
+        self.lyrics_manager_table.horizontalHeader().sectionClicked.connect(self._sort_lyrics_manager_table)
+        self.lyrics_manager_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.lyrics_manager_table.customContextMenuRequested.connect(self._show_lyrics_manager_context_menu)
 
-        lyrics_manager_layout.addLayout(lyrics_manager_controls)
-        lyrics_manager_layout.addWidget(self.lyrics_manager_summary_label)
-        lyrics_manager_layout.addWidget(self.lyrics_manager_progress)
-        lyrics_manager_layout.addWidget(self.lyrics_manager_table, 1)
+        self.lyrics_manager_results_page = QWidget()
+        lm_results_layout = QVBoxLayout(self.lyrics_manager_results_page)
+        lm_results_layout.setContentsMargins(0, 0, 0, 0)
+        lm_results_layout.setSpacing(10)
+
+        lm_results_layout.addLayout(lyrics_manager_controls)
+        lm_results_layout.addWidget(self.lyrics_manager_stats_container)
+        lm_results_layout.addWidget(self.lyrics_manager_table, 1)
+
+        self.lyrics_manager_stack.addWidget(self.lyrics_manager_progress_page)
+        self.lyrics_manager_stack.addWidget(self.lyrics_manager_results_page)
+        self.lyrics_manager_stack.setCurrentIndex(1)
+
+        lyrics_manager_layout.addWidget(self.lyrics_manager_stack, 1)
 
         file_rename_tab = QWidget()
         file_rename_layout = QVBoxLayout(file_rename_tab)
@@ -2873,6 +3023,7 @@ class ToolboxWindow(QMainWindow):
         self._album_art_initial_scan_done = False
         self._music_compatibility_initial_scan_done = False
         self._metadata_manager_initial_scan_done = False
+        self._lyrics_manager_initial_scan_done = False
 
         self._build_help_pane()
         
@@ -3733,7 +3884,12 @@ class ToolboxWindow(QMainWindow):
         self._file_rename_scan_target = None
 
     def _set_lyrics_manager_idle(self, message: str) -> None:
-        self.lyrics_manager_summary_label.setText(message)
+        self.stat_lm_scanned_lbl.setText("-")
+        self.stat_lm_embedded_lbl.setText("-")
+        self.stat_lm_missing_lbl.setText("-")
+        self.stat_lm_lrc_lbl.setText("-")
+        self.stat_lm_errors_lbl.setText("-")
+        self.lyrics_manager_progress_label.setText(message)
         self.lyrics_manager_progress.setRange(0, 1)
         self.lyrics_manager_progress.setValue(0)
         self.lyrics_manager_progress.setFormat("Idle")
@@ -3744,26 +3900,26 @@ class ToolboxWindow(QMainWindow):
         self.lyrics_manager_scan_btn.setEnabled(True)
         self.lyrics_manager_bulk_lookup_btn.setEnabled(False)
         self.lyrics_manager_export_lrc_btn.setEnabled(False)
-        self.lyrics_manager_apply_lookup_btn.setEnabled(False)
+        self.lyrics_manager_apply_lookup_btn.setVisible(False)
         self._lyrics_manager_scan_target = None
         self._lyrics_manager_scan_results = []
         self._lyrics_lookup_results = []
 
     def _configure_lyrics_manager_scan_table(self) -> None:
-        self.lyrics_manager_table.setColumnCount(3)
+        self.lyrics_manager_table.setColumnCount(4)
         self.lyrics_manager_table.setHorizontalHeaderLabels(
-            ["File", "Embedded", "Matching LRC File"]
+            ["", "File", "Embedded Lyrics", "Matching LRC File"]
         )
-        self._configure_resizable_table_columns(self.lyrics_manager_table, [420, 120, 220])
+        self._configure_resizable_table_columns(self.lyrics_manager_table, [40, 420, 120, 220])
 
     def _configure_lyrics_manager_lookup_table(self) -> None:
-        self.lyrics_manager_table.setColumnCount(5)
+        self.lyrics_manager_table.setColumnCount(6)
         self.lyrics_manager_table.setHorizontalHeaderLabels(
-            ["File", "Lookup", "Source", "Apply", "Preview"]
+            ["", "File", "Lookup", "Source", "Apply", "Preview"]
         )
         self._configure_resizable_table_columns(
             self.lyrics_manager_table,
-            [320, 120, 140, 100, 340],
+            [40, 320, 120, 140, 100, 340],
         )
 
     def _set_backup_restore_idle(self, message: str) -> None:
@@ -4684,6 +4840,9 @@ class ToolboxWindow(QMainWindow):
             return extension
         return "(no extension)"
 
+    def cancel_lyrics_manager_scan(self) -> None:
+        self._cancel_lyrics_manager_scan = True
+
     def cancel_metadata_manager_scan(self) -> None:
         self._metadata_manager_scan_cancelled = True
         self.metadata_manager_cancel_btn.setEnabled(False)
@@ -5197,6 +5356,12 @@ class ToolboxWindow(QMainWindow):
             if target:
                 self.scan_missing_metadata()
 
+        if index == self._lyrics_manager_tab_index and not self._lyrics_manager_initial_scan_done:
+            self._lyrics_manager_initial_scan_done = True
+            target = self.path_input.text().strip()
+            if target:
+                self.scan_embedded_lyrics()
+
         if index != self._directory_tab_index:
             return
 
@@ -5674,6 +5839,123 @@ class ToolboxWindow(QMainWindow):
                         break
 
             self.album_art_table.setRowHidden(row, not text_match)
+
+    def _sort_lyrics_manager_table(self, col: int) -> None:
+        if col == 0:
+            return
+            
+        header = self.lyrics_manager_table.horizontalHeader()
+        header.setSortIndicatorShown(True)
+        if header.sortIndicatorSection() == col:
+            order = Qt.AscendingOrder if header.sortIndicatorOrder() == Qt.DescendingOrder else Qt.DescendingOrder
+        else:
+            order = Qt.AscendingOrder
+            
+        header.setSortIndicator(col, order)
+        self.lyrics_manager_table.sortByColumn(col, order)
+
+    def _reapply_lyrics_manager_sort(self) -> None:
+        header = self.lyrics_manager_table.horizontalHeader()
+        col = header.sortIndicatorSection()
+        if col != 0:
+            self.lyrics_manager_table.sortByColumn(col, header.sortIndicatorOrder())
+
+    def _show_lyrics_manager_context_menu(self, pos) -> None:
+        if not hasattr(self, "lyrics_manager_table"):
+            return
+            
+        item = self.lyrics_manager_table.itemAt(pos)
+        if not item:
+            return
+            
+        row = item.row()
+        file_name_item = self.lyrics_manager_table.item(row, 1)
+        if not file_name_item:
+            return
+            
+        relative_path = file_name_item.text()
+        lyrics_text = ""
+        
+        if self.lyrics_manager_table.columnCount() == 6:
+            for result in getattr(self, "_lyrics_lookup_results", []):
+                if result.get("relative_path") == relative_path:
+                    lyrics_text = str(result.get("lyrics_text", ""))
+                    break
+        elif self.lyrics_manager_table.columnCount() == 4:
+            target = getattr(self, "_lyrics_manager_scan_target", "")
+            if target:
+                file_path = Path(target) / relative_path
+                entries, _ = self._embedded_lyrics_entries_for_file(file_path)
+                if entries:
+                    lyrics_text = self._best_lrc_text_from_entries(entries)
+        
+        if lyrics_text:
+            menu = QMenu(self)
+            preview_action = menu.addAction("Preview Full Lyrics")
+            action = menu.exec(self.lyrics_manager_table.viewport().mapToGlobal(pos))
+            if action == preview_action:
+                self._show_lyrics_preview_dialog(relative_path, lyrics_text)
+
+    def _show_lyrics_preview_dialog(self, title: str, lyrics_text: str) -> None:
+        from PySide6.QtWidgets import QTextEdit, QDialogButtonBox, QVBoxLayout
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Lyrics Preview - {title}")
+        dialog.resize(600, 700)
+        
+        layout = QVBoxLayout(dialog)
+        
+        text_edit = QTextEdit()
+        text_edit.setPlainText(lyrics_text)
+        text_edit.setReadOnly(True)
+        layout.addWidget(text_edit)
+        
+        button_box = QDialogButtonBox(QDialogButtonBox.Close)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        dialog.exec()
+
+    def _apply_lyrics_manager_table_filter(self, query: str) -> None:
+        if not hasattr(self, "lyrics_manager_table"):
+            return
+
+        normalized_query = query.strip().lower()
+        filter_all = not normalized_query
+        
+        filter_index = 0
+        if hasattr(self, "lyrics_manager_filter_combo"):
+            filter_index = self.lyrics_manager_filter_combo.currentIndex()
+
+        for row in range(self.lyrics_manager_table.rowCount()):
+            embedded_item = self.lyrics_manager_table.item(row, 2)
+            lrc_item = self.lyrics_manager_table.item(row, 3)
+            
+            embedded_text = embedded_item.text() if embedded_item else ""
+            lrc_text = lrc_item.text() if lrc_item else ""
+            
+            combo_match = True
+            if filter_index == 1:
+                combo_match = (embedded_text == "Yes" and not lrc_text)
+            elif filter_index == 2:
+                combo_match = (embedded_text == "No" and not lrc_text)
+            elif filter_index == 3:
+                combo_match = bool(lrc_text)
+            elif filter_index == 4:
+                combo_match = (embedded_text == "Error")
+                
+            if not combo_match:
+                self.lyrics_manager_table.setRowHidden(row, True)
+                continue
+
+            text_match = filter_all
+            if not filter_all:
+                for col in range(1, self.lyrics_manager_table.columnCount()):
+                    item = self.lyrics_manager_table.item(row, col)
+                    if item and normalized_query in item.text().lower():
+                        text_match = True
+                        break
+
+            self.lyrics_manager_table.setRowHidden(row, not text_match)
 
     def _reset_album_art_results(self) -> None:
         self.stat_scanned_lbl.setText("-")
@@ -7382,17 +7664,27 @@ class ToolboxWindow(QMainWindow):
         self.lyrics_manager_scan_btn.setEnabled(False)
         self.lyrics_manager_bulk_lookup_btn.setEnabled(False)
         self.lyrics_manager_export_lrc_btn.setEnabled(False)
-        self.lyrics_manager_apply_lookup_btn.setEnabled(False)
+        self.lyrics_manager_apply_lookup_btn.setVisible(False)
+
+        self.lyrics_manager_stack.setCurrentIndex(0)
+        self.lyrics_manager_cancel_btn.setEnabled(True)
+        self._cancel_lyrics_manager_scan = False
 
         if total_audio == 0:
             self.lyrics_manager_progress.setRange(0, 1)
             self.lyrics_manager_progress.setValue(0)
             self.lyrics_manager_progress.setFormat("Complete: no audio files found")
-            self.lyrics_manager_summary_label.setText("No audio files found in target.")
+            self.stat_lm_scanned_lbl.setText("0/0")
+            self.stat_lm_embedded_lbl.setText("-")
+            self.stat_lm_missing_lbl.setText("-")
+            self.stat_lm_lrc_lbl.setText("-")
+            self.stat_lm_errors_lbl.setText("-")
             self._lyrics_manager_scan_target = str(resolved_target)
             self.lyrics_manager_scan_btn.setEnabled(True)
             self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
             self.lyrics_manager_export_lrc_btn.setEnabled(True)
+            self.lyrics_manager_cancel_btn.setEnabled(False)
+            self.lyrics_manager_stack.setCurrentIndex(1)
             return
 
         with_lyrics = 0
@@ -7404,14 +7696,22 @@ class ToolboxWindow(QMainWindow):
 
         try:
             for index, file_path in enumerate(audio_files, start=1):
+                if getattr(self, "_cancel_lyrics_manager_scan", False):
+                    self.lyrics_manager_progress.setFormat(f"Scan cancelled at {index-1}/{total_audio}")
+                    self.lyrics_manager_progress_label.setText(f"Scan cancelled at {index-1}/{total_audio}")
+                    pass
+                    break
+
+                self.lyrics_manager_progress_label.setText(file_path.name)
                 entries, error = self._embedded_lyrics_entries_for_file(file_path)
                 try:
                     relative_path = file_path.relative_to(resolved_target).as_posix()
                 except Exception:
                     relative_path = str(file_path)
 
-                lrc_exists = file_path.with_suffix(".lrc").exists()
-                lrc_status = "Yes" if lrc_exists else "No"
+                lrc_path = file_path.with_suffix(".lrc")
+                lrc_exists = lrc_path.exists()
+                lrc_status = lrc_path.name if lrc_exists else ""
                 if lrc_exists:
                     matching_lrc += 1
 
@@ -7439,40 +7739,55 @@ class ToolboxWindow(QMainWindow):
                 self.lyrics_manager_progress.setValue(index)
                 self.lyrics_manager_progress.setFormat(f"Scanning {index}/{total_audio}")
                 if index % 25 == 0 or index == total_audio:
-                    self.lyrics_manager_summary_label.setText(
-                        f"Scanning: {index}/{total_audio} | With lyrics: {with_lyrics} | Without lyrics: {without_lyrics} | Errors: {error_count}"
-                    )
+                    self.stat_lm_scanned_lbl.setText(f"{index}/{total_audio}")
+                    self.stat_lm_embedded_lbl.setText(str(with_lyrics))
+                    self.stat_lm_missing_lbl.setText(str(without_lyrics))
+                    self.stat_lm_lrc_lbl.setText(str(matching_lrc))
+                    self.stat_lm_errors_lbl.setText(str(error_count))
                 QApplication.processEvents()
         finally:
             self.lyrics_manager_scan_btn.setEnabled(True)
             self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
             self.lyrics_manager_export_lrc_btn.setEnabled(True)
+            self.lyrics_manager_cancel_btn.setEnabled(False)
+            self.lyrics_manager_stack.setCurrentIndex(1)
 
-        self.lyrics_manager_table.setSortingEnabled(False)
         self.lyrics_manager_table.setUpdatesEnabled(False)
         try:
             self.lyrics_manager_table.setRowCount(len(rows))
             for row_index, (file_name, has_lyrics, lrc_status) in enumerate(rows):
-                self.lyrics_manager_table.setItem(row_index, 0, QTableWidgetItem(file_name))
-                self.lyrics_manager_table.setItem(row_index, 1, QTableWidgetItem(has_lyrics))
-                self.lyrics_manager_table.setItem(row_index, 2, QTableWidgetItem(lrc_status))
+                check_item = QTableWidgetItem()
+                check_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
+                check_item.setCheckState(Qt.Unchecked)
+                self.lyrics_manager_table.setItem(row_index, 0, check_item)
+                self.lyrics_manager_table.setItem(row_index, 1, QTableWidgetItem(file_name))
+                self.lyrics_manager_table.setItem(row_index, 2, QTableWidgetItem(has_lyrics))
+                self.lyrics_manager_table.setItem(row_index, 3, QTableWidgetItem(lrc_status))
 
-                status_item = self.lyrics_manager_table.item(row_index, 1)
-                if status_item is None:
-                    continue
+                status_item = self.lyrics_manager_table.item(row_index, 2)
+                lrc_item = self.lyrics_manager_table.item(row_index, 3)
 
-                if has_lyrics == "Yes":
-                    status_item.setBackground(QColor("#2E7D32"))
-                    status_item.setForeground(QColor("#F2FFF2"))
-                elif has_lyrics == "No":
-                    status_item.setBackground(QColor("#3C3C3C"))
-                    status_item.setForeground(QColor("#E2E2E2"))
-                else:
-                    status_item.setBackground(QColor("#7A2C2C"))
-                    status_item.setForeground(QColor("#FFF0F0"))
+                if status_item is not None:
+                    if has_lyrics == "Yes":
+                        status_item.setBackground(QColor("#2E7D32"))
+                        status_item.setForeground(QColor("#F2FFF2"))
+                    elif has_lyrics == "No":
+                        status_item.setBackground(QColor("#3C3C3C"))
+                        status_item.setForeground(QColor("#E2E2E2"))
+                    else:
+                        status_item.setBackground(QColor("#7A2C2C"))
+                        status_item.setForeground(QColor("#FFF0F0"))
+
+                if lrc_item is not None:
+                    if lrc_status:
+                        lrc_item.setBackground(QColor("#2E7D32"))
+                        lrc_item.setForeground(QColor("#F2FFF2"))
+                    else:
+                        lrc_item.setBackground(QColor("#7A2C2C"))
+                        lrc_item.setForeground(QColor("#FFF0F0"))
         finally:
             self.lyrics_manager_table.setUpdatesEnabled(True)
-            self.lyrics_manager_table.setSortingEnabled(True)
+            self._reapply_lyrics_manager_sort()
             self.lyrics_manager_table.viewport().update()
 
         self._lyrics_manager_scan_target = str(resolved_target)
@@ -7482,9 +7797,11 @@ class ToolboxWindow(QMainWindow):
         self.lyrics_manager_progress.setFormat(
             f"Complete: {with_lyrics} with lyrics, {without_lyrics} without lyrics"
         )
-        self.lyrics_manager_summary_label.setText(
-            f"Audio scanned: {total_audio} | Embedded: {with_lyrics} | Without embedded: {without_lyrics} | Matching LRC: {matching_lrc} | Errors: {error_count}"
-        )
+        self.stat_lm_scanned_lbl.setText(f"{total_audio}/{total_audio}")
+        self.stat_lm_embedded_lbl.setText(str(with_lyrics))
+        self.stat_lm_missing_lbl.setText(str(without_lyrics))
+        self.stat_lm_lrc_lbl.setText(str(matching_lrc))
+        self.stat_lm_errors_lbl.setText(str(error_count))
         self.statusBar().showMessage("Embedded lyrics scan completed", 5000)
 
     def _collect_target_audio_files(self, target_root: Path) -> list[Path]:
@@ -7524,6 +7841,18 @@ class ToolboxWindow(QMainWindow):
         endpoint: str,
         params: dict[str, str | int],
     ) -> tuple[object | None, str | None, int]:
+        import time
+        while True:
+            now = time.time()
+            with self._lrclib_lock:
+                limit_until = self._lrclib_rate_limit_until
+            if now < limit_until:
+                if getattr(self, "_cancel_lyrics_manager_scan", False):
+                    return None, "Cancelled", 0
+                time.sleep(0.5)
+            else:
+                break
+
         filtered_params: dict[str, str] = {}
         for key, value in params.items():
             if value is None:
@@ -7577,6 +7906,14 @@ class ToolboxWindow(QMainWindow):
             except urllib.error.HTTPError as exc:
                 if exc.code == 404:
                     return None, None, 404
+                if exc.code == 429:
+                    import time
+                    with self._lrclib_lock:
+                        now = time.time()
+                        if now >= self._lrclib_rate_limit_until:
+                            self._lrclib_rate_limit_until = now + self._lrclib_rate_limit_backoff
+                            self._lrclib_rate_limit_backoff = min(self._lrclib_rate_limit_backoff * 1.5, 60.0)
+                    return None, "RateLimited", 429
                 try:
                     error_payload = exc.read().decode("utf-8", "ignore").strip()
                 except Exception:
@@ -7611,6 +7948,8 @@ class ToolboxWindow(QMainWindow):
 
         try:
             data = json.loads(payload.decode("utf-8", "ignore"))
+            with self._lrclib_lock:
+                self._lrclib_rate_limit_backoff = 2.0
         except Exception as exc:
             return None, f"Invalid API response: {exc}", status
 
@@ -7790,7 +8129,16 @@ class ToolboxWindow(QMainWindow):
                 ("/api/get-cached", "get-cached"),
                 ("/api/get", "get"),
             ]:
-                response, error, status = self._lrclib_request_json(endpoint, signature_params)
+                for _ in range(3):
+                    response, error, status = self._lrclib_request_json(endpoint, signature_params)
+                    if status == 429:
+                        continue
+                    if status == 0:
+                        import time
+                        time.sleep(1)
+                        continue
+                    break
+
                 if error and status != 404:
                     return "Error", f"{source_label}: {error}", ""
                 if not isinstance(response, dict):
@@ -7810,7 +8158,16 @@ class ToolboxWindow(QMainWindow):
         if album:
             search_params["album_name"] = album
 
-        search_response, search_error, search_status = self._lrclib_request_json("/api/search", search_params)
+        for _ in range(3):
+            search_response, search_error, search_status = self._lrclib_request_json("/api/search", search_params)
+            if search_status == 429:
+                continue
+            if search_status == 0:
+                import time
+                time.sleep(1)
+                continue
+            break
+
         if search_error and search_status != 404:
             return "Error", f"search: {search_error}", ""
 
@@ -7846,7 +8203,6 @@ class ToolboxWindow(QMainWindow):
 
     def _populate_lyrics_lookup_table(self) -> None:
         self._configure_lyrics_manager_lookup_table()
-        self.lyrics_manager_table.setSortingEnabled(False)
         self.lyrics_manager_table.setUpdatesEnabled(False)
         try:
             self.lyrics_manager_table.setRowCount(len(self._lyrics_lookup_results))
@@ -7857,14 +8213,18 @@ class ToolboxWindow(QMainWindow):
                 apply_status = str(row_data.get("apply_status") or "-")
                 preview = str(row_data.get("preview") or "")
 
-                self.lyrics_manager_table.setItem(row_index, 0, QTableWidgetItem(relative_path))
-                self.lyrics_manager_table.setItem(row_index, 1, QTableWidgetItem(status))
-                self.lyrics_manager_table.setItem(row_index, 2, QTableWidgetItem(source))
-                self.lyrics_manager_table.setItem(row_index, 3, QTableWidgetItem(apply_status))
-                self.lyrics_manager_table.setItem(row_index, 4, QTableWidgetItem(preview))
+                check_item = QTableWidgetItem()
+                check_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
+                check_item.setCheckState(Qt.Unchecked)
+                self.lyrics_manager_table.setItem(row_index, 0, check_item)
+                self.lyrics_manager_table.setItem(row_index, 1, QTableWidgetItem(relative_path))
+                self.lyrics_manager_table.setItem(row_index, 2, QTableWidgetItem(status))
+                self.lyrics_manager_table.setItem(row_index, 3, QTableWidgetItem(source))
+                self.lyrics_manager_table.setItem(row_index, 4, QTableWidgetItem(apply_status))
+                self.lyrics_manager_table.setItem(row_index, 5, QTableWidgetItem(preview))
 
-                status_item = self.lyrics_manager_table.item(row_index, 1)
-                apply_item = self.lyrics_manager_table.item(row_index, 3)
+                status_item = self.lyrics_manager_table.item(row_index, 2)
+                apply_item = self.lyrics_manager_table.item(row_index, 4)
 
                 if status_item is not None:
                     if status == "Found":
@@ -7886,7 +8246,7 @@ class ToolboxWindow(QMainWindow):
                         apply_item.setForeground(QColor("#FFF0F0"))
         finally:
             self.lyrics_manager_table.setUpdatesEnabled(True)
-            self.lyrics_manager_table.setSortingEnabled(True)
+            self._reapply_lyrics_manager_sort()
             self.lyrics_manager_table.viewport().update()
 
     def bulk_lookup_lyrics(self) -> None:
@@ -7920,31 +8280,27 @@ class ToolboxWindow(QMainWindow):
 
         resolved_target = target_path.resolve()
 
-        # Prefer the prior Scan Lyrics results so bulk lookup only targets
-        # files the scan has already identified as needing lyrics work.
-        scan_results: list[dict[str, object]] = []
-        if self._lyrics_manager_scan_target:
-            try:
-                scan_target_path = Path(self._lyrics_manager_scan_target).resolve()
-            except Exception:
-                scan_target_path = None
+        audio_files = []
+        for row in range(self.lyrics_manager_table.rowCount()):
+            if self.lyrics_manager_table.isRowHidden(row):
+                continue
+            check_state = self.lyrics_manager_table.model().data(self.lyrics_manager_table.model().index(row, 0), Qt.CheckStateRole)
+            if check_state == Qt.Checked:
+                file_name_item = self.lyrics_manager_table.item(row, 1)
+                if file_name_item:
+                    file_name = file_name_item.text()
+                    candidate = Path(file_name)
+                    if not candidate.is_absolute():
+                        candidate = resolved_target / file_name
+                    audio_files.append(candidate)
 
-            if scan_target_path == resolved_target and self._lyrics_manager_scan_results:
-                scan_results = list(self._lyrics_manager_scan_results)
-
-        if scan_results:
-            audio_files = []
-            for row in scan_results:
-                if str(row.get("embedded") or "") != "No":
-                    continue
-                if str(row.get("lrc_status") or "") == "Yes":
-                    continue
-                file_path_text = str(row.get("file_path") or "")
-                if not file_path_text:
-                    continue
-                audio_files.append(Path(file_path_text))
-        else:
-            audio_files = self._collect_target_audio_files(resolved_target)
+        if not audio_files:
+            QMessageBox.information(
+                self,
+                "No Files Selected",
+                "Please select at least one file from the table to perform a bulk lookup.",
+            )
+            return
 
         total_audio = len(audio_files)
 
@@ -7957,23 +8313,11 @@ class ToolboxWindow(QMainWindow):
         self.lyrics_manager_scan_btn.setEnabled(False)
         self.lyrics_manager_bulk_lookup_btn.setEnabled(False)
         self.lyrics_manager_export_lrc_btn.setEnabled(False)
-        self.lyrics_manager_apply_lookup_btn.setEnabled(False)
+        self.lyrics_manager_apply_lookup_btn.setVisible(False)
 
-        if total_audio == 0:
-            self.lyrics_manager_progress.setRange(0, 1)
-            self.lyrics_manager_progress.setValue(0)
-            self.lyrics_manager_progress.setFormat("Complete: no eligible audio files found")
-            if scan_results:
-                self.lyrics_manager_summary_label.setText(
-                    "Scan found no files that needed LRCLIB lookup (embedded lyrics or .lrc sidecars already present)."
-                )
-            else:
-                self.lyrics_manager_summary_label.setText("No audio files found in target.")
-            self.lyrics_manager_scan_btn.setEnabled(True)
-            self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
-            self.lyrics_manager_export_lrc_btn.setEnabled(True)
-            self._lyrics_manager_scan_target = str(resolved_target)
-            return
+        self.lyrics_manager_stack.setCurrentIndex(0)
+        self.lyrics_manager_cancel_btn.setEnabled(True)
+        self._cancel_lyrics_manager_scan = False
 
         found_count = 0
         not_found_count = 0
@@ -7991,6 +8335,16 @@ class ToolboxWindow(QMainWindow):
             # are cached in-memory for this run to avoid duplicate queries.
             lookup_jobs: list[tuple[int, Path, str, dict[str, object] | None, str | None]] = []
             for index, file_path in enumerate(audio_files, start=1):
+                if getattr(self, "_cancel_lyrics_manager_scan", False):
+                    self.lyrics_manager_progress.setFormat(f"Lookup cancelled at {index-1}/{total_audio}")
+                    self.lyrics_manager_progress_label.setText(f"Lookup cancelled at {index-1}/{total_audio}")
+                    break
+
+                self.lyrics_manager_progress.setValue(index)
+                self.lyrics_manager_progress.setFormat(f"Reading metadata {index}/{total_audio}")
+                self.lyrics_manager_progress_label.setText(f"Reading metadata: {file_path.name}")
+                QApplication.processEvents()
+
                 try:
                     relative_path = file_path.relative_to(resolved_target).as_posix()
                 except Exception:
@@ -8061,77 +8415,117 @@ class ToolboxWindow(QMainWindow):
                     )
                     future_to_job[future] = (index, file_path, relative_path, key)
 
-                # Collect results as they complete
-                for future in as_completed(future_to_job):
-                    index, file_path, relative_path, key = future_to_job[future]
-                    try:
-                        status, source, lyrics_text = future.result()
-                    except Exception as exc:
-                        status = "Error"
-                        source = f"exception: {exc}"
-                        lyrics_text = ""
+                # Collect results as they complete without blocking GUI
+                import concurrent.futures
+                futures = set(future_to_job.keys())
+                completed_count = 0
+                
+                while futures:
+                    if getattr(self, "_cancel_lyrics_manager_scan", False):
+                        self.lyrics_manager_progress.setFormat(f"Lookup cancelled at {completed_count}/{total_audio}")
+                        self.lyrics_manager_progress_label.setText(f"Lookup cancelled at {completed_count}/{total_audio}")
+                        for f in futures:
+                            f.cancel()
+                        break
 
-                    # cache the result
-                    try:
-                        self._lrclib_cache[key] = (status, source, lyrics_text)
-                    except Exception:
-                        pass
+                    import time
+                    now = time.time()
+                    with self._lrclib_lock:
+                        limit_until = self._lrclib_rate_limit_until
+                    
+                    if now < limit_until:
+                        remaining = int(limit_until - now)
+                        self.lyrics_manager_progress.setFormat(f"Rate limited. Resuming in {remaining}s...")
+                        self.lyrics_manager_progress_label.setText("API Rate Limit Hit. Auto-backing off...")
 
-                    preview = self._lyrics_lookup_preview(lyrics_text)
-                    apply_status = "Ready" if lyrics_text else "-"
-
-                    self._lyrics_lookup_results.append(
-                        {
-                            "file_path": str(file_path),
-                            "relative_path": relative_path,
-                            "status": status,
-                            "source": source,
-                            "preview": preview,
-                            "lyrics_text": lyrics_text,
-                            "apply_status": apply_status,
-                        }
-                    )
-
-                    if status == "Found":
-                        found_count += 1
-                    elif status == "Not found":
-                        not_found_count += 1
-                    elif status == "Instrumental":
-                        instrumental_count += 1
-                    else:
-                        error_count += 1
-
-                    # update progress for the file's index
-                    self.lyrics_manager_progress.setValue(index)
-                    if index % 10 == 0 or index == total_audio:
-                        self.lyrics_manager_summary_label.setText(
-                            f"Lookup: {index}/{total_audio} | Found: {found_count} | Not found: {not_found_count} | Instrumental: {instrumental_count} | Errors: {error_count}"
-                        )
                     QApplication.processEvents()
+                    
+                    try:
+                        done, not_done = concurrent.futures.wait(
+                            futures, timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED
+                        )
+                    except Exception:
+                        continue
+                        
+                    for future in done:
+                        futures.remove(future)
+                        completed_count += 1
+                        
+                        index, file_path, relative_path, key = future_to_job[future]
+                        self.lyrics_manager_progress_label.setText(f"Looking up: {file_path.name}")
+                        try:
+                            status, source, lyrics_text = future.result()
+                        except Exception as exc:
+                            status = "Error"
+                            source = f"exception: {exc}"
+                            lyrics_text = ""
+
+                        # cache the result
+                        try:
+                            self._lrclib_cache[key] = (status, source, lyrics_text)
+                        except Exception:
+                            pass
+
+                        preview = self._lyrics_lookup_preview(lyrics_text)
+                        apply_status = "Ready" if lyrics_text else "-"
+
+                        self._lyrics_lookup_results.append(
+                            {
+                                "file_path": str(file_path),
+                                "relative_path": relative_path,
+                                "status": status,
+                                "source": source,
+                                "preview": preview,
+                                "lyrics_text": lyrics_text,
+                                "apply_status": apply_status,
+                            }
+                        )
+
+                        if status == "Found":
+                            found_count += 1
+                        elif status == "Not found":
+                            not_found_count += 1
+                        elif status == "Instrumental":
+                            instrumental_count += 1
+                        else:
+                            error_count += 1
+
+                        # update progress for the file's index
+                        self.lyrics_manager_progress.setValue(index)
+                        if index % 10 == 0 or index == total_audio:
+                            self.stat_lm_scanned_lbl.setText(f"{index}/{total_audio}")
+                            self.stat_lm_embedded_lbl.setText(str(found_count))
+                            self.stat_lm_missing_lbl.setText(str(not_found_count))
+                            self.stat_lm_lrc_lbl.setText(str(instrumental_count))
+                            self.stat_lm_errors_lbl.setText(str(error_count))
         finally:
             self.lyrics_manager_scan_btn.setEnabled(True)
             self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
             self.lyrics_manager_export_lrc_btn.setEnabled(True)
+            self.lyrics_manager_cancel_btn.setEnabled(False)
+            self.lyrics_manager_stack.setCurrentIndex(1)
 
         self._lyrics_manager_scan_target = str(resolved_target)
         self._populate_lyrics_lookup_table()
-        self.lyrics_manager_apply_lookup_btn.setEnabled(found_count > 0)
+        self.lyrics_manager_apply_lookup_btn.setVisible(found_count > 0)
 
         self.lyrics_manager_progress.setRange(0, total_audio)
         self.lyrics_manager_progress.setValue(total_audio)
         self.lyrics_manager_progress.setFormat(f"Complete: {found_count} lyrics found")
-        self.lyrics_manager_summary_label.setText(
-            f"Bulk lookup complete | Audio scanned: {total_audio} | Found: {found_count} | Not found: {not_found_count} | Instrumental: {instrumental_count} | Errors: {error_count}"
-        )
+        self.stat_lm_scanned_lbl.setText(f"{total_audio}/{total_audio}")
+        self.stat_lm_embedded_lbl.setText(str(found_count))
+        self.stat_lm_missing_lbl.setText(str(not_found_count))
+        self.stat_lm_lrc_lbl.setText(str(instrumental_count))
+        self.stat_lm_errors_lbl.setText(str(error_count))
         self.statusBar().showMessage("Bulk lyrics lookup completed", 5000)
 
     def apply_bulk_lookup_results(self) -> None:
-        ready_rows = [
-            row
-            for row in self._lyrics_lookup_results
-            if str(row.get("status") or "") == "Found"
-            and str(row.get("lyrics_text") or "").strip()
-        ]
+        ready_rows = []
+        for i, row in enumerate(self._lyrics_lookup_results):
+            if self.lyrics_manager_table.isRowHidden(i):
+                continue
+            if str(row.get("status") or "") == "Found" and str(row.get("lyrics_text") or "").strip():
+                ready_rows.append(row)
 
         if not self._lyrics_manager_scan_target:
             QMessageBox.information(
@@ -8167,7 +8561,7 @@ class ToolboxWindow(QMainWindow):
         self.lyrics_manager_scan_btn.setEnabled(False)
         self.lyrics_manager_bulk_lookup_btn.setEnabled(False)
         self.lyrics_manager_export_lrc_btn.setEnabled(False)
-        self.lyrics_manager_apply_lookup_btn.setEnabled(False)
+        self.lyrics_manager_apply_lookup_btn.setVisible(False)
 
         self.lyrics_manager_progress.setRange(0, len(ready_rows))
         self.lyrics_manager_progress.setValue(0)
@@ -8195,23 +8589,19 @@ class ToolboxWindow(QMainWindow):
                 self.lyrics_manager_progress.setValue(index)
                 self.lyrics_manager_progress.setFormat(f"Applying {index}/{len(ready_rows)}")
                 if index % 10 == 0 or index == len(ready_rows):
-                    self.lyrics_manager_summary_label.setText(
-                        f"Applying lookup results: {index}/{len(ready_rows)} | Applied: {applied_count} | Errors: {len(errors)}"
-                    )
+                    pass
                 QApplication.processEvents()
         finally:
             self.lyrics_manager_scan_btn.setEnabled(True)
             self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
             self.lyrics_manager_export_lrc_btn.setEnabled(True)
-            self.lyrics_manager_apply_lookup_btn.setEnabled(applied_count > 0)
+            self.lyrics_manager_apply_lookup_btn.setVisible(applied_count > 0)
 
         self._populate_lyrics_lookup_table()
         self.lyrics_manager_progress.setRange(0, len(ready_rows))
         self.lyrics_manager_progress.setValue(len(ready_rows))
         self.lyrics_manager_progress.setFormat(f"Complete: {applied_count} .lrc files written")
-        self.lyrics_manager_summary_label.setText(
-            f"Lookup apply complete | Applied: {applied_count} | Errors: {len(errors)}"
-        )
+        QMessageBox.information(self, "Lookup Apply Complete", f"Applied: {applied_count}\nErrors: {len(errors)}")
 
         lines = [
             f"Lookup results ready: {len(ready_rows)}",
@@ -8258,25 +8648,42 @@ class ToolboxWindow(QMainWindow):
             return
 
         resolved_target = target_path.resolve()
-        audio_files = self._collect_target_audio_files(resolved_target)
-        total_audio = len(audio_files)
-        if total_audio == 0:
-            QMessageBox.information(self, "No Audio Files", "No audio files found in target.")
+        audio_files = []
+        for row in range(self.lyrics_manager_table.rowCount()):
+            if self.lyrics_manager_table.isRowHidden(row):
+                continue
+            check_state = self.lyrics_manager_table.model().data(self.lyrics_manager_table.model().index(row, 0), Qt.CheckStateRole)
+            if check_state == Qt.Checked:
+                file_name_item = self.lyrics_manager_table.item(row, 1)
+                if file_name_item:
+                    file_name = file_name_item.text()
+                    candidate = Path(file_name)
+                    if not candidate.is_absolute():
+                        candidate = resolved_target / file_name
+                    audio_files.append(candidate)
+
+        if not audio_files:
+            QMessageBox.information(
+                self,
+                "No Files Selected",
+                "Please select at least one file from the table to convert.",
+            )
             return
 
-        confirm = QMessageBox.question(
-            self,
-            "Convert Embedded Lyrics To .lrc",
-            (
-                "Create .lrc files next to songs using embedded lyrics?\n\n"
-                "Naming rule: song.ext -> song.lrc (same base name).\n"
-                "Existing .lrc files with matching names will be overwritten.\n\n"
-                f"Audio files to scan: {total_audio}"
-            ),
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
+        total_audio = len(audio_files)
+
+        dialog = LyricsConversionPreviewDialog(
+            audio_files, 
+            resolved_target, 
+            getattr(self, "_lyrics_manager_scan_results", []), 
+            self
         )
-        if confirm != QMessageBox.Yes:
+        if dialog.exec() != QDialog.Accepted:
+            return
+            
+        audio_files = dialog.get_valid_files()
+        total_audio = len(audio_files)
+        if not audio_files:
             return
 
         self.lyrics_manager_scan_btn.setEnabled(False)
@@ -8299,9 +8706,7 @@ class ToolboxWindow(QMainWindow):
             self.lyrics_manager_progress.setValue(index)
             self.lyrics_manager_progress.setFormat(f"Converting {index}/{total_audio}")
             if index % 25 == 0 or index == total_audio:
-                self.lyrics_manager_summary_label.setText(
-                    f"Converting: {index}/{total_audio} | Exported: {exported} | No lyrics: {skipped_no_lyrics} | Errors: {len(errors)}"
-                )
+                pass
 
             QApplication.processEvents()
 
@@ -8344,9 +8749,7 @@ class ToolboxWindow(QMainWindow):
         self.lyrics_manager_scan_btn.setEnabled(True)
         self.lyrics_manager_export_lrc_btn.setEnabled(True)
 
-        self.lyrics_manager_summary_label.setText(
-            f"LRC conversion complete | Exported: {exported} | No lyrics: {skipped_no_lyrics} | Errors: {len(errors)}"
-        )
+        QMessageBox.information(self, "LRC Conversion Complete", f"Exported: {exported}\nNo lyrics: {skipped_no_lyrics}\nErrors: {len(errors)}")
         self.lyrics_manager_progress.setRange(0, total_audio)
         self.lyrics_manager_progress.setValue(total_audio)
         self.lyrics_manager_progress.setFormat(
