@@ -4841,9 +4841,15 @@ class ToolboxWindow(QMainWindow):
         return "(no extension)"
 
     def cancel_lyrics_manager_scan(self) -> None:
+        if self.lyrics_manager_cancel_btn.text() == "Restart":
+            self.scan_embedded_lyrics()
+            return
         self._cancel_lyrics_manager_scan = True
 
     def cancel_metadata_manager_scan(self) -> None:
+        if self.metadata_manager_cancel_btn.text() == "Restart":
+            self.scan_missing_metadata()
+            return
         self._metadata_manager_scan_cancelled = True
         self.metadata_manager_cancel_btn.setEnabled(False)
         self.metadata_manager_progress_label.setText("Cancelling scan...")
@@ -4891,6 +4897,7 @@ class ToolboxWindow(QMainWindow):
         self.metadata_manager_stack.setCurrentIndex(0)
         self.metadata_manager_progress.setRange(0, 0)
         self.metadata_manager_progress.setFormat("Discovering audio files...")
+        self.metadata_manager_cancel_btn.setText("Cancel Scan")
         self.metadata_manager_cancel_btn.setEnabled(True)
         self._metadata_manager_scan_cancelled = False
 
@@ -4982,13 +4989,13 @@ class ToolboxWindow(QMainWindow):
                 results.append((str(file_path.parent), file_path.name, "", "", ""))
 
         if self._metadata_manager_scan_cancelled:
-            self.metadata_manager_progress_label.setText("Idle")
-            self.metadata_manager_progress.setRange(0, 1)
-            self.metadata_manager_progress.setValue(0)
-            self.metadata_manager_progress.setFormat("Idle")
-            self.metadata_manager_stack.setCurrentIndex(1)
+            self.metadata_manager_progress_label.setText("Scan cancelled")
+            self.metadata_manager_progress.setFormat("Scan cancelled")
             self.stat_mm_scanned_lbl.setText("Cancelled")
             self.stat_mm_missing_lbl.setText("Cancelled")
+            self.metadata_manager_cancel_btn.setText("Restart")
+            self.metadata_manager_cancel_btn.setEnabled(True)
+            self.metadata_manager_stack.setCurrentIndex(0)
             return
 
         self.metadata_manager_progress_label.setText("Idle")
@@ -6623,6 +6630,7 @@ class ToolboxWindow(QMainWindow):
             self.statusBar().showMessage("Album art scan is already running")
             return
 
+        self.album_art_cancel_btn.setText("Cancel Scan")
         target = self.path_input.text().strip()
         if not target:
             self.album_art_table.setRowCount(0)
@@ -6806,7 +6814,8 @@ class ToolboxWindow(QMainWindow):
     ) -> None:
         self.album_art_fix_btn.setEnabled(False)
         self.album_art_download_btn.setEnabled(False)
-        self.album_art_cancel_btn.setEnabled(False)
+        self.album_art_cancel_btn.setText("Restart")
+        self.album_art_cancel_btn.setEnabled(True)
         self._last_incompatible_files = []
         
         self.album_art_progress.setRange(0, max(total_audio, 1))
@@ -6817,6 +6826,10 @@ class ToolboxWindow(QMainWindow):
         self.statusBar().showMessage("Album art compatibility scan cancelled")
 
     def cancel_album_art_scan(self) -> None:
+        if self.album_art_cancel_btn.text() == "Restart":
+            self.scan_album_art_compatibility()
+            return
+            
         worker = self._scan_worker
         thread = self._scan_thread
         if worker is None or thread is None or not thread.isRunning():
@@ -6833,6 +6846,7 @@ class ToolboxWindow(QMainWindow):
             self.statusBar().showMessage("Music compatibility scan is already running")
             return
 
+        self.music_compatibility_cancel_btn.setText("Cancel Scan")
         target = self.path_input.text().strip()
         if not target:
             self.music_compatibility_table_model.update_data([])
@@ -6873,6 +6887,8 @@ class ToolboxWindow(QMainWindow):
         self.stat_mc_unknown_lbl.setText("-")
         self.stat_mc_skipped_lbl.setText("-")
         self.music_compatibility_stack.setCurrentIndex(0)
+        self.music_compatibility_cancel_btn.setText("Cancel Scan")
+        self.music_compatibility_cancel_btn.setEnabled(True)
         self.music_compatibility_progress.setRange(0, 1)
         self.music_compatibility_progress.setValue(0)
         self.music_compatibility_progress.setFormat("Preparing scan...")
@@ -6904,6 +6920,9 @@ class ToolboxWindow(QMainWindow):
         self._music_compatibility_scan_thread.start()
 
     def cancel_music_compatibility_scan(self) -> None:
+        if self.music_compatibility_cancel_btn.text() == "Restart":
+            self.scan_music_compatibility()
+            return
         worker = self._music_compatibility_scan_worker
         thread = self._music_compatibility_scan_thread
         if worker is None or thread is None or not thread.isRunning():
@@ -6961,7 +6980,8 @@ class ToolboxWindow(QMainWindow):
         self._last_music_compatibility_unsupported_count = 0
         self._last_music_compatibility_eq_incompatible_count = 0
         self.music_compatibility_scan_btn.setEnabled(True)
-        self.music_compatibility_cancel_btn.setEnabled(False)
+        self.music_compatibility_cancel_btn.setText("Restart")
+        self.music_compatibility_cancel_btn.setEnabled(True)
         self.music_compatibility_progress.setRange(0, max(total, 1))
         self.music_compatibility_progress.setValue(min(scanned, max(total, 1)))
         self.music_compatibility_progress.setFormat(
@@ -6973,7 +6993,7 @@ class ToolboxWindow(QMainWindow):
         self.stat_mc_unsupported_lbl.setText(str(unsupported))
         self.stat_mc_unknown_lbl.setText(str(unknown))
         self.stat_mc_skipped_lbl.setText(str(skipped))
-        self.music_compatibility_stack.setCurrentIndex(1)
+        self.music_compatibility_stack.setCurrentIndex(0)
         self.statusBar().showMessage("Music compatibility scan cancelled", 5000)
         self._update_music_compatibility_convert_button_state()
 
@@ -7630,6 +7650,7 @@ class ToolboxWindow(QMainWindow):
         self.statusBar().showMessage("Music compatibility scan failed", 5000)
 
     def scan_embedded_lyrics(self) -> None:
+        self.lyrics_manager_cancel_btn.setText("Cancel Scan")
         target = self.path_input.text().strip()
         if not target:
             self._set_lyrics_manager_idle("Choose a target before scanning embedded lyrics.")
@@ -7749,8 +7770,13 @@ class ToolboxWindow(QMainWindow):
             self.lyrics_manager_scan_btn.setEnabled(True)
             self.lyrics_manager_bulk_lookup_btn.setEnabled(True)
             self.lyrics_manager_export_lrc_btn.setEnabled(True)
-            self.lyrics_manager_cancel_btn.setEnabled(False)
-            self.lyrics_manager_stack.setCurrentIndex(1)
+            if self._cancel_lyrics_manager_scan:
+                self.lyrics_manager_cancel_btn.setText("Restart")
+                self.lyrics_manager_cancel_btn.setEnabled(True)
+                self.lyrics_manager_stack.setCurrentIndex(0)
+            else:
+                self.lyrics_manager_cancel_btn.setEnabled(False)
+                self.lyrics_manager_stack.setCurrentIndex(1)
 
         self.lyrics_manager_table.setUpdatesEnabled(False)
         try:
