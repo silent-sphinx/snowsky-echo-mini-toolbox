@@ -2510,6 +2510,23 @@ class ToolboxWindow(QMainWindow):
         file_rename_controls.addWidget(self.file_rename_apply_btn)
         file_rename_controls.addStretch(1)
 
+        self.file_rename_stats_container = QWidget()
+        fr_stats_layout = QHBoxLayout(self.file_rename_stats_container)
+        fr_stats_layout.setContentsMargins(0, 0, 0, 0)
+        fr_stats_layout.setSpacing(10)
+
+        self.stat_fr_scanned_box, self.stat_fr_scanned_lbl = create_stat_box("Audio Scanned")
+        self.stat_fr_suggestions_box, self.stat_fr_suggestions_lbl = create_stat_box("Suggestions")
+        self.stat_fr_matching_box, self.stat_fr_matching_lbl = create_stat_box("Already Matching")
+        self.stat_fr_missing_meta_box, self.stat_fr_missing_meta_lbl = create_stat_box("Missing Metadata")
+        self.stat_fr_timeouts_box, self.stat_fr_timeouts_lbl = create_stat_box("Timed Out")
+
+        fr_stats_layout.addWidget(self.stat_fr_scanned_box)
+        fr_stats_layout.addWidget(self.stat_fr_suggestions_box)
+        fr_stats_layout.addWidget(self.stat_fr_matching_box)
+        fr_stats_layout.addWidget(self.stat_fr_missing_meta_box)
+        fr_stats_layout.addWidget(self.stat_fr_timeouts_box)
+
         self.file_rename_summary_label = QLabel("No rename scan run yet.")
         self.file_rename_summary_label.setObjectName("targetSummary")
 
@@ -2535,6 +2552,7 @@ class ToolboxWindow(QMainWindow):
         self.file_rename_table.customContextMenuRequested.connect(self._on_file_rename_table_context_menu)
 
         file_rename_layout.addLayout(file_rename_controls)
+        file_rename_layout.addWidget(self.file_rename_stats_container)
         file_rename_layout.addWidget(self.file_rename_summary_label)
         file_rename_layout.addWidget(self.file_rename_table, 1)
 
@@ -3878,6 +3896,11 @@ class ToolboxWindow(QMainWindow):
         self._cleanup_type_files = {}
 
     def _set_file_rename_idle(self, message: str) -> None:
+        self.stat_fr_scanned_lbl.setText("-")
+        self.stat_fr_suggestions_lbl.setText("-")
+        self.stat_fr_matching_lbl.setText("-")
+        self.stat_fr_missing_meta_lbl.setText("-")
+        self.stat_fr_timeouts_lbl.setText("-")
         self.file_rename_summary_label.setText(message)
         self.file_rename_table.setRowCount(0)
         self.file_rename_apply_btn.setEnabled(False)
@@ -4618,11 +4641,12 @@ class ToolboxWindow(QMainWindow):
 
         self._file_rename_scan_target = str(resolved_target)
         self.file_rename_apply_btn.setEnabled(len(suggestions) > 0)
-        self.file_rename_summary_label.setText(
-            f"Audio scanned: {scanned_audio} | Suggestions: {len(suggestions)} | "
-            f"Already matching: {already_matching} | Missing metadata: {missing_metadata} | "
-            f"Timed out: {metadata_timeouts}"
-        )
+        self.stat_fr_scanned_lbl.setText(str(scanned_audio))
+        self.stat_fr_suggestions_lbl.setText(str(len(suggestions)))
+        self.stat_fr_matching_lbl.setText(str(already_matching))
+        self.stat_fr_missing_meta_lbl.setText(str(missing_metadata))
+        self.stat_fr_timeouts_lbl.setText(str(metadata_timeouts))
+        self.file_rename_summary_label.setText("Scan complete.")
         self.statusBar().showMessage("File rename suggestion scan completed", 4000)
 
     def rename_selected_files(self) -> None:
