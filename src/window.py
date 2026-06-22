@@ -6163,7 +6163,12 @@ class ToolboxWindow(QMainWindow):
         if not art_bytes:
             return False, "No embedded art"
 
-        if art_mime.lower() == "image/jpeg" and jpeg_scan_type(art_bytes) == "Non-progressive":
+        dims = image_size_from_bytes(art_bytes)
+        resolution_ok = True
+        if dims and (dims[0] > 1000 or dims[1] > 1000):
+            resolution_ok = False
+
+        if art_mime.lower() == "image/jpeg" and jpeg_scan_type(art_bytes) == "Non-progressive" and resolution_ok:
             return True, "Already compatible"
 
         converted_jpeg = to_non_progressive_jpeg(art_bytes)
@@ -6342,9 +6347,14 @@ class ToolboxWindow(QMainWindow):
             QMessageBox.information(self, "No Embedded Art", "The selected file has no embedded artwork.")
             return
 
-        if art_mime.lower() == "image/jpeg" and jpeg_scan_type(art_bytes) == "Non-progressive":
+        dims = image_size_from_bytes(art_bytes)
+        resolution_ok = True
+        if dims and (dims[0] > 1000 or dims[1] > 1000):
+            resolution_ok = False
+
+        if art_mime.lower() == "image/jpeg" and jpeg_scan_type(art_bytes) == "Non-progressive" and resolution_ok:
             progress.setValue(6)
-            QMessageBox.information(self, "Already Compatible", "Album art is already JPEG non-progressive.")
+            QMessageBox.information(self, "Already Compatible", "Album art is already compatible (JPEG, non-progressive, ≤1000x1000).")
             self.statusBar().showMessage("Album art is already compatible")
             return
 
@@ -6887,9 +6897,21 @@ class ToolboxWindow(QMainWindow):
                 check_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
                 check_item.setCheckState(Qt.Checked if status == "Incompatible" else Qt.Unchecked)
                 
-                meta_item = QTableWidgetItem(meta_status)
-                if "Missing" in meta_status:
-                    meta_item.setForeground(QColor("#E57373"))
+                display_meta_status = "Found" if not meta_status else meta_status
+                meta_item = QTableWidgetItem(display_meta_status)
+                if "Missing" in display_meta_status or "Error" in display_meta_status:
+                    meta_item.setBackground(QColor("#4A1010"))
+                    if display_meta_status == "Missing Artist/Album":
+                        meta_item.setToolTip("Both Artist and Album tags are missing. Auto-download will fail.")
+                    elif display_meta_status == "Missing Artist":
+                        meta_item.setToolTip("Artist tag is missing. Auto-download may be inaccurate or fail.")
+                    elif display_meta_status == "Missing Album":
+                        meta_item.setToolTip("Album tag is missing. Auto-download may be inaccurate or fail.")
+                    else:
+                        meta_item.setToolTip(f"Metadata issue: {display_meta_status}")
+                else:
+                    meta_item.setBackground(QColor("#1E4620"))
+                    meta_item.setToolTip("Essential metadata (Artist & Album) found. Auto-download is supported.")
 
                 items = [
                     check_item,
@@ -6905,8 +6927,28 @@ class ToolboxWindow(QMainWindow):
                 for col_index, item in enumerate(items):
                     if col_index in (1, 2, 3, 4, 5, 6):
                         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+
+                    if col_index == 2:
+                        if status == "Compatible":
+                            item.setBackground(QColor("#1E4620"))
+                        elif status == "Incompatible":
+                            item.setBackground(QColor("#4A1010"))
+
                     if status == "Incompatible":
-                        item.setBackground(QColor("#4A1010"))
+                        if col_index == 3 and progressive == "True":
+                            item.setBackground(QColor("#4A1010"))
+                            item.setToolTip("JPEG must be non-progressive.")
+                        elif col_index == 4 and file_type != "JPEG":
+                            item.setBackground(QColor("#4A1010"))
+                            item.setToolTip("Format must be JPEG.")
+                        elif col_index == 5 and resolution:
+                            try:
+                                parts = resolution.split("x")
+                                if len(parts) == 2 and (int(parts[0].strip()) > 1000 or int(parts[1].strip()) > 1000):
+                                    item.setBackground(QColor("#4A1010"))
+                                    item.setToolTip("Resolution must be 1000x1000 or lower.")
+                            except ValueError:
+                                pass
                     elif status == "Missing Artwork":
                         item.setBackground(QColor("#6B3E00"))
                     self.album_art_table.setItem(row_index, col_index, item)

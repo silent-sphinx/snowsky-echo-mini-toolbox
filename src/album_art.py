@@ -195,6 +195,10 @@ def to_non_progressive_jpeg(data: bytes, quality: int = 90) -> bytes | None:
     if image.isNull():
         return None
 
+    if image.width() > 1000 or image.height() > 1000:
+        from PySide6.QtCore import Qt
+        image = image.scaled(1000, 1000, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
     encoded = QByteArray()
     buffer = QBuffer(encoded)
     if not buffer.open(QIODevice.WriteOnly):
@@ -373,7 +377,12 @@ def album_art_scan_result(
     dims = image_size_from_bytes(art_bytes)
     resolution = f"{dims[0]} x {dims[1]}" if dims else ""
     progressive = "True" if jpeg_type == "Progressive" else "False"
-    is_compatible = jpeg_type == "Non-progressive"
+    
+    resolution_ok = True
+    if dims and (dims[0] > 1000 or dims[1] > 1000):
+        resolution_ok = False
+        
+    is_compatible = jpeg_type == "Non-progressive" and resolution_ok
     status = "Compatible" if is_compatible else "Incompatible"
     classification = "compatible" if is_compatible else "incompatible"
     return (relative_path, status, progressive, "JPEG", resolution, metadata_status), classification

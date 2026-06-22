@@ -28,6 +28,14 @@ This document describes exactly how the media compatibility checker evaluates au
 
 * This device does not often work well with unusual encodings for tags, best to stick to UTF-16.
 
+## Album Art Requirements
+
+The device has specific requirements for embedded album artwork to be displayed correctly:
+
+* **Format:** Must be JPEG (`image/jpeg`). PNG, GIF, BMP, and other formats are UNSUPPORTED.
+* **JPEG Encoding:** Must be **Baseline (Non-progressive) JPEG**. Progressive JPEGs are UNSUPPORTED and will fail to display.
+* **Resolution:** Must be **1000x1000 pixels or lower**. Resolutions exceeding 1000 pixels may display but will load slowly.
+
 ## File Name Compatibility
 
 The device handles most file names well, but there are exceptions based on tested edge cases:
