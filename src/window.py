@@ -1987,7 +1987,6 @@ class ToolboxWindow(QMainWindow):
         self._lrclib_rate_limit_backoff: float = 2.0
         import threading
         self._lrclib_lock = threading.Lock()
-        self._main_menu_tab_index = -1
         self._about_tab_index = -1
         self._music_compatibility_tab_index = -1
         self._lyrics_manager_tab_index = -1
@@ -2039,72 +2038,13 @@ class ToolboxWindow(QMainWindow):
             base_path = Path(__file__).resolve().parent.parent
         return base_path.joinpath(*parts)
 
-    def _header_logo_pixmap(self) -> QPixmap | None:
-        logo_path = self._asset_path("assets", "toolbox-logo.png")
-        if not logo_path.exists():
-            return None
 
-        pixmap = QPixmap(str(logo_path))
-        if pixmap.isNull():
-            return None
-        return pixmap
-
-    def _position_header_logo(self) -> None:
-        if not hasattr(self, "header_logo_label") or not hasattr(self, "_header_logo_source"):
-            return
-        if self._header_logo_source is None:
-            self.header_logo_label.hide()
-            return
-
-        root = self.centralWidget()
-        if root is None or root.layout() is None:
-            return
-
-        margins = root.layout().contentsMargins()
-        top_y = self.title_label.geometry().top()
-        bottom_y = self.target_label.geometry().bottom()
-        available_height = max(24, bottom_y - top_y + 1)
-
-        left_content_width = max(
-            self.title_label.sizeHint().width(),
-            self.target_label.sizeHint().width(),
-        )
-        left_content_right = margins.left() + left_content_width
-        minimum_gap = 16
-        available_width = root.width() - margins.right() - left_content_right - minimum_gap
-
-        if available_width < 24:
-            self.header_logo_label.hide()
-            return
-
-        scaled = self._header_logo_source.scaled(
-            available_width,
-            available_height,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        if scaled.isNull():
-            self.header_logo_label.hide()
-            return
-
-        x_pos = root.width() - margins.right() - scaled.width()
-        min_x_pos = left_content_right + minimum_gap
-        if x_pos < min_x_pos:
-            self.header_logo_label.hide()
-            return
-        y_pos = top_y + max(0, (available_height - scaled.height()) // 2)
-        self.header_logo_label.setPixmap(scaled)
-        self.header_logo_label.setGeometry(x_pos, y_pos, scaled.width(), scaled.height())
-        self.header_logo_label.show()
-        self.header_logo_label.raise_()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        self._position_header_logo()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._position_header_logo()
 
     def _configure_resizable_table_columns(
         self, table: QTableWidget, default_widths: list[int] | tuple[int, ...] | None = None
@@ -2121,27 +2061,33 @@ class ToolboxWindow(QMainWindow):
     def _build_ui(self) -> None:
         root = QWidget()
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setContentsMargins(12, 16, 16, 16)
         layout.setSpacing(10)
         # print("[DIAGNOSTIC] _build_ui after layout created")
 
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(20)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+
+        title_layout = QVBoxLayout()
+        title_layout.setSpacing(4)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+
         self.title_label = QLabel("Snowsky Echo Mini Toolbox")
         self.title_label.setObjectName("title")
-        layout.addWidget(self.title_label)
+        title_layout.addWidget(self.title_label)
 
         self.target_label = QLabel("Select a Folder or Removable Drive")
         self.target_label.setObjectName("sectionLabel")
-        layout.addWidget(self.target_label)
+        title_layout.addWidget(self.target_label)
 
-        self.header_logo_label = QLabel(root)
-        self.header_logo_label.setObjectName("headerLogo")
-        self.header_logo_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
-        self.header_logo_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self._header_logo_source = self._header_logo_pixmap()
-        if self._header_logo_source is not None:
-            self.header_logo_label.setToolTip("Snowsky Echo Mini Toolbox")
-        else:
-            self.header_logo_label.hide()
+        title_layout.addStretch()
+
+        header_layout.addLayout(title_layout)
+
+        selectors_layout = QVBoxLayout()
+        selectors_layout.setSpacing(10)
+        selectors_layout.setContentsMargins(0, 0, 0, 0)
 
         path_row = QHBoxLayout()
         self.path_input = QLineEdit()
@@ -2202,12 +2148,12 @@ class ToolboxWindow(QMainWindow):
         drive_row.addWidget(self.unmount_drive_btn)
         
 
-        self.current_target_label = QLabel("Current target: none selected")
-        self.current_target_label.setObjectName("targetSummary")
+        selectors_layout.addLayout(path_row)
+        selectors_layout.addLayout(drive_row)
 
-        layout.addLayout(path_row)
-        layout.addLayout(drive_row)
-        layout.addWidget(self.current_target_label)
+        header_layout.addLayout(selectors_layout, 1)
+
+        layout.addLayout(header_layout)
 
         self.tabs = QTabWidget()
         
@@ -3121,78 +3067,6 @@ class ToolboxWindow(QMainWindow):
         backup_restore_layout.addWidget(transfer_section)
         backup_restore_layout.addStretch(1)
 
-        main_menu_tab = QScrollArea()
-        main_menu_tab.setWidgetResizable(True)
-        main_menu_tab.setFrameShape(QFrame.NoFrame)
-        main_menu_content = QWidget()
-        main_menu_outer_layout = QVBoxLayout(main_menu_content)
-        main_menu_outer_layout.setContentsMargins(20, 20, 20, 20)
-        main_menu_outer_layout.setSpacing(20)
-        
-        welcome_text = (
-            "Welcome to the Snowsky Echo Mini Toolbox, your one-stop shop for organizing and converting your music media. "
-            "To start, select the location of your media by browsing or choosing one of the mounted drives at the top of the interface.\n\n"
-            "It is recommended to connect your microSD card directly to your computer using a USB reader, rather than plugging in the Snowsky Echo Mini itself, as the device uses a slower interface."
-        )
-        welcome_lbl = QLabel(welcome_text)
-        welcome_lbl.setWordWrap(True)
-        welcome_lbl.setStyleSheet("font-size: 14px; color: #E3E3E3; line-height: 1.4;")
-        main_menu_outer_layout.addWidget(welcome_lbl)
-        
-        main_menu_layout = QGridLayout()
-        main_menu_layout.setSpacing(15)
-        
-        tools = [
-            ("ℹ️ About Folder/Drive", "View details and properties of the selected target.", "_about_tab_index"),
-            ("📁 Music Browser", "Browse and manage music files with an integrated player.", "_directory_tab_index"),
-            ("🖼️ Album Art", "Scan, download, and update embedded album artwork.", "_album_art_tab_index"),
-            ("🎵 Music Compatibility", "Check and fix audio format compatibility issues.", "_music_compatibility_tab_index"),
-            ("🎤 Lyrics Manager", "Download and embed synchronized lyrics (LRC).", "_lyrics_manager_tab_index"),
-            ("🏷️ File Rename", "Bulk rename files based on rules and metadata.", "_file_rename_tab_index"),
-            ("🧹 File Cleanup", "Clean up unwanted and unsupported files.", "_cleanup_tab_index"),
-            ("📝 Metadata Manager", "Edit audio tags and properties in bulk.", "_metadata_manager_tab_index"),
-            ("💾 Backup/Restore", "Backup to zip or transfer files to another drive.", "_backup_restore_tab_index"),
-        ]
-        
-        row, col = 0, 0
-        for title, desc, attr_name in tools:
-            tile = QPushButton()
-            tile.setObjectName("mainMenuTile")
-            tile.setCursor(Qt.PointingHandCursor)
-            tile.setMinimumHeight(100)
-            
-            tile_layout = QVBoxLayout(tile)
-            tile_layout.setContentsMargins(15, 15, 15, 15)
-            tile_layout.setSpacing(8)
-            
-            title_lbl = QLabel(title)
-            title_lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
-            title_lbl.setStyleSheet("font-size: 15px; font-weight: bold; color: #E3E3E3;")
-            
-            desc_lbl = QLabel(desc)
-            desc_lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
-            desc_lbl.setWordWrap(True)
-            desc_lbl.setStyleSheet("color: #A0A0A0; font-size: 12px;")
-            
-            tile_layout.addWidget(title_lbl)
-            tile_layout.addWidget(desc_lbl)
-            tile_layout.addStretch()
-            
-            tile.clicked.connect(lambda checked=False, a=attr_name: self.tabs.setCurrentIndex(getattr(self, a)) if getattr(self, a, -1) != -1 and self.tabs.isTabEnabled(getattr(self, a)) else None)
-            
-            main_menu_layout.addWidget(tile, row, col)
-            col += 1
-            if col > 2:
-                col = 0
-                row += 1
-                
-        main_menu_layout.setRowStretch(row + 1, 1)
-        main_menu_outer_layout.addLayout(main_menu_layout)
-        main_menu_outer_layout.addStretch(1)
-        main_menu_content.setLayout(main_menu_outer_layout)
-        main_menu_tab.setWidget(main_menu_content)
-
-        self._main_menu_tab_index = self.tabs.addTab(main_menu_tab, "Main Menu")
         self._about_tab_index = self.tabs.addTab(about_tab, "About Folder/Drive")
         self._directory_tab_index = self.tabs.addTab(browser_tab, "Music Browser")
         self._album_art_tab_index = self.tabs.addTab(album_art_tab, "Album Art")
@@ -3206,7 +3080,7 @@ class ToolboxWindow(QMainWindow):
         self._backup_restore_tab_index = self.tabs.addTab(backup_restore_tab, "Backup/Restore")
         
         for i in range(self.tabs.count()):
-            if i not in (self._main_menu_tab_index, self._about_tab_index):
+            if i != self._about_tab_index:
                 self.tabs.setTabEnabled(i, False)
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
@@ -3220,7 +3094,7 @@ class ToolboxWindow(QMainWindow):
         
 
         content_row = QHBoxLayout()
-        content_row.setContentsMargins(0, 0, 0, 0)
+        content_row.setContentsMargins(4, 0, 0, 0)
         content_row.setSpacing(10)
         content_row.addWidget(self.tabs, 1)
         content_row.addWidget(self.help_container, 0)
@@ -3228,13 +3102,10 @@ class ToolboxWindow(QMainWindow):
         layout.addLayout(content_row, 1)
 
         self.setCentralWidget(root)
-        self._position_header_logo()
         self.status_version_label = QLabel(f"Version: {APP_VERSION}")
-        self.status_credit_label = QLabel("Developed by: Silent Sphinx @silent-sphinx")
         self.statusBar().addPermanentWidget(self.status_version_label)
-        self.statusBar().addPermanentWidget(self.status_credit_label)
         self.statusBar().showMessage("Ready")
-        self.tabs.setCurrentIndex(self._main_menu_tab_index)
+        self.tabs.setCurrentIndex(self._about_tab_index)
         # UI build complete
 
     def _on_path_input_editing_finished(self) -> None:
@@ -3500,6 +3371,8 @@ class ToolboxWindow(QMainWindow):
                 font-weight: 700;
                 color: #F4F4F4;
                 padding-bottom: 2px;
+                margin-left: 0px;
+                padding-left: 0px;
             }
             QLabel#subtitle {
                 color: #B5B5B5;
@@ -3510,10 +3383,10 @@ class ToolboxWindow(QMainWindow):
                 color: #E3E3E3;
                 font-weight: 600;
                 padding-top: 2px;
+                margin-left: 0px;
+                padding-left: 4px;
             }
-            QLabel#targetSummary {
-                color: #B5B5B5;
-            }
+
             QWidget#helpPane {
                 background-color: #262626;
                 border: 1px solid #3C3C3C;
@@ -3626,17 +3499,29 @@ class ToolboxWindow(QMainWindow):
                 border-radius: 6px;
             }
             QPushButton#mainMenuTile {
-                background-color: #2D2D2D;
-                border: 1px solid #3C3C3C;
-                border-radius: 6px;
+                background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #323232, stop:1 #2A2A2A);
+                border: 1px solid #404040;
+                border-radius: 12px;
                 text-align: left;
             }
             QPushButton#mainMenuTile:hover {
-                background-color: #383838;
-                border: 1px solid #5A5A5A;
+                background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3A3A3A, stop:1 #323232);
+                border: 1px solid #5C5C5C;
             }
             QPushButton#mainMenuTile:pressed {
-                background-color: #262626;
+                background-color: #242424;
+                border: 1px solid #303030;
+            }
+            QLabel#mainMenuHeader {
+                font-family: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', sans-serif;
+                font-size: 32px;
+                font-weight: 800;
+                color: #FFFFFF;
+                margin-bottom: 5px;
+            }
+            QLabel#mainMenuWelcome {
+                font-size: 15px;
+                color: #B5B5B5;
             }
             QLabel#statTitle {
                 color: #A0A0A0;
@@ -3894,12 +3779,6 @@ class ToolboxWindow(QMainWindow):
         self._drive_scan_worker = None
         self._drive_scan_thread = None
 
-    def _set_current_target_label(self, target: str) -> None:
-        if not target:
-            self.current_target_label.setText("Current target: none selected")
-            return
-        self.current_target_label.setText(f"Current target: {target}")
-
     def _filesystem_looks_compatible(self, filesystem_value: str) -> bool:
         normalized = filesystem_value.lower()
         return "exfat" in normalized or "fat" in normalized
@@ -4054,12 +3933,12 @@ class ToolboxWindow(QMainWindow):
         has_browser_target = has_selected_drive or has_selected_directory
         
         for i in range(self.tabs.count()):
-            if i not in (self._main_menu_tab_index, self._about_tab_index):
+            if i != self._about_tab_index:
                 self.tabs.setTabEnabled(i, has_browser_target)
 
-        if not has_browser_target and self.tabs.currentIndex() not in (self._main_menu_tab_index, self._about_tab_index):
-            if self._main_menu_tab_index >= 0:
-                self.tabs.setCurrentIndex(self._main_menu_tab_index)
+        if not has_browser_target and self.tabs.currentIndex() != self._about_tab_index:
+            if self._about_tab_index >= 0:
+                self.tabs.setCurrentIndex(self._about_tab_index)
 
     def _set_cleanup_idle(self, message: str) -> None:
         self.stat_cleanup_files_lbl.setText("-")
@@ -5559,6 +5438,7 @@ class ToolboxWindow(QMainWindow):
         else:
             QMessageBox.information(self, "Cleanup Completed", "\n".join(message_lines))
 
+        self.statusBar().showMessage(f"Removed {removed} file(s)", 5000)
         self.scan_file_cleanup_breakdown()
 
     def refresh_directory_browser(self, target: str) -> None:
@@ -5599,15 +5479,13 @@ class ToolboxWindow(QMainWindow):
 
         if self._directory_scan_armed and self.tabs.currentIndex() == self._directory_tab_index:
             self._start_directory_size_scan(resolved)
+        self.statusBar().showMessage(f"Refreshed directory browser for: {Path(resolved).name}", 4000)
 
     @Slot(int)
     def on_tab_changed(self, index: int) -> None:
-        if index == self._main_menu_tab_index:
-            self.help_container.hide()
-        else:
-            self.help_container.show()
-            
+        self.help_container.show()
         self._update_help_for_tab(index)
+        self.statusBar().showMessage(f"Viewing {self.tabs.tabText(index).replace('&', '')}", 3000)
         
         if index == self._album_art_tab_index and not self._album_art_initial_scan_done:
             self._album_art_initial_scan_done = True
@@ -5652,14 +5530,13 @@ class ToolboxWindow(QMainWindow):
             self.browser_root_label.setText("")
             self.browser_tree.setEnabled(False)
             self.browser_size_progress.hide()
-            if self._main_menu_tab_index >= 0:
-                self.tabs.setCurrentIndex(self._main_menu_tab_index)
+            if self._about_tab_index >= 0:
+                self.tabs.setCurrentIndex(self._about_tab_index)
             return
 
         self._directory_scan_armed = True
 
         self.path_input.setText(selected_target)
-        self._set_current_target_label(selected_target)
         self.refresh_directory_browser(selected_target)
 
     def _start_directory_size_scan(self, resolved_root: str) -> None:
@@ -6019,6 +5896,7 @@ class ToolboxWindow(QMainWindow):
             self.statusBar().showMessage(f"Failed to update {field} for {file_name_item.text()}: {e}", 5000)
             return
 
+        self.statusBar().showMessage(f"Updated {field} for {file_name_item.text()}", 3000)
         self.metadata_manager_table.blockSignals(True)
         if not new_val:
             item.setBackground(QColor("#7A2C2C"))
@@ -9046,6 +8924,7 @@ class ToolboxWindow(QMainWindow):
         self.lyrics_manager_export_lrc_btn.setEnabled(True)
 
         QMessageBox.information(self, "LRC Conversion Complete", f"Exported: {exported}\nNo lyrics: {skipped_no_lyrics}\nErrors: {len(errors)}")
+        self.statusBar().showMessage(f"Exported {exported} .lrc files", 5000)
         self.lyrics_manager_progress.setRange(0, total_audio)
         self.lyrics_manager_progress.setValue(total_audio)
         self.lyrics_manager_progress.setFormat(
@@ -10436,7 +10315,6 @@ class ToolboxWindow(QMainWindow):
             return
 
         self.path_input.setText(selected_path)
-        self._set_current_target_label(selected_path)
         self._update_directory_tab_access()
         self._update_unmount_drive_button_state()
         self.show_info()
@@ -10444,7 +10322,6 @@ class ToolboxWindow(QMainWindow):
 
     def show_info(self) -> None:
         target = self.path_input.text().strip()
-        self._set_current_target_label(target)
         self.refresh_directory_browser(target)
         self._update_directory_tab_access()
 
