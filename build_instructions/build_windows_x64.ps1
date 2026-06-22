@@ -64,7 +64,7 @@ $ICO_PATH = "build_assets\icons\windows-icon.ico"
 if (Test-Path $ICO_PATH) {
     Write-Host "Using static icon: $ICO_PATH"
 } else {
-    Write-Warning "Static icon not found: $ICO_PATH — installer may use default icon."
+    Write-Warning "Static icon not found: $ICO_PATH - installer may use default icon."
 }
 
 # ---------------------------------------------------------------------------
