@@ -193,6 +193,121 @@ FILE_CLEANUP_CATEGORY_ORDER = [
     "Other",
 ]
 
+FILE_EXTENSION_DESCRIPTIONS: dict[str, str] = {
+    # Audio
+    ".aac": "AAC Audio",
+    ".aif": "AIFF Audio",
+    ".aiff": "AIFF Audio",
+    ".alac": "Apple Lossless Audio",
+    ".ape": "Monkey's Audio (Lossless)",
+    ".dsf": "DSD Stream File",
+    ".flac": "FLAC Lossless Audio",
+    ".m4a": "AAC/ALAC Audio (iTunes)",
+    ".m4b": "AAC Audiobook",
+    ".m4p": "Protected AAC Audio",
+    ".m4r": "iPhone Ringtone",
+    ".mid": "MIDI Sequence",
+    ".midi": "MIDI Sequence",
+    ".mp3": "MP3 Audio",
+    ".mpc": "Musepack Audio",
+    ".oga": "Ogg Audio",
+    ".ogg": "Ogg Vorbis Audio",
+    ".opus": "Opus Audio",
+    ".ra": "RealAudio",
+    ".tak": "TAK Lossless Audio",
+    ".tta": "True Audio (Lossless)",
+    ".wav": "WAV Uncompressed Audio",
+    ".wma": "Windows Media Audio",
+    ".wv": "WavPack Audio",
+    # Image
+    ".bmp": "Bitmap Image",
+    ".gif": "GIF Image",
+    ".heic": "HEIC Image (Apple)",
+    ".heif": "HEIF Image",
+    ".ico": "Icon File",
+    ".jpeg": "JPEG Image",
+    ".jpg": "JPEG Image",
+    ".png": "PNG Image",
+    ".svg": "SVG Vector Image",
+    ".tif": "TIFF Image",
+    ".tiff": "TIFF Image",
+    ".webp": "WebP Image",
+    # Video
+    ".3gp": "3GP Mobile Video",
+    ".avi": "AVI Video",
+    ".flv": "Flash Video",
+    ".m2ts": "Blu-ray Transport Stream",
+    ".m4v": "MPEG-4 Video (iTunes)",
+    ".mkv": "Matroska Video",
+    ".mov": "QuickTime Video",
+    ".mp4": "MP4 Video",
+    ".mpeg": "MPEG Video",
+    ".mpg": "MPEG Video",
+    ".mts": "AVCHD Video",
+    ".ts": "Transport Stream",
+    ".webm": "WebM Video",
+    ".wmv": "Windows Media Video",
+    # Document
+    ".csv": "Comma-Separated Values",
+    ".doc": "Word Document (Legacy)",
+    ".docx": "Word Document",
+    ".epub": "EPUB eBook",
+    ".md": "Markdown Document",
+    ".ods": "OpenDocument Spreadsheet",
+    ".odt": "OpenDocument Text",
+    ".pdf": "PDF Document",
+    ".ppt": "PowerPoint (Legacy)",
+    ".pptx": "PowerPoint Presentation",
+    ".rtf": "Rich Text Format",
+    ".txt": "Plain Text File",
+    ".xls": "Excel Spreadsheet (Legacy)",
+    ".xlsx": "Excel Spreadsheet",
+    # Archive
+    ".7z": "7-Zip Archive",
+    ".bz2": "Bzip2 Compressed",
+    ".gz": "Gzip Compressed",
+    ".rar": "RAR Archive",
+    ".tar": "Tar Archive",
+    ".tgz": "Gzip Tar Archive",
+    ".xz": "XZ Compressed",
+    ".zip": "ZIP Archive",
+    # Playlist
+    ".asx": "ASX Playlist",
+    ".cue": "Cue Sheet",
+    ".m3u": "M3U Playlist",
+    ".m3u8": "M3U8 Playlist (UTF-8)",
+    ".pls": "PLS Playlist",
+    ".xspf": "XSPF Playlist",
+    # Subtitle / Lyrics
+    ".ass": "Advanced SubStation Subtitles",
+    ".lrc": "Synced Lyrics File",
+    ".srt": "SubRip Subtitles",
+    ".ssa": "SubStation Subtitles",
+    ".sub": "MicroDVD Subtitles",
+    ".vtt": "WebVTT Subtitles",
+    # Executable
+    ".app": "macOS Application",
+    ".bat": "Windows Batch Script",
+    ".bin": "Binary Executable",
+    ".command": "macOS Shell Script",
+    ".exe": "Windows Executable",
+    ".msi": "Windows Installer",
+    ".pkg": "macOS Installer Package",
+    ".run": "Linux Installer",
+    ".sh": "Shell Script",
+    # Common hidden / system
+    ".ds_store": "macOS Folder Metadata",
+    ".ini": "Configuration File",
+    ".log": "Log File",
+    ".db": "Database File",
+    ".tmp": "Temporary File",
+    ".bak": "Backup File",
+    ".nfo": "Info/NFO Text File",
+    ".url": "Internet Shortcut",
+    ".lnk": "Windows Shortcut",
+    ".plist": "macOS Property List",
+}
+
 
 class FileBrowserProxyModel(QSortFilterProxyModel):
     """Adds recursive directory size values and stable numeric sorting for the Size column."""
@@ -1890,6 +2005,10 @@ class ToolboxWindow(QMainWindow):
         # Cache LRCLIB lookups by signature to avoid duplicate network requests
         self._lrclib_cache: dict[tuple[str, str, str, int], tuple[str, str, str]] = {}
         self._cleanup_type_files: dict[str, list[Path]] = {}
+        self._cleanup_total_bytes: int = 0
+        self._cleanup_total_files: int = 0
+        self._cleanup_categories_found: int = 0
+        self._cleanup_scan_cancelled: bool = False
         self._last_scan_target: str | None = None
         self._last_incompatible_files: list[str] = []
         self._active_audio_metadata_path: Path | None = None
@@ -2742,11 +2861,41 @@ class ToolboxWindow(QMainWindow):
         cleanup_layout.setContentsMargins(10, 10, 10, 10)
         cleanup_layout.setSpacing(10)
 
-        cleanup_hint = QLabel(
-            "Scan the current target, then select file type categories to remove."
-        )
-        cleanup_hint.setObjectName("targetSummary")
+        # --- Stacked Widget: Page 0 = Progress, Page 1 = Results ---
+        self.cleanup_stack = QStackedWidget()
 
+        # Page 0: Scan progress
+        self.cleanup_progress_page = QWidget()
+        cleanup_progress_layout = QVBoxLayout(self.cleanup_progress_page)
+        cleanup_progress_layout.addStretch(1)
+
+        self.cleanup_progress_label = QLabel("Click Scan to analyse file types on this target.")
+        self.cleanup_progress_label.setAlignment(Qt.AlignCenter)
+        self.cleanup_progress_label.setMinimumWidth(400)
+        cleanup_progress_layout.addWidget(self.cleanup_progress_label, alignment=Qt.AlignCenter)
+
+        self.cleanup_progress_bar = QProgressBar()
+        self.cleanup_progress_bar.setRange(0, 1)
+        self.cleanup_progress_bar.setValue(0)
+        self.cleanup_progress_bar.setFormat("Idle")
+        self.cleanup_progress_bar.setTextVisible(True)
+        self.cleanup_progress_bar.setMinimumHeight(30)
+        cleanup_progress_layout.addWidget(self.cleanup_progress_bar)
+
+        self.cleanup_cancel_btn = QPushButton("Cancel Scan")
+        self.cleanup_cancel_btn.setEnabled(False)
+        self.cleanup_cancel_btn.clicked.connect(self._cancel_cleanup_scan)
+        cleanup_progress_layout.addWidget(self.cleanup_cancel_btn, alignment=Qt.AlignCenter)
+
+        cleanup_progress_layout.addStretch(1)
+
+        # Page 1: Results
+        self.cleanup_results_page = QWidget()
+        cleanup_results_layout = QVBoxLayout(self.cleanup_results_page)
+        cleanup_results_layout.setContentsMargins(0, 0, 0, 0)
+        cleanup_results_layout.setSpacing(10)
+
+        # Controls row
         cleanup_controls = QHBoxLayout()
         self.cleanup_scan_btn = QPushButton("Scan File Types")
         self.cleanup_scan_btn.clicked.connect(self.scan_file_cleanup_breakdown)
@@ -2756,24 +2905,47 @@ class ToolboxWindow(QMainWindow):
         cleanup_controls.addWidget(self.cleanup_scan_btn)
         cleanup_controls.addWidget(self.cleanup_remove_btn)
         cleanup_controls.addStretch(1)
+        cleanup_results_layout.addLayout(cleanup_controls)
 
+        # Stat bubbles row
+        self.cleanup_stats_container = QWidget()
+        cleanup_stats_layout = QHBoxLayout(self.cleanup_stats_container)
+        cleanup_stats_layout.setContentsMargins(0, 0, 0, 0)
+        cleanup_stats_layout.setSpacing(10)
+
+        self.stat_cleanup_files_box, self.stat_cleanup_files_lbl = create_stat_box("Total Files")
+        self.stat_cleanup_types_box, self.stat_cleanup_types_lbl = create_stat_box("Extensions Found")
+        self.stat_cleanup_size_box, self.stat_cleanup_size_lbl = create_stat_box("Total Size")
+
+        cleanup_stats_layout.addWidget(self.stat_cleanup_files_box)
+        cleanup_stats_layout.addWidget(self.stat_cleanup_types_box)
+        cleanup_stats_layout.addWidget(self.stat_cleanup_size_box)
+        cleanup_results_layout.addWidget(self.cleanup_stats_container)
+
+        # Summary label
         self.cleanup_summary_label = QLabel("No scan run yet.")
         self.cleanup_summary_label.setObjectName("targetSummary")
+        cleanup_results_layout.addWidget(self.cleanup_summary_label)
 
-        self.cleanup_table = QTableWidget(0, 5)
+        # Results table — 6 columns
+        self.cleanup_table = QTableWidget(0, 6)
         self.cleanup_table.setHorizontalHeaderLabels(
-            ["Remove", "File Type", "Type", "Files", "Total Size"]
+            ["Remove", "Extension", "Category", "Description", "Files", "Total Size"]
         )
         self.cleanup_table.verticalHeader().setVisible(False)
-        self._configure_resizable_table_columns(self.cleanup_table, [80, 220, 120, 100, 150])
+        self._configure_resizable_table_columns(self.cleanup_table, [60, 100, 100, 220, 80, 120])
         self.cleanup_table.setAlternatingRowColors(True)
         self.cleanup_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.cleanup_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.cleanup_table.setSortingEnabled(True)
+        cleanup_results_layout.addWidget(self.cleanup_table, 1)
 
-        cleanup_layout.addWidget(cleanup_hint)
-        cleanup_layout.addLayout(cleanup_controls)
-        cleanup_layout.addWidget(self.cleanup_summary_label)
-        cleanup_layout.addWidget(self.cleanup_table, 1)
+        # Assemble stacked widget
+        self.cleanup_stack.addWidget(self.cleanup_progress_page)
+        self.cleanup_stack.addWidget(self.cleanup_results_page)
+        self.cleanup_stack.setCurrentIndex(0)
+
+        cleanup_layout.addWidget(self.cleanup_stack, 1)
 
         metadata_manager_tab = QWidget()
         metadata_manager_layout = QVBoxLayout(metadata_manager_tab)
@@ -3042,6 +3214,7 @@ class ToolboxWindow(QMainWindow):
         self._music_compatibility_initial_scan_done = False
         self._metadata_manager_initial_scan_done = False
         self._lyrics_manager_initial_scan_done = False
+        self._cleanup_initial_scan_done = False
 
         self._build_help_pane()
         
@@ -3889,11 +4062,22 @@ class ToolboxWindow(QMainWindow):
                 self.tabs.setCurrentIndex(self._main_menu_tab_index)
 
     def _set_cleanup_idle(self, message: str) -> None:
+        self.stat_cleanup_files_lbl.setText("-")
+        self.stat_cleanup_types_lbl.setText("-")
+        self.stat_cleanup_size_lbl.setText("-")
         self.cleanup_summary_label.setText(message)
         self.cleanup_table.setRowCount(0)
         self.cleanup_remove_btn.setEnabled(False)
         self._cleanup_scan_target = None
         self._cleanup_type_files = {}
+        self._cleanup_total_bytes = 0
+        self._cleanup_total_files = 0
+        self._cleanup_categories_found = 0
+
+    def _cancel_cleanup_scan(self) -> None:
+        self._cleanup_scan_cancelled = True
+        self.cleanup_cancel_btn.setEnabled(False)
+        self.cleanup_progress_label.setText("Cancelling scan...")
 
     def _set_file_rename_idle(self, message: str) -> None:
         self.stat_fr_scanned_lbl.setText("-")
@@ -5093,30 +5277,44 @@ class ToolboxWindow(QMainWindow):
         target = self.path_input.text().strip()
         if not target:
             self._set_cleanup_idle("Choose a target before scanning file types.")
+            self.cleanup_stack.setCurrentIndex(0)
+            self.cleanup_progress_label.setText("Choose a target before scanning.")
             QMessageBox.information(self, "No Target", "Choose a folder or drive before scanning file types.")
             return
 
         target_path = Path(target).expanduser()
         if not target_path.exists() or not target_path.is_dir():
             self._set_cleanup_idle("Target path is invalid.")
+            self.cleanup_stack.setCurrentIndex(0)
+            self.cleanup_progress_label.setText("Target path is invalid.")
             QMessageBox.warning(self, "Invalid Target", "The selected target path is not a valid folder.")
             return
 
         resolved_target = str(target_path.resolve())
-        progress = QProgressDialog("Scanning file types...", "Cancel", 0, 0, self)
-        progress.setWindowTitle("File Cleanup Scan")
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(True)
+
+        # Switch to progress page
+        self._cleanup_scan_cancelled = False
+        self.cleanup_stack.setCurrentIndex(0)
+        self.cleanup_progress_bar.setRange(0, 0)  # indeterminate
+        self.cleanup_progress_bar.setFormat("Scanning...")
+        self.cleanup_progress_label.setText("Discovering files...")
+        self.cleanup_cancel_btn.setEnabled(True)
+        self.cleanup_scan_btn.setEnabled(False)
+        QApplication.processEvents()
 
         stats_by_type: dict[str, dict[str, object]] = {}
         files_by_type: dict[str, list[Path]] = {}
         category_order = {category: index for index, category in enumerate(FILE_CLEANUP_CATEGORY_ORDER)}
 
         scanned_files = 0
+        total_bytes_scanned = 0
         canceled = False
         for root_dir, _dir_names, file_names in os.walk(resolved_target):
             for file_name in file_names:
+                if self._cleanup_scan_cancelled:
+                    canceled = True
+                    break
+
                 file_path = Path(root_dir) / file_name
                 extension = file_path.suffix.lower()
                 category = self._cleanup_category_for_file(file_name.lower(), extension)
@@ -5133,6 +5331,7 @@ class ToolboxWindow(QMainWindow):
                     type_stats = {
                         "file_type": file_type_label,
                         "type": category,
+                        "extension": extension,
                         "count": 0,
                         "bytes": 0,
                     }
@@ -5144,21 +5343,28 @@ class ToolboxWindow(QMainWindow):
                 files_by_type[row_key].append(file_path)
 
                 scanned_files += 1
+                total_bytes_scanned += file_size
                 if scanned_files % 400 == 0:
-                    progress.setLabelText(f"Scanning file types... {scanned_files} files")
+                    self.cleanup_progress_label.setText(
+                        f"Scanning... {scanned_files:,} files found · {format_bytes(total_bytes_scanned)}"
+                    )
                     QApplication.processEvents()
-                    if progress.wasCanceled():
-                        canceled = True
-                        break
 
             if canceled:
                 break
 
-        progress.close()
+        self.cleanup_scan_btn.setEnabled(True)
+        self.cleanup_cancel_btn.setEnabled(False)
+
         if canceled:
-            self.cleanup_summary_label.setText("File type scan cancelled.")
+            self.cleanup_progress_label.setText("Scan cancelled.")
+            self.cleanup_progress_bar.setRange(0, 1)
+            self.cleanup_progress_bar.setValue(0)
+            self.cleanup_progress_bar.setFormat("Cancelled")
+            # Stay on progress page so user can re-scan
             return
 
+        # Sort by category order then extension name
         sorted_keys = sorted(
             stats_by_type.keys(),
             key=lambda key: (
@@ -5167,6 +5373,18 @@ class ToolboxWindow(QMainWindow):
             ),
         )
 
+        # Compute totals
+        total_bytes = sum(int(stats_by_type[key]["bytes"]) for key in sorted_keys)
+        total_files = sum(int(stats_by_type[key]["count"]) for key in sorted_keys)
+        found_types = len(sorted_keys)
+
+        # Populate stat bubbles
+        self.stat_cleanup_files_lbl.setText(f"{total_files:,}")
+        self.stat_cleanup_types_lbl.setText(str(found_types))
+        self.stat_cleanup_size_lbl.setText(format_bytes(total_bytes))
+
+        # Populate table
+        self.cleanup_table.setSortingEnabled(False)
         self.cleanup_table.setUpdatesEnabled(False)
         try:
             self.cleanup_table.setRowCount(len(sorted_keys))
@@ -5176,6 +5394,15 @@ class ToolboxWindow(QMainWindow):
                 size_bytes = int(type_stats["bytes"])
                 file_type_text = str(type_stats["file_type"])
                 type_text = str(type_stats["type"])
+                ext = str(type_stats.get("extension", ""))
+
+                # Look up description from the mapping
+                description = FILE_EXTENSION_DESCRIPTIONS.get(ext, "")
+                if not description:
+                    if ext:
+                        description = f"{ext.lstrip('.').upper()} File"
+                    else:
+                        description = "Unknown"
 
                 check_item = QTableWidgetItem()
                 check_item.setFlags(
@@ -5184,7 +5411,7 @@ class ToolboxWindow(QMainWindow):
                 check_item.setCheckState(Qt.Unchecked)
                 check_item.setData(Qt.UserRole, row_key)
 
-                file_type_item = QTableWidgetItem(file_type_text)
+                ext_item = QTableWidgetItem(file_type_text)
                 if type_text == "Hidden":
                     hidden_tip = (
                         "Hidden files are not shown in Finder by default. "
@@ -5195,27 +5422,39 @@ class ToolboxWindow(QMainWindow):
                             "These are macOS sidecar metadata files (._*). "
                             "Finder usually hides them. Press Cmd+Shift+. to show hidden files."
                         )
-                    file_type_item.setToolTip(hidden_tip)
+                    ext_item.setToolTip(hidden_tip)
+
+                # Use a numeric sort data role for the count and size columns
+                count_item = QTableWidgetItem()
+                count_item.setData(Qt.DisplayRole, count)
+
+                size_item = QTableWidgetItem(format_bytes(size_bytes))
+                size_item.setData(Qt.UserRole, size_bytes)
 
                 self.cleanup_table.setItem(row, 0, check_item)
-                self.cleanup_table.setItem(row, 1, file_type_item)
+                self.cleanup_table.setItem(row, 1, ext_item)
                 self.cleanup_table.setItem(row, 2, QTableWidgetItem(type_text))
-                self.cleanup_table.setItem(row, 3, QTableWidgetItem(str(count)))
-                self.cleanup_table.setItem(row, 4, QTableWidgetItem(format_bytes(size_bytes)))
+                self.cleanup_table.setItem(row, 3, QTableWidgetItem(description))
+                self.cleanup_table.setItem(row, 4, count_item)
+                self.cleanup_table.setItem(row, 5, size_item)
         finally:
             self.cleanup_table.setUpdatesEnabled(True)
+            self.cleanup_table.setSortingEnabled(True)
             self.cleanup_table.viewport().update()
 
         self._cleanup_scan_target = resolved_target
         self._cleanup_type_files = files_by_type
+        self._cleanup_total_bytes = total_bytes
+        self._cleanup_total_files = total_files
+        self._cleanup_categories_found = found_types
 
-        total_bytes = sum(int(stats_by_type[key]["bytes"]) for key in sorted_keys)
-        total_files = sum(int(stats_by_type[key]["count"]) for key in sorted_keys)
-        found_types = len(sorted_keys)
         self.cleanup_summary_label.setText(
-            f"Scanned {total_files} files across {found_types} file types | Total size: {format_bytes(total_bytes)}"
+            f"Scanned {total_files:,} files across {found_types} file types · Total size: {format_bytes(total_bytes)}"
         )
         self.cleanup_remove_btn.setEnabled(total_files > 0)
+
+        # Switch to results page
+        self.cleanup_stack.setCurrentIndex(1)
         self.statusBar().showMessage("File cleanup scan completed", 4000)
 
     def remove_selected_file_types(self) -> None:
@@ -5241,17 +5480,18 @@ class ToolboxWindow(QMainWindow):
         selected_labels: list[str] = []
         for row in range(self.cleanup_table.rowCount()):
             check_item = self.cleanup_table.item(row, 0)
-            file_type_item = self.cleanup_table.item(row, 1)
+            ext_item = self.cleanup_table.item(row, 1)
             category_item = self.cleanup_table.item(row, 2)
-            count_item = self.cleanup_table.item(row, 3)
-            if not check_item or not file_type_item or not category_item or not count_item:
+            count_item = self.cleanup_table.item(row, 4)
+            if not check_item or not ext_item or not category_item or not count_item:
                 continue
             if check_item.flags() & Qt.ItemIsUserCheckable and check_item.checkState() == Qt.Checked:
-                if int(count_item.text() or "0") > 0:
+                count_val = count_item.data(Qt.DisplayRole)
+                if isinstance(count_val, int) and count_val > 0:
                     row_key = check_item.data(Qt.UserRole)
                     if isinstance(row_key, str) and row_key:
                         selected_type_keys.append(row_key)
-                        selected_labels.append(f"{category_item.text()} ({file_type_item.text()})")
+                        selected_labels.append(f"{category_item.text()} ({ext_item.text()})")
 
         if not selected_type_keys:
             QMessageBox.information(self, "Nothing Selected", "Select one or more file types to remove.")
@@ -5392,6 +5632,12 @@ class ToolboxWindow(QMainWindow):
             target = self.path_input.text().strip()
             if target:
                 self.scan_embedded_lyrics()
+
+        if index == self._cleanup_tab_index and not self._cleanup_initial_scan_done:
+            self._cleanup_initial_scan_done = True
+            target = self.path_input.text().strip()
+            if target:
+                self.scan_file_cleanup_breakdown()
 
         if index != self._directory_tab_index:
             return
