@@ -1550,9 +1550,38 @@ class MusicConversionWorker(QObject):
                     continue
 
                 try:
+                    # Read embedded album art from source before we replace/remove it
+                    art_bytes = None
+                    art_mime = ""
+                    try:
+                        art_bytes, art_mime = read_embedded_album_art(source_path)
+                    except Exception:
+                        art_bytes, art_mime = None, ""
+
                     if output_path.exists() and output_path != source_path:
                         output_path.unlink()
                     temp_output_path.replace(output_path)
+
+                    # If artwork was present on source, try to convert to a compatible
+                    # JPEG and write it into the new file. Failures here should not
+                    # mark the conversion as failed.
+                    if art_bytes:
+                        try:
+                            converted_jpeg = None
+                            # If already JPEG, attempt to use as-is but ensure
+                            # it's non-progressive / size-friendly by running
+                            # through the conversion helper which is a no-op
+                            # for already-compatible images.
+                            converted_jpeg = to_non_progressive_jpeg(art_bytes)
+                            if converted_jpeg:
+                                ok, detail = write_embedded_album_art(output_path, converted_jpeg)
+                                if not ok:
+                                    logger = logging.getLogger(__name__)
+                                    logger.debug("Failed to re-embed artwork for %s: %s", output_path, detail)
+                        except Exception as exc:
+                            logger = logging.getLogger(__name__)
+                            logger.debug("Exception re-embedding artwork for %s: %s", output_path, exc)
+
                     if source_path != output_path and source_path.exists():
                         source_path.unlink()
                     converted += 1
