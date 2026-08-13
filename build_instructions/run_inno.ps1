@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.4.1"
+    [string]$Version = "1.5.1"
 )
 $ErrorActionPreference = 'Stop'
 $ROOT_DIR = (Get-Item "$PSScriptRoot\.." ).FullName

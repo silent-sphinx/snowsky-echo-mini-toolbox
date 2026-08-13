@@ -18,7 +18,7 @@ if ($args.Count -gt 0) {
     try {
         $VERSION = & python -c "import sys; sys.path.insert(0, r'$ROOT_DIR'); from src.constants import APP_VERSION; print(APP_VERSION)"
     } catch {
-        $VERSION = "1.3.2"
+        $VERSION = "1.5.1"
     }
 }
 

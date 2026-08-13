@@ -6,7 +6,7 @@ set -euo pipefail
 # Usage: ./build_instructions/build_release_linux.sh [version] [arch]
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${1:-$(python3 -c "import sys; sys.path.insert(0, '$ROOT_DIR'); from src.constants import APP_VERSION; print(APP_VERSION)" 2>/dev/null || echo "1.3.2")}"
+VERSION="${1:-$(python3 -c "import sys; sys.path.insert(0, '$ROOT_DIR'); from src.constants import APP_VERSION; print(APP_VERSION)" 2>/dev/null || echo "1.5.1")}"
 ARCH="${2:-$(dpkg --print-architecture 2>/dev/null || echo amd64)}"
 VENV_DIR="$ROOT_DIR/.venv-build"
 APP_NAME="Snowsky Echo Mini Toolbox"

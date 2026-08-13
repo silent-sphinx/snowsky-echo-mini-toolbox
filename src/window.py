@@ -19,6 +19,7 @@ import tempfile
 
 from PySide6.QtCore import QDir, QModelIndex, QPersistentModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot, QTimer, QSettings, QAbstractTableModel
 from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPalette, QPen, QPixmap, QRegion, QClipboard
+from .ui_utils import create_progress_dialog
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -86,6 +87,9 @@ from .music_compatibility import (
     get_all_streams,
 )
 from .models import DriveOption
+from .workflows import WorkflowManager, Workflow
+from .workflow_ui import WorkflowManagerDialog
+from .workflow_executor import WorkflowExecutor
 from .system_info import collect_target_info, format_bytes, list_removable_drives, attempt_unmount_mountpoint
 
 try:
@@ -2413,6 +2417,9 @@ class ToolboxWindow(QMainWindow):
         self.resize(920, 620)
 
         self._build_ui()
+        self.workflow_manager = WorkflowManager()
+        self.workflow_executor = WorkflowExecutor(self)
+        self._build_menus()
         self._apply_charcoal_theme()
         # Defer drive refresh until the event loop is running to avoid
         # accessing widgets before their native C++ wrappers are fully initialized.
@@ -2429,7 +2436,56 @@ class ToolboxWindow(QMainWindow):
             base_path = Path(__file__).resolve().parent.parent
         return base_path.joinpath(*parts)
 
+    def _build_menus(self) -> None:
+        menu_bar = self.menuBar()
+        menu_bar.clear()
+        
+        self.workflow_menu = menu_bar.addMenu("Workflows")
+        
+        manage_action = self.workflow_menu.addAction("Manage Workflows...")
+        manage_action.triggered.connect(self._open_workflow_manager)
+        
+        self.workflow_menu.addSeparator()
+        self._populate_workflow_menu()
+        
+    def _populate_workflow_menu(self) -> None:
+        # Remove dynamic actions after the separator
+        actions = self.workflow_menu.actions()
+        if len(actions) > 2:
+            for action in actions[2:]:
+                self.workflow_menu.removeAction(action)
+                
+        if not self.workflow_manager.workflows:
+            empty_action = self.workflow_menu.addAction("(No saved workflows)")
+            empty_action.setEnabled(False)
+        else:
+            for workflow in self.workflow_manager.workflows:
+                action = self.workflow_menu.addAction(workflow.name)
+                # Capture loop variable
+                action.triggered.connect(lambda checked=False, w_id=workflow.id: self._run_workflow(w_id))
 
+    def _open_workflow_manager(self) -> None:
+        dialog = WorkflowManagerDialog(self.workflow_manager, self)
+        dialog.exec()
+        # Repopulate menu after dialog is closed, as workflows may have changed
+        self._populate_workflow_menu()
+        
+    def _run_workflow(self, workflow_id: str) -> None:
+        workflow = next((w for w in self.workflow_manager.workflows if w.id == workflow_id), None)
+        if not workflow:
+            return
+            
+        target_text = self.path_input.text().strip()
+        if not target_text:
+            QMessageBox.information(self, "No Target", "Please select a target folder before running a workflow.")
+            return
+            
+        target_path = Path(target_text).expanduser()
+        if not target_path.exists() or not target_path.is_dir():
+            QMessageBox.warning(self, "Invalid Target", "The selected target path is not a valid folder.")
+            return
+            
+        self.workflow_executor.execute(workflow, target_path)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -4846,11 +4902,7 @@ class ToolboxWindow(QMainWindow):
         self._rename_worker.moveToThread(self._rename_thread)
         self._rename_thread.started.connect(self._rename_worker.run)
         
-        progress = QProgressDialog("Discovering audio files...", "Cancel", 0, 0, self)
-        progress.setWindowTitle("File Rename")
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(True)
+        progress = create_progress_dialog("File Rename", "Discovering audio files...", 0, self)
         
         # Connect progress dialog to worker
         self._rename_worker.progress.connect(
@@ -5034,12 +5086,7 @@ class ToolboxWindow(QMainWindow):
         if confirm != QMessageBox.Yes:
             return
 
-        progress = QProgressDialog("Renaming selected files...", "Cancel", 0, len(rename_pairs), self)
-        progress.setWindowTitle("File Rename")
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(True)
-        progress.setValue(0)
+        progress = create_progress_dialog("File Rename", "Renaming selected files...", len(rename_pairs), self)
 
         renamed = 0
         lrc_renamed = 0
@@ -5619,12 +5666,7 @@ class ToolboxWindow(QMainWindow):
         if confirm != QMessageBox.Yes:
             return
 
-        progress = QProgressDialog("Removing selected file types...", "Cancel", 0, len(files_to_remove), self)
-        progress.setWindowTitle("File Cleanup")
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(True)
-        progress.setValue(0)
+        progress = create_progress_dialog("File Cleanup", "Removing selected file types...", len(files_to_remove), self)
 
         removed = 0
         failed: list[tuple[str, str]] = []
@@ -6541,12 +6583,7 @@ class ToolboxWindow(QMainWindow):
             QMessageBox.information(self, "Not Audio", "Fix Album Art is only available for audio files.")
             return
 
-        progress = QProgressDialog("Preparing fix...", "Cancel", 0, 6, self)
-        progress.setWindowTitle("Fix Album Art")
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(True)
-        progress.setValue(0)
+        progress = create_progress_dialog("Fix Album Art", "Preparing fix...", 6, self)
 
         def update_step(step: int, text: str) -> bool:
             progress.setLabelText(text)
@@ -6677,12 +6714,7 @@ class ToolboxWindow(QMainWindow):
         if not selected_image:
             return
 
-        progress = QProgressDialog("Preparing artwork...", "Cancel", 0, 5, self)
-        progress.setWindowTitle("Add Album Art")
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(True)
-        progress.setValue(0)
+        progress = create_progress_dialog("Add Album Art", "Preparing artwork...", 5, self)
 
         def update_step(step: int, text: str) -> bool:
             progress.setLabelText(text)
@@ -6886,12 +6918,7 @@ class ToolboxWindow(QMainWindow):
             QMessageBox.information(self, "Not Audio", "Lookup/Add Lyrics is only available for audio files.")
             return
 
-        progress = QProgressDialog("Preparing lyrics lookup...", "Cancel", 0, 3, self)
-        progress.setWindowTitle("Lookup/Add Lyrics")
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(True)
-        progress.setValue(0)
+        progress = create_progress_dialog("Lookup/Add Lyrics", "Preparing lyrics lookup...", 3, self)
 
         def update_step(step: int, text: str) -> bool:
             progress.setLabelText(text)
@@ -7748,19 +7775,14 @@ class ToolboxWindow(QMainWindow):
             f"Converting incompatible music to {mode_label} ({profile_label})..."
         )
 
-        progress = QProgressDialog(
+        progress = create_progress_dialog(
+            "Convert Incompatible Music",
             progress_title,
-            "Cancel",
-            0,
             len(candidates),
-            self,
+            self
         )
-        progress.setWindowTitle("Convert Incompatible Music")
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setMinimumDuration(0)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
-        progress.setValue(0)
         progress.setWindowFlag(Qt.WindowCloseButtonHint, False)
         progress.show()
         QApplication.processEvents()
@@ -9251,12 +9273,12 @@ class ToolboxWindow(QMainWindow):
             )
             return
 
-        self._download_progress = QProgressDialog("Initializing download...", "Cancel", 0, len(selected_files), self)
-        self._download_progress.setWindowTitle("Download Album Art")
-        self._download_progress.setWindowModality(Qt.ApplicationModal)
-        self._download_progress.setMinimumDuration(0)
-        self._download_progress.setAutoClose(True)
-        self._download_progress.setValue(0)
+        self._download_progress = create_progress_dialog(
+            "Download Album Art",
+            "Initializing download...",
+            len(selected_files),
+            self
+        )
 
         self._download_thread = QThread()
         self._download_worker = AlbumArtDownloadFetchWorker(selected_files)
@@ -9295,12 +9317,7 @@ class ToolboxWindow(QMainWindow):
         if not items_to_apply:
             return
             
-        progress = QProgressDialog("Applying album art...", "Cancel", 0, len(items_to_apply), self)
-        progress.setWindowTitle("Apply Album Art")
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(True)
-        progress.setValue(0)
+        progress = create_progress_dialog("Apply Album Art", "Applying album art...", len(items_to_apply), self)
 
         applied_count = 0
         failed_count = 0
@@ -9422,12 +9439,7 @@ class ToolboxWindow(QMainWindow):
 
         files_to_fix: list[Path] = [p for p, _ in selected_files_info]
         total_files = len(files_to_fix)
-        progress = QProgressDialog("Fixing incompatible files...", "Cancel", 0, total_files, self)
-        progress.setWindowTitle("Fix Incompatible Files")
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(True)
-        progress.setValue(0)
+        progress = create_progress_dialog("Fix Incompatible Files", "Fixing incompatible files...", total_files, self)
 
         fixed_count = 0
         already_compatible_count = 0

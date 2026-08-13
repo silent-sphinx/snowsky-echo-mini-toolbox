@@ -6,7 +6,7 @@ set -euo pipefail
 # Usage: ./build_instructions/release_mac_os.sh [version]
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${1:-1.3.2}"
+VERSION="${1:-1.5.1}"
 VENV_DIR="$ROOT_DIR/.venv-build"
 APP_NAME="Snowsky Echo Mini Toolbox"
 APP_SLUG="snowsky-echo-mini-toolbox"

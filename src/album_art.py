@@ -444,3 +444,122 @@ class AlbumArtScanWorker(QObject):
             self.finished.emit(rows, scanned_audio, compatible, incompatible, missing_artwork)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+def write_metadata_tag(file_path: Path, tag_name: str, tag_value: str, remove_only: bool) -> tuple[bool, str]:
+    import mutagen
+    file_str = str(file_path)
+    suf = file_path.suffix.lower()
+    try:
+        if suf == ".mp3":
+            try:
+                from mutagen.easyid3 import EasyID3
+                from mutagen.id3 import ID3, ID3NoHeaderError, TXXX
+            except ImportError as exc:
+                return False, f"Unable to import MP3 metadata helpers: {exc}"
+
+            if remove_only:
+                easy_removed = False
+                custom_removed = False
+                try:
+                    easy_tags = EasyID3(file_str)
+                    if tag_name in easy_tags:
+                        del easy_tags[tag_name]
+                        easy_tags.save(file_str, v2_version=3)
+                        easy_removed = True
+                except ID3NoHeaderError:
+                    pass
+                except Exception:
+                    pass
+
+                try:
+                    id3 = ID3(file_str)
+                    for frame in list(id3.getall("TXXX")):
+                        if getattr(frame, "desc", "") == tag_name:
+                            try:
+                                del id3[frame.HashKey]
+                                custom_removed = True
+                            except Exception:
+                                pass
+                    if custom_removed:
+                        id3.save(file_str, v2_version=3)
+                except Exception:
+                    pass
+
+                if easy_removed or custom_removed:
+                    return True, ""
+                return False, f"Tag '{tag_name}' was not found."
+
+            try:
+                easy_tags = EasyID3(file_str)
+            except ID3NoHeaderError:
+                ID3().save(file_str, v2_version=3)
+                easy_tags = EasyID3(file_str)
+            except Exception:
+                easy_tags = None
+
+            if easy_tags is not None:
+                try:
+                    easy_tags[tag_name] = [tag_value]
+                    easy_tags.save(file_str, v2_version=3)
+                    return True, ""
+                except Exception:
+                    pass
+
+            try:
+                id3 = ID3(file_str)
+            except ID3NoHeaderError:
+                ID3().save(file_str, v2_version=3)
+                id3 = ID3(file_str)
+                
+            for frame in list(id3.getall("TXXX")):
+                if getattr(frame, "desc", "") == tag_name:
+                    try:
+                        del id3[frame.HashKey]
+                    except Exception:
+                        pass
+            id3.add(TXXX(encoding=3, desc=tag_name, text=[tag_value]))
+            id3.save(file_str, v2_version=3)
+            return True, ""
+
+        audio = mutagen.File(file_str, easy=False)
+        if audio is None:
+            return False, "Unable to parse audio metadata for this file."
+
+        tags = getattr(audio, "tags", None)
+        if tags is None:
+            if remove_only:
+                return False, "No metadata tags were found."
+            try:
+                audio.add_tags()
+            except Exception:
+                pass
+            tags = getattr(audio, "tags", None)
+
+        if tags is None:
+            return False, "Unable to initialize metadata tags for this file."
+
+        if remove_only:
+            removed = False
+            if tag_name in tags:
+                del tags[tag_name]
+                removed = True
+            try:
+                if hasattr(tags, 'pop'):
+                    for k in list(tags.keys()):
+                        if k.lower() == tag_name.lower():
+                            tags.pop(k)
+                            removed = True
+            except Exception:
+                pass
+            
+            if removed:
+                audio.save()
+                return True, ""
+            return False, f"Tag '{tag_name}' not found."
+            
+        tags[tag_name] = [tag_value]
+        audio.save()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
