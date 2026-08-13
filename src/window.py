@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFileSystemModel,
     QGridLayout,
@@ -51,6 +52,7 @@ from PySide6.QtWidgets import (
     QTableView,
     QTableWidgetItem,
     QStyleOptionViewItem,
+    QTextEdit,
     QTreeView,
     QTreeWidget,
     QTreeWidgetItem,
@@ -179,6 +181,8 @@ EXECUTABLE_FILE_EXTENSIONS = {
     ".run",
     ".sh",
 }
+
+SYSTEM_FOLDERS = {".trashes", ".spotlight-v100", ".fseventsd", "system volume information", "$recycle.bin"}
 
 FILE_CLEANUP_CATEGORY_ORDER = [
     "Audio",
@@ -490,6 +494,7 @@ class FileBrowserProxyModel(QSortFilterProxyModel):
                 # walking the source tree so folder selection covers contents
                 # even if nodes are collapsed or filtered in the view.
                 for root, dir_names, file_names in os.walk(path):
+                    dir_names[:] = [d for d in dir_names if d.lower() not in SYSTEM_FOLDERS]
                     for name in dir_names + file_names:
                         candidate = str(Path(root) / name)
                         if not Path(candidate).name.startswith("._"):
@@ -987,6 +992,354 @@ class DriveScanWorker(QObject):
         self.finished.emit(options)
 
 
+class TargetInfoWorker(QObject):
+    finished = Signal(list, object, bool, object)
+    failed = Signal(str)
+
+    def __init__(self, target: str, resolved_target: str | None):
+        super().__init__()
+        self.target = target
+        self.resolved_target = resolved_target
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            info = collect_target_info(self.target)
+            
+            size_warning_threshold = 256 * 1024 * 1024 * 1024
+            total_capacity_bytes = None
+            try:
+                fs_stats = os.statvfs(self.target)
+                total_capacity_bytes = fs_stats.f_frsize * fs_stats.f_blocks
+            except Exception:
+                total_capacity_bytes = None
+
+            size_warning = bool(
+                total_capacity_bytes is not None and total_capacity_bytes > size_warning_threshold
+            )
+
+            track_count = None
+            if self.resolved_target and Path(self.resolved_target).is_dir():
+                try:
+                    track_count = sum(1 for _ in iter_audio_files(Path(self.resolved_target)))
+                except Exception:
+                    track_count = None
+
+            self.finished.emit(info, total_capacity_bytes, size_warning, track_count)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+def _cleanup_category_for_file(file_name: str, extension: str) -> str:
+    if file_name.startswith("._"):
+        return "Hidden"
+    if extension in AUDIO_FILE_EXTENSIONS:
+        return "Audio"
+    if extension in IMAGE_FILE_EXTENSIONS:
+        return "Image"
+    if extension in VIDEO_FILE_EXTENSIONS:
+        return "Video"
+    if extension in DOCUMENT_FILE_EXTENSIONS:
+        return "Document"
+    if extension in ARCHIVE_FILE_EXTENSIONS:
+        return "Archive"
+    if extension in PLAYLIST_FILE_EXTENSIONS:
+        return "Playlist"
+    if extension in SUBTITLE_FILE_EXTENSIONS:
+        return "Subtitle"
+    if extension in EXECUTABLE_FILE_EXTENSIONS:
+        return "Executable"
+    if file_name.startswith("."):
+        return "Hidden"
+    return "Other"
+
+def _cleanup_file_type_label(file_name: str, extension: str, category: str) -> str:
+    if category == "Hidden":
+        lowered = file_name.lower()
+        if lowered.startswith("._") and extension:
+            return f"._*{extension} (macOS sidecar)"
+        if extension:
+            return f".*{extension}"
+        return file_name
+    if extension:
+        return extension
+    return "(no extension)"
+
+class FileCleanupScanWorker(QObject):
+    progress = Signal(int, object, str)
+    finished = Signal(dict, dict, int, object, int, str)
+    cancelled = Signal()
+    failed = Signal(str)
+
+    def __init__(self, target_path: str):
+        super().__init__()
+        self.target_path = target_path
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            stats_by_type: dict[str, dict[str, object]] = {}
+            files_by_type: dict[str, list[Path]] = {}
+            
+            scanned_files = 0
+            total_bytes_scanned = 0
+            
+            for root_dir, dir_names, file_names in os.walk(self.target_path):
+                dir_names[:] = [d for d in dir_names if d.lower() not in SYSTEM_FOLDERS]
+                if self._cancel_requested:
+                    self.cancelled.emit()
+                    return
+                for file_name in file_names:
+                    if self._cancel_requested:
+                        self.cancelled.emit()
+                        return
+                    
+                    file_path = Path(root_dir) / file_name
+                    extension = file_path.suffix.lower()
+                    category = _cleanup_category_for_file(file_name.lower(), extension)
+                    file_type_label = _cleanup_file_type_label(file_name, extension, category)
+                    row_key = f"{category}|{file_type_label.lower()}"
+                    
+                    try:
+                        file_size = file_path.stat().st_size
+                    except Exception:
+                        file_size = 0
+                        
+                    type_stats = stats_by_type.get(row_key)
+                    if type_stats is None:
+                        type_stats = {
+                            "file_type": file_type_label,
+                            "type": category,
+                            "extension": extension,
+                            "count": 0,
+                            "bytes": 0,
+                        }
+                        stats_by_type[row_key] = type_stats
+                        files_by_type[row_key] = []
+
+                    type_stats["count"] = int(type_stats["count"]) + 1
+                    type_stats["bytes"] = int(type_stats["bytes"]) + int(file_size)
+                    files_by_type[row_key].append(file_path)
+
+                    scanned_files += 1
+                    total_bytes_scanned += file_size
+                    if scanned_files % 400 == 0:
+                        self.progress.emit(scanned_files, total_bytes_scanned, "")
+
+            found_types = len(stats_by_type)
+            self.finished.emit(stats_by_type, files_by_type, scanned_files, total_bytes_scanned, found_types, self.target_path)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class FileRenameScanWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(list, int, int, int, int, str)
+    cancelled = Signal()
+    failed = Signal(str)
+
+    def __init__(self, target_path: str):
+        super().__init__()
+        self.target_path = target_path
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+        
+    def _metadata_value_to_text(self, value) -> str:
+        if value is None:
+            return ""
+        if hasattr(value, "text"):
+            try:
+                text_value = getattr(value, "text")
+                return self._metadata_value_to_text(text_value)
+            except Exception:
+                pass
+        if isinstance(value, bytes):
+            try:
+                return value.decode("utf-8", "ignore").strip()
+            except Exception:
+                return ""
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return ""
+            first_value = value[0]
+            if isinstance(first_value, tuple) and first_value:
+                first_value = first_value[0]
+            return self._metadata_value_to_text(first_value)
+        text = str(value).strip()
+        return text
+
+    def _extract_track_number(self, raw_value) -> str | None:
+        text = self._metadata_value_to_text(raw_value)
+        if not text:
+            return None
+        primary = text.split("/", 1)[0].strip()
+        match = re.search(r"\d+", primary or text)
+        if not match:
+            return None
+        return match.group(0)
+
+    def _format_track_number(self, track_number: str) -> str:
+        parsed = self._extract_track_number(track_number)
+        if not parsed:
+            return track_number
+        try:
+            return f"{int(parsed):02d}"
+        except Exception:
+            return parsed
+
+    def _extract_track_title(self, raw_value) -> str | None:
+        text = self._metadata_value_to_text(raw_value)
+        if not text:
+            return None
+        collapsed = " ".join(text.split()).strip()
+        return collapsed or None
+
+    def _safe_filename_component(self, name: str) -> str:
+        cleaned = name.strip()
+        cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", cleaned)
+        if os.path.sep:
+            cleaned = cleaned.replace(os.path.sep, "_")
+        if os.path.altsep:
+            cleaned = cleaned.replace(os.path.altsep, "_")
+        cleaned = " ".join(cleaned.split()).strip()
+        return cleaned
+
+    def _read_metadata_safe(self, file_path: Path) -> dict[str, str | None]:
+        track_raw = None
+        title_raw = None
+        try:
+            audio_easy = mutagen.File(file_path, easy=True)
+        except Exception:
+            audio_easy = None
+
+        easy_tags = getattr(audio_easy, "tags", None) if audio_easy else None
+        if easy_tags:
+            track_values = easy_tags.get("tracknumber")
+            title_values = easy_tags.get("title")
+            if track_values:
+                track_raw = track_values[0]
+            if title_values:
+                title_raw = title_values[0]
+
+        if track_raw is None or title_raw is None:
+            try:
+                audio_full = mutagen.File(file_path)
+            except Exception:
+                audio_full = None
+
+            full_tags = getattr(audio_full, "tags", None) if audio_full else None
+            def _safe_full_tag(*keys):
+                if not full_tags:
+                    return None
+                for key in keys:
+                    try:
+                        value = full_tags.get(key)
+                    except Exception:
+                        continue
+                    if value:
+                        return value
+                return None
+
+            if full_tags:
+                if track_raw is None:
+                    track_raw = _safe_full_tag("TRCK", "tracknumber", "TRACKNUMBER", "trkn")
+                if title_raw is None:
+                    title_raw = _safe_full_tag("TIT2", "title", "TITLE", "\xa9nam")
+
+        return {
+            "track_number": self._extract_track_number(track_raw),
+            "track_title": self._extract_track_title(title_raw),
+        }
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            audio_files: list[Path] = []
+            for root_dir, dir_names, file_names in os.walk(self.target_path):
+                dir_names[:] = [d for d in dir_names if d.lower() not in SYSTEM_FOLDERS]
+                if self._cancel_requested:
+                    self.cancelled.emit()
+                    return
+                for file_name in file_names:
+                    if file_name.startswith("."):
+                        continue
+                    file_path = Path(root_dir) / file_name
+                    if file_path.suffix.lower() not in AUDIO_FILE_EXTENSIONS:
+                        continue
+                    audio_files.append(file_path)
+                    
+            if not audio_files:
+                self.finished.emit([], 0, 0, 0, 0, self.target_path)
+                return
+
+            suggestions: list[tuple[Path, Path, str, str, str]] = []
+            scanned_audio = 0
+            missing_metadata = 0
+            metadata_timeouts = 0
+            already_matching = 0
+            total_audio_files = len(audio_files)
+
+            import concurrent.futures
+            # Single worker so we don't spam threads, but we still get a timeout mechanism
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                for index, file_path in enumerate(audio_files, start=1):
+                    if self._cancel_requested:
+                        self.cancelled.emit()
+                        return
+
+                    scanned_audio += 1
+                    
+                    future = executor.submit(self._read_metadata_safe, file_path)
+                    try:
+                        result = future.result(timeout=3.0)
+                        track_no = result.get("track_number")
+                        track_title = result.get("track_title")
+                    except concurrent.futures.TimeoutError:
+                        metadata_timeouts += 1
+                        missing_metadata += 1
+                        continue
+                    except Exception:
+                        missing_metadata += 1
+                        continue
+
+                    if not track_no or not track_title:
+                        missing_metadata += 1
+                        continue
+
+                    safe_title = self._safe_filename_component(track_title)
+                    if not safe_title:
+                        missing_metadata += 1
+                        continue
+
+                    formatted_track_no = self._format_track_number(track_no)
+                    suggested_name = f"{formatted_track_no}. {safe_title}{file_path.suffix}"
+                    if suggested_name == file_path.name:
+                        already_matching += 1
+                        continue
+                    elif suggested_name.lower() == file_path.name.lower():
+                        # Only capitalization differs
+                        reason = "Metadata Title uses different name"
+                    else:
+                        # Actual content difference
+                        reason = "Name differs from preset"
+
+                    suggested_path = file_path.with_name(suggested_name)
+                    
+                    suggestions.append((file_path, suggested_path, formatted_track_no, safe_title, reason))
+                    
+                    self.progress.emit(index, total_audio_files, file_path.name)
+
+            self.finished.emit(suggestions, scanned_audio, missing_metadata, metadata_timeouts, already_matching, self.target_path)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class ZipBackupWorker(QObject):
     progress = Signal(int, int, str)
     finished = Signal(object)
@@ -1015,7 +1368,8 @@ class ZipBackupWorker(QObject):
                 raise RuntimeError("Source folder is not available.")
 
             source_files: list[Path] = []
-            for root_dir, _dir_names, file_names in os.walk(str(source)):
+            for root_dir, dir_names, file_names in os.walk(str(source)):
+                dir_names[:] = [d for d in dir_names if d.lower() not in SYSTEM_FOLDERS]
                 if self._cancel_requested:
                     self.cancelled.emit(
                         {
@@ -1039,6 +1393,25 @@ class ZipBackupWorker(QObject):
             zip_path.parent.mkdir(parents=True, exist_ok=True)
 
             root_name = source.name.strip() or "backup"
+
+            # Collect empty directories during the same walk (already done above).
+            empty_dirs: list[Path] = []
+            for root_dir, dir_names, file_names in os.walk(str(source)):
+                dir_names[:] = [d for d in dir_names if d.lower() not in SYSTEM_FOLDERS]
+                if self._cancel_requested:
+                    self.cancelled.emit(
+                        {
+                            "processed": processed,
+                            "total": total_files,
+                            "partial_zip": str(zip_path),
+                        }
+                    )
+                    return
+                root_path = Path(root_dir)
+                rel_dir = root_path.relative_to(source)
+                if rel_dir != Path(".") and not dir_names and not file_names:
+                    empty_dirs.append(rel_dir)
+
             with zipfile.ZipFile(
                 str(zip_path),
                 mode="w",
@@ -1047,33 +1420,20 @@ class ZipBackupWorker(QObject):
             ) as archive:
                 archive.writestr(f"{root_name}/", "")
 
-                for current_dir, dir_names, file_names in os.walk(str(source)):
+                for empty_dir in empty_dirs:
+                    arc_dir = (Path(root_name) / empty_dir).as_posix()
+                    archive.writestr(f"{arc_dir}/", "")
+
+                for file_path in source_files:
                     if self._cancel_requested:
                         raise InterruptedError("cancelled")
 
-                    current_dir_path = Path(current_dir)
-                    rel_dir = current_dir_path.relative_to(source)
-                    arc_dir = (Path(root_name) / rel_dir).as_posix()
+                    rel_file = file_path.relative_to(source).as_posix()
+                    arc_name = (Path(root_name) / rel_file).as_posix()
+                    archive.write(str(file_path), arcname=arc_name)
 
-                    if rel_dir != Path(".") and not dir_names and not file_names:
-                        archive.writestr(f"{arc_dir}/", "")
-
-                    for file_name in file_names:
-                        file_path = current_dir_path / file_name
-                        if file_path.is_symlink():
-                            continue
-                        if not file_path.is_file():
-                            continue
-
-                        if self._cancel_requested:
-                            raise InterruptedError("cancelled")
-
-                        rel_file = file_path.relative_to(source).as_posix()
-                        arc_name = (Path(root_name) / rel_file).as_posix()
-                        archive.write(str(file_path), arcname=arc_name)
-
-                        processed += 1
-                        self.progress.emit(processed, max(total_files, 1), rel_file)
+                    processed += 1
+                    self.progress.emit(processed, max(total_files, 1), rel_file)
 
             self.finished.emit(
                 {
@@ -1127,7 +1487,8 @@ class FileTransferWorker(QObject):
 
             skipped = 0
             source_files: list[Path] = []
-            for root_dir, _dir_names, file_names in os.walk(str(source)):
+            for root_dir, dir_names, file_names in os.walk(str(source)):
+                dir_names[:] = [d for d in dir_names if d.lower() not in SYSTEM_FOLDERS]
                 if self._cancel_requested:
                     self.cancelled.emit({"processed": 0, "total": 0})
                     return
@@ -1146,6 +1507,7 @@ class FileTransferWorker(QObject):
 
             destination.mkdir(parents=True, exist_ok=True)
             for current_dir, dir_names, _file_names in os.walk(str(source)):
+                dir_names[:] = [d for d in dir_names if d.lower() not in SYSTEM_FOLDERS]
                 if self._cancel_requested:
                     self.cancelled.emit(
                         {
@@ -1178,18 +1540,19 @@ class FileTransferWorker(QObject):
                 target_file = destination / rel_file
                 target_file.parent.mkdir(parents=True, exist_ok=True)
 
-                if self.mode == "move":
-                    shutil.move(str(source_file), str(target_file))
-                else:
-                    shutil.copy2(str(source_file), str(target_file))
+                shutil.copy2(str(source_file), str(target_file))
 
                 processed += 1
                 self.progress.emit(processed, max(total_files, 1), rel_file.as_posix())
 
             if self.mode == "move":
+                for source_file in source_files:
+                    try:
+                        source_file.unlink()
+                    except Exception:
+                        pass
+
                 for current_dir, dir_names, file_names in os.walk(str(source), topdown=False):
-                    if dir_names or file_names:
-                        continue
                     try:
                         Path(current_dir).rmdir()
                     except Exception:
@@ -1910,7 +2273,6 @@ class BulkMetadataEditDialog(QDialog):
         self.accept()
 
 
-from PySide6.QtWidgets import QDialogButtonBox
 
 class LyricsConversionPreviewDialog(QDialog):
     def __init__(self, audio_files: list[Path], resolved_target: Path, scan_results: list[dict[str, object]], parent=None):
@@ -2859,7 +3221,7 @@ class ToolboxWindow(QMainWindow):
 
         self.cleanup_cancel_btn = QPushButton("Cancel Scan")
         self.cleanup_cancel_btn.setEnabled(False)
-        self.cleanup_cancel_btn.clicked.connect(self._cancel_cleanup_scan)
+        self.cleanup_cancel_btn.clicked.connect(self.cancel_file_cleanup_scan)
         cleanup_progress_layout.addWidget(self.cleanup_cancel_btn, alignment=Qt.AlignCenter)
 
         cleanup_progress_layout.addStretch(1)
@@ -4023,8 +4385,11 @@ class ToolboxWindow(QMainWindow):
         self._cleanup_total_files = 0
         self._cleanup_categories_found = 0
 
-    def _cancel_cleanup_scan(self) -> None:
-        self._cleanup_scan_cancelled = True
+    def cancel_file_cleanup_scan(self) -> None:
+        if hasattr(self, "_cleanup_worker") and self._cleanup_worker is not None:
+            self._cleanup_worker.request_cancel()
+        else:
+            self._cleanup_scan_cancelled = True
         self.cleanup_cancel_btn.setEnabled(False)
         self.cleanup_progress_label.setText("Cancelling scan...")
 
@@ -4438,142 +4803,6 @@ class ToolboxWindow(QMainWindow):
         self._backup_restore_active_operation = ""
         self._backup_restore_active_kind = ""
 
-    def _metadata_value_to_text(self, value) -> str:
-        if value is None:
-            return ""
-
-        if hasattr(value, "text"):
-            try:
-                text_value = getattr(value, "text")
-                return self._metadata_value_to_text(text_value)
-            except Exception:
-                pass
-
-        if isinstance(value, bytes):
-            try:
-                return value.decode("utf-8", "ignore").strip()
-            except Exception:
-                return ""
-
-        if isinstance(value, (list, tuple)):
-            if not value:
-                return ""
-            first_value = value[0]
-            if isinstance(first_value, tuple) and first_value:
-                first_value = first_value[0]
-            return self._metadata_value_to_text(first_value)
-
-        text = str(value).strip()
-        return text
-
-    def _extract_track_number(self, raw_value) -> str | None:
-        text = self._metadata_value_to_text(raw_value)
-        if not text:
-            return None
-
-        primary = text.split("/", 1)[0].strip()
-        match = re.search(r"\d+", primary or text)
-        if not match:
-            return None
-        return match.group(0)
-
-    def _format_track_number(self, track_number: str) -> str:
-        parsed = self._extract_track_number(track_number)
-        if not parsed:
-            return track_number
-        try:
-            return f"{int(parsed):02d}"
-        except Exception:
-            return parsed
-
-    def _extract_track_title(self, raw_value) -> str | None:
-        text = self._metadata_value_to_text(raw_value)
-        if not text:
-            return None
-        collapsed = " ".join(text.split()).strip()
-        return collapsed or None
-
-    def _safe_filename_component(self, name: str) -> str:
-        cleaned = name.strip()
-        cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", cleaned)
-        if os.path.sep:
-            cleaned = cleaned.replace(os.path.sep, "_")
-        if os.path.altsep:
-            cleaned = cleaned.replace(os.path.altsep, "_")
-        cleaned = " ".join(cleaned.split()).strip()
-        return cleaned
-
-    def _track_metadata_for_file(self, file_path: Path) -> tuple[str | None, str | None, bool]:
-        if mutagen is None:
-            return None, None, False
-
-        result: dict[str, object] = {
-            "track_number": None,
-            "track_title": None,
-        }
-
-        def _read_metadata() -> None:
-            track_raw = None
-            title_raw = None
-
-            try:
-                audio_easy = mutagen.File(file_path, easy=True)
-            except Exception:
-                audio_easy = None
-
-            easy_tags = getattr(audio_easy, "tags", None) if audio_easy else None
-            if easy_tags:
-                track_values = easy_tags.get("tracknumber")
-                title_values = easy_tags.get("title")
-                if track_values:
-                    track_raw = track_values[0]
-                if title_values:
-                    title_raw = title_values[0]
-
-            # Only fall back to full tag parsing when easy tags are missing fields.
-            if track_raw is None or title_raw is None:
-                try:
-                    audio_full = mutagen.File(file_path)
-                except Exception:
-                    audio_full = None
-
-                full_tags = getattr(audio_full, "tags", None) if audio_full else None
-                def _safe_full_tag(*keys):
-                    if not full_tags:
-                        return None
-
-                    for key in keys:
-                        try:
-                            value = full_tags.get(key)
-                        except Exception:
-                            continue
-
-                        if value:
-                            return value
-
-                    return None
-
-                if full_tags:
-                    if track_raw is None:
-                        track_raw = _safe_full_tag("TRCK", "tracknumber", "TRACKNUMBER", "trkn")
-                    if title_raw is None:
-                        title_raw = _safe_full_tag("TIT2", "title", "TITLE", "\xa9nam")
-
-            result["track_number"] = self._extract_track_number(track_raw)
-            result["track_title"] = self._extract_track_title(title_raw)
-
-        worker = threading.Thread(target=_read_metadata, daemon=True)
-        worker.start()
-        worker.join(timeout=3.0)
-        if worker.is_alive():
-            return None, None, True
-
-        return (
-            result.get("track_number") if isinstance(result.get("track_number"), str) else None,
-            result.get("track_title") if isinstance(result.get("track_title"), str) else None,
-            False,
-        )
-
     def scan_file_rename_suggestions(self) -> None:
         if mutagen is None:
             self._set_file_rename_idle("Mutagen unavailable; metadata rename scan cannot run.")
@@ -4604,118 +4833,88 @@ class ToolboxWindow(QMainWindow):
             )
             return
 
-        resolved_target = target_path.resolve()
-        _preset = str(self.file_rename_preset_combo.currentData() or "trackno_trackname")
+        resolved_target = str(target_path.resolve())
 
-        suggestions: list[tuple[Path, Path, str, str, str]] = []
-        scanned_audio = 0
-        missing_metadata = 0
-        metadata_timeouts = 0
-        already_matching = 0
-        canceled = False
-        audio_files: list[Path] = []
-
+        # Switch to progress page
+        self._file_rename_scan_cancelled = False
+        self.file_rename_apply_btn.setEnabled(False)
+        self.file_rename_table.setRowCount(0)
+        self.file_rename_summary_label.setText("Starting rename suggestion scan...")
+        
+        self._rename_thread = QThread()
+        self._rename_worker = FileRenameScanWorker(resolved_target)
+        self._rename_worker.moveToThread(self._rename_thread)
+        self._rename_thread.started.connect(self._rename_worker.run)
+        
         progress = QProgressDialog("Discovering audio files...", "Cancel", 0, 0, self)
         progress.setWindowTitle("File Rename")
         progress.setWindowModality(Qt.ApplicationModal)
         progress.setMinimumDuration(0)
         progress.setAutoClose(True)
+        
+        # Connect progress dialog to worker
+        self._rename_worker.progress.connect(
+            lambda p, t, l: (progress.setRange(0, t), progress.setValue(p), progress.setLabelText(f"Scanning rename suggestions... {p}/{t}: {l}"))
+        )
+        progress.canceled.connect(self._rename_worker.request_cancel)
+        
+        self._rename_worker.finished.connect(
+            lambda s, a, m, t, am, rt: (
+                progress.close(),
+                self._on_rename_scan_finished(s, a, m, t, am, rt)
+            )
+        )
+        self._rename_worker.cancelled.connect(
+            lambda: (
+                progress.close(),
+                self._on_rename_scan_cancelled()
+            )
+        )
+        self._rename_worker.failed.connect(
+            lambda e: (
+                progress.close(),
+                self._on_rename_scan_failed(e)
+            )
+        )
+        
+        # Cleanup
+        self._rename_worker.finished.connect(self._rename_thread.quit)
+        self._rename_worker.cancelled.connect(self._rename_thread.quit)
+        self._rename_worker.failed.connect(self._rename_thread.quit)
+        self._rename_worker.finished.connect(self._rename_worker.deleteLater)
+        self._rename_worker.cancelled.connect(self._rename_worker.deleteLater)
+        self._rename_worker.failed.connect(self._rename_worker.deleteLater)
+        self._rename_thread.finished.connect(self._rename_thread.deleteLater)
+        
+        progress.show()
+        self._rename_thread.start()
 
-        for root_dir, _dir_names, file_names in os.walk(str(resolved_target)):
-            for file_name in file_names:
-                if file_name.startswith("."):
-                    continue
-
-                file_path = Path(root_dir) / file_name
-                if file_path.suffix.lower() not in AUDIO_FILE_EXTENSIONS:
-                    continue
-
-                audio_files.append(file_path)
-
-                if len(audio_files) % 50 == 0:
-                    progress.setLabelText(
-                        f"Discovering audio files... {len(audio_files)} found"
-                    )
-                    QApplication.processEvents()
-                    if progress.wasCanceled():
-                        canceled = True
-                        break
-
-            if canceled:
-                break
-
-        if canceled:
-            progress.close()
-            self.file_rename_summary_label.setText("Rename suggestion scan cancelled.")
-            return
-
-        total_audio_files = len(audio_files)
-        progress.setRange(0, max(total_audio_files, 1))
-        progress.setValue(0)
-
-        if total_audio_files == 0:
-            progress.close()
-            self.file_rename_table.setRowCount(0)
-            self.file_rename_apply_btn.setEnabled(False)
-            self._file_rename_scan_target = str(resolved_target)
+    def _on_rename_scan_cancelled(self) -> None:
+        self.file_rename_summary_label.setText("Rename suggestion scan cancelled.")
+        
+    def _on_rename_scan_failed(self, error: str) -> None:
+        self.file_rename_summary_label.setText(f"Rename suggestion scan failed: {error}")
+        
+    def _on_rename_scan_finished(
+        self,
+        suggestions: list[tuple[Path, Path, str, str, str]],
+        scanned_audio: int,
+        missing_metadata: int,
+        metadata_timeouts: int,
+        already_matching: int,
+        resolved_target: str
+    ) -> None:
+        if scanned_audio == 0:
             self.file_rename_summary_label.setText("No audio files found in target.")
             self.statusBar().showMessage("No audio files found for rename scan", 4000)
-            return
-
-        for index, file_path in enumerate(audio_files, start=1):
-            scanned_audio += 1
-            progress.setValue(index)
-
-            progress.setLabelText(
-                f"Scanning rename suggestions... {index}/{total_audio_files}: {file_path.name}"
-            )
-            QApplication.processEvents()
-            if progress.wasCanceled():
-                canceled = True
-                break
-
-            track_no, track_title, timed_out = self._track_metadata_for_file(file_path)
-            if timed_out:
-                metadata_timeouts += 1
-                missing_metadata += 1
-                continue
-            if not track_no or not track_title:
-                missing_metadata += 1
-                continue
-
-            safe_title = self._safe_filename_component(track_title)
-            if not safe_title:
-                missing_metadata += 1
-                continue
-
-            formatted_track_no = self._format_track_number(track_no)
-            suggested_name = f"{formatted_track_no}. {safe_title}{file_path.suffix}"
-            if suggested_name == file_path.name:
-                already_matching += 1
-                continue
-            elif suggested_name.lower() == file_path.name.lower():
-                # Only capitalization differs
-                reason = "Metadata Title uses different name"
-            else:
-                # Actual content difference
-                reason = "Name differs from preset"
-
-            suggested_path = file_path.with_name(suggested_name)
-            suggestions.append(
-                (file_path, suggested_path, formatted_track_no, safe_title, reason)
-            )
-
-        progress.close()
-
-        if canceled:
-            self.file_rename_summary_label.setText("Rename suggestion scan cancelled.")
             return
 
         target_counts: dict[str, int] = {}
         for _source_path, target_path_item, _track_no, _title, _reason in suggestions:
             key = str(target_path_item).lower()
             target_counts[key] = target_counts.get(key, 0) + 1
-
+            
+        self.file_rename_table.setSortingEnabled(False)
         self.file_rename_table.setUpdatesEnabled(False)
         try:
             self.file_rename_table.setRowCount(len(suggestions))
@@ -4750,7 +4949,7 @@ class ToolboxWindow(QMainWindow):
                 check_item.setFlags(
                     Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
                 )
-                if reason_text == "Target name already exists":
+                if reason_text in ("Duplicate suggested target name", "Target name already exists"):
                     check_item.setCheckState(Qt.Unchecked)
                 else:
                     check_item.setCheckState(Qt.Checked)
@@ -4761,13 +4960,12 @@ class ToolboxWindow(QMainWindow):
                 self.file_rename_table.setItem(row_index, 2, QTableWidgetItem(suggested_rel))
                 self.file_rename_table.setItem(row_index, 3, QTableWidgetItem(track_no))
                 self.file_rename_table.setItem(row_index, 4, QTableWidgetItem(track_title))
-                self.file_rename_table.setItem(row_index, 5, QTableWidgetItem(reason_text))
-
+                
+                reason_item = QTableWidgetItem(reason_text)
                 if conflict_reason:
-                    reason_item = self.file_rename_table.item(row_index, 5)
-                    if reason_item is not None:
-                        reason_item.setBackground(QColor("#7A5E2C"))
-                        reason_item.setForeground(QColor("#FFF9E6"))
+                    reason_item.setBackground(QColor("#7A5E2C"))
+                    reason_item.setForeground(QColor("#FFF9E6"))
+                self.file_rename_table.setItem(row_index, 5, reason_item)
         finally:
             self.file_rename_table.setUpdatesEnabled(True)
             self.file_rename_table.viewport().update()
@@ -4962,41 +5160,6 @@ class ToolboxWindow(QMainWindow):
                 clipboard = QApplication.clipboard()
                 clipboard.setText(text)
 
-    def _cleanup_category_for_file(self, file_name: str, extension: str) -> str:
-        if file_name.startswith("._"):
-            return "Hidden"
-        if extension in AUDIO_FILE_EXTENSIONS:
-            return "Audio"
-        if extension in IMAGE_FILE_EXTENSIONS:
-            return "Image"
-        if extension in VIDEO_FILE_EXTENSIONS:
-            return "Video"
-        if extension in DOCUMENT_FILE_EXTENSIONS:
-            return "Document"
-        if extension in ARCHIVE_FILE_EXTENSIONS:
-            return "Archive"
-        if extension in PLAYLIST_FILE_EXTENSIONS:
-            return "Playlist"
-        if extension in SUBTITLE_FILE_EXTENSIONS:
-            return "Subtitle"
-        if extension in EXECUTABLE_FILE_EXTENSIONS:
-            return "Executable"
-        if file_name.startswith("."):
-            return "Hidden"
-        return "Other"
-
-    def _cleanup_file_type_label(self, file_name: str, extension: str, category: str) -> str:
-        if category == "Hidden":
-            lowered = file_name.lower()
-            if lowered.startswith("._") and extension:
-                return f"._*{extension} (macOS sidecar)"
-            if extension:
-                return f".*{extension}"
-            return file_name
-        if extension:
-            return extension
-        return "(no extension)"
-
     def cancel_lyrics_manager_scan(self) -> None:
         if self.lyrics_manager_cancel_btn.text() == "Restart":
             self.scan_embedded_lyrics()
@@ -5067,7 +5230,8 @@ class ToolboxWindow(QMainWindow):
         results: list[tuple[str, str, str, str, str]] = []
         audio_files: list[Path] = []
 
-        for root_dir, _dir_names, file_names in os.walk(str(resolved_target)):
+        for root_dir, dir_names, file_names in os.walk(str(resolved_target)):
+            dir_names[:] = [d for d in dir_names if d.lower() not in SYSTEM_FOLDERS]
             for file_name in file_names:
                 if file_name.startswith("."):
                     continue
@@ -5249,69 +5413,61 @@ class ToolboxWindow(QMainWindow):
         self.cleanup_progress_label.setText("Discovering files...")
         self.cleanup_cancel_btn.setEnabled(True)
         self.cleanup_scan_btn.setEnabled(False)
-        QApplication.processEvents()
-
-        stats_by_type: dict[str, dict[str, object]] = {}
-        files_by_type: dict[str, list[Path]] = {}
-        category_order = {category: index for index, category in enumerate(FILE_CLEANUP_CATEGORY_ORDER)}
-
-        scanned_files = 0
-        total_bytes_scanned = 0
-        canceled = False
-        for root_dir, _dir_names, file_names in os.walk(resolved_target):
-            for file_name in file_names:
-                if self._cleanup_scan_cancelled:
-                    canceled = True
-                    break
-
-                file_path = Path(root_dir) / file_name
-                extension = file_path.suffix.lower()
-                category = self._cleanup_category_for_file(file_name.lower(), extension)
-                file_type_label = self._cleanup_file_type_label(file_name, extension, category)
-                row_key = f"{category}|{file_type_label.lower()}"
-
-                try:
-                    file_size = file_path.stat().st_size
-                except Exception:
-                    file_size = 0
-
-                type_stats = stats_by_type.get(row_key)
-                if type_stats is None:
-                    type_stats = {
-                        "file_type": file_type_label,
-                        "type": category,
-                        "extension": extension,
-                        "count": 0,
-                        "bytes": 0,
-                    }
-                    stats_by_type[row_key] = type_stats
-                    files_by_type[row_key] = []
-
-                type_stats["count"] = int(type_stats["count"]) + 1
-                type_stats["bytes"] = int(type_stats["bytes"]) + int(file_size)
-                files_by_type[row_key].append(file_path)
-
-                scanned_files += 1
-                total_bytes_scanned += file_size
-                if scanned_files % 400 == 0:
-                    self.cleanup_progress_label.setText(
-                        f"Scanning... {scanned_files:,} files found · {format_bytes(total_bytes_scanned)}"
-                    )
-                    QApplication.processEvents()
-
-            if canceled:
-                break
-
+        
+        self._cleanup_thread = QThread()
+        self._cleanup_worker = FileCleanupScanWorker(resolved_target)
+        self._cleanup_worker.moveToThread(self._cleanup_thread)
+        self._cleanup_thread.started.connect(self._cleanup_worker.run)
+        
+        self._cleanup_worker.progress.connect(self._on_cleanup_scan_progress)
+        self._cleanup_worker.finished.connect(self._on_cleanup_scan_finished)
+        self._cleanup_worker.cancelled.connect(self._on_cleanup_scan_cancelled)
+        self._cleanup_worker.failed.connect(self._on_cleanup_scan_failed)
+        
+        self._cleanup_worker.finished.connect(self._cleanup_thread.quit)
+        self._cleanup_worker.cancelled.connect(self._cleanup_thread.quit)
+        self._cleanup_worker.failed.connect(self._cleanup_thread.quit)
+        self._cleanup_worker.finished.connect(self._cleanup_worker.deleteLater)
+        self._cleanup_worker.cancelled.connect(self._cleanup_worker.deleteLater)
+        self._cleanup_worker.failed.connect(self._cleanup_worker.deleteLater)
+        self._cleanup_thread.finished.connect(self._cleanup_thread.deleteLater)
+        
+        self._cleanup_thread.start()
+        
+    def _on_cleanup_scan_progress(self, scanned_files: int, total_bytes_scanned: int, _: str) -> None:
+        self.cleanup_progress_label.setText(
+            f"Scanning... {scanned_files:,} files found · {format_bytes(total_bytes_scanned)}"
+        )
+        
+    def _on_cleanup_scan_cancelled(self) -> None:
         self.cleanup_scan_btn.setEnabled(True)
         self.cleanup_cancel_btn.setEnabled(False)
-
-        if canceled:
-            self.cleanup_progress_label.setText("Scan cancelled.")
-            self.cleanup_progress_bar.setRange(0, 1)
-            self.cleanup_progress_bar.setValue(0)
-            self.cleanup_progress_bar.setFormat("Cancelled")
-            # Stay on progress page so user can re-scan
-            return
+        self.cleanup_progress_label.setText("Scan cancelled.")
+        self.cleanup_progress_bar.setRange(0, 1)
+        self.cleanup_progress_bar.setValue(0)
+        self.cleanup_progress_bar.setFormat("Cancelled")
+        
+    def _on_cleanup_scan_failed(self, error: str) -> None:
+        self.cleanup_scan_btn.setEnabled(True)
+        self.cleanup_cancel_btn.setEnabled(False)
+        self.cleanup_progress_label.setText(f"Scan failed: {error}")
+        self.cleanup_progress_bar.setRange(0, 1)
+        self.cleanup_progress_bar.setValue(0)
+        self.cleanup_progress_bar.setFormat("Failed")
+        
+    def _on_cleanup_scan_finished(
+        self,
+        stats_by_type: dict[str, dict[str, object]],
+        files_by_type: dict[str, list[Path]],
+        total_files_scanned: int,
+        total_bytes_scanned: int,
+        found_types: int,
+        resolved_target: str
+    ) -> None:
+        self.cleanup_scan_btn.setEnabled(True)
+        self.cleanup_cancel_btn.setEnabled(False)
+        
+        category_order = {category: index for index, category in enumerate(FILE_CLEANUP_CATEGORY_ORDER)}
 
         # Sort by category order then extension name
         sorted_keys = sorted(
@@ -5325,7 +5481,6 @@ class ToolboxWindow(QMainWindow):
         # Compute totals
         total_bytes = sum(int(stats_by_type[key]["bytes"]) for key in sorted_keys)
         total_files = sum(int(stats_by_type[key]["count"]) for key in sorted_keys)
-        found_types = len(sorted_keys)
 
         # Populate stat bubbles
         self.stat_cleanup_files_lbl.setText(f"{total_files:,}")
@@ -6122,7 +6277,6 @@ class ToolboxWindow(QMainWindow):
                 self._show_lyrics_preview_dialog(relative_path, lyrics_text)
 
     def _show_lyrics_preview_dialog(self, title: str, lyrics_text: str) -> None:
-        from PySide6.QtWidgets import QTextEdit, QDialogButtonBox, QVBoxLayout
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Lyrics Preview - {title}")
         dialog.resize(600, 700)
@@ -8093,6 +8247,7 @@ class ToolboxWindow(QMainWindow):
     def _collect_target_audio_files(self, target_root: Path) -> list[Path]:
         audio_files: list[Path] = []
         for root_dir, dir_names, file_names in os.walk(str(target_root)):
+            dir_names[:] = [d for d in dir_names if d.lower() not in SYSTEM_FOLDERS]
             dir_names[:] = [name for name in dir_names if not name.startswith(".")]
             for file_name in file_names:
                 if file_name.startswith("."):
@@ -8128,6 +8283,7 @@ class ToolboxWindow(QMainWindow):
         params: dict[str, str | int],
     ) -> tuple[object | None, str | None, int]:
         import time
+        start_wait = time.time()
         while True:
             now = time.time()
             with self._lrclib_lock:
@@ -8135,6 +8291,8 @@ class ToolboxWindow(QMainWindow):
             if now < limit_until:
                 if getattr(self, "_cancel_lyrics_manager_scan", False):
                     return None, "Cancelled", 0
+                if now - start_wait > 60:
+                    return None, "RateLimited (timeout)", 429
                 time.sleep(0.5)
             else:
                 break
@@ -10473,36 +10631,31 @@ class ToolboxWindow(QMainWindow):
             self.statusBar().showMessage("Path does not exist")
             return
 
-        try:
-            info = collect_target_info(target)
-        except Exception as exc:
-            import logging
+        self.info_table.setRowCount(0)
+        self.statusBar().showMessage("Inspecting target...")
 
-            logger = logging.getLogger(__name__)
-            logger.exception("Failed to inspect target: %s", target)
-            QMessageBox.critical(self, "Error", f"Failed to inspect target:\n{exc}")
-            self.statusBar().showMessage("Failed to inspect target")
-            return
+        self._info_thread = QThread()
+        self._info_worker = TargetInfoWorker(target, resolved_target)
+        self._info_worker.moveToThread(self._info_thread)
+        self._info_thread.started.connect(self._info_worker.run)
+        
+        self._info_worker.finished.connect(self._on_info_finished)
+        self._info_worker.failed.connect(self._on_info_failed)
+        self._info_worker.finished.connect(self._info_thread.quit)
+        self._info_worker.failed.connect(self._info_thread.quit)
+        self._info_worker.finished.connect(self._info_worker.deleteLater)
+        self._info_worker.failed.connect(self._info_worker.deleteLater)
+        self._info_thread.finished.connect(self._info_thread.deleteLater)
+        
+        self._info_thread.start()
 
-        size_warning_threshold = 256 * 1024 * 1024 * 1024
-        total_capacity_bytes = None
-        try:
-            fs_stats = os.statvfs(target)
-            total_capacity_bytes = fs_stats.f_frsize * fs_stats.f_blocks
-        except Exception:
-            total_capacity_bytes = None
+    def _on_info_failed(self, error: str) -> None:
+        logger = logging.getLogger(__name__)
+        logger.exception("Failed to inspect target: %s", error)
+        QMessageBox.critical(self, "Error", f"Failed to inspect target:\n{error}")
+        self.statusBar().showMessage("Failed to inspect target")
 
-        size_warning = bool(
-            total_capacity_bytes is not None and total_capacity_bytes > size_warning_threshold
-        )
-
-        track_count = None
-        if resolved_target and Path(resolved_target).is_dir():
-            try:
-                track_count = sum(1 for _ in iter_audio_files(Path(resolved_target)))
-            except Exception:
-                track_count = None
-
+    def _on_info_finished(self, info: list, total_capacity_bytes: object, size_warning: bool, track_count: object) -> None:
         if track_count is not None:
             info = list(info)
             info.append(("Track Count", f"{track_count}/8192"))
