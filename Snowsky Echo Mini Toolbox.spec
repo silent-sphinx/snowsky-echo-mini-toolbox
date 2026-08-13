@@ -31,7 +31,7 @@ def _get_ffmpeg_asset_dir() -> str:
             return 'build_binaries/macos_silicon'
         return 'build_binaries/macos_intel'
     if sys.platform == 'linux':
-        return 'build_binaries/linux_x64'
+        return 'build_binaries/linux_amd64'
     if sys.platform == 'win32':
         return 'build_binaries/windows_x64'
     raise RuntimeError(f'Unsupported platform: {sys.platform}')
