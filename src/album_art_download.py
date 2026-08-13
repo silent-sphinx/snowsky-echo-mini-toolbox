@@ -267,6 +267,8 @@ class AlbumArtDownloadDialog(QDialog):
                     preview_lbl.setPixmap(pixmaps[0].scaled(90, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation))
                     
                     def on_combo_changed(idx, lbl=preview_lbl, pms=pixmaps):
+                        if idx < 0 or idx >= len(pms):
+                            return
                         lbl.setPixmap(pms[idx].scaled(90, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
                     combo.currentIndexChanged.connect(on_combo_changed)

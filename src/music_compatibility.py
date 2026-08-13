@@ -635,7 +635,7 @@ def _map_dsd_multiple(sample_rate: int) -> int | None:
         ratio = sample_rate / float(base)
         nearest = int(round(ratio))
         diff = abs(ratio - nearest)
-        if diff <= 0.5:
+        if diff <= 0.05:
             if best is None or diff < best[1]:
                 best = (nearest, diff)
     return best[0] if best else None
@@ -1088,6 +1088,7 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         codec_name = metadata.get("codec_name")
         audio_streams = metadata.get("audio_streams") or []
         eq_sample_rate = sample_rate
+        eq_bit_depth = 1  # DSD is inherently 1-bit
         sample_rate_text = str(sample_rate) if sample_rate is not None else "-"
         codec_text = codec_name if codec_name else "-"
 
@@ -1166,6 +1167,12 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
 
     filename_comp_status, filename_comp_reason = _evaluate_file_name_compatibility(path.name)
 
+    channels_text = "-"
+    stream_count_text = "-"
+    if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS):
+        channels_text = str(metadata.get("channels") or "-")
+        stream_count_text = str(metadata.get("total_stream_count") or "-")
+
     return {
         "file": relative_path,
         "extension": extension_display,
@@ -1178,8 +1185,8 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         "block_size": block_size_text,
         "dsd_profile": dsd_profile,
         "eq_compatibility": eq_compatibility,
-        "channels": str(metadata.get("channels") or "-") if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS) else "-",
-        "stream_count": str(metadata.get("total_stream_count") or "-") if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS) else "-",
+        "channels": channels_text,
+        "stream_count": stream_count_text,
         "filename_compatibility": filename_comp_status,
         "filename_compatibility_reason": filename_comp_reason,
     }

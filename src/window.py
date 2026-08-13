@@ -3908,7 +3908,48 @@ class ToolboxWindow(QMainWindow):
             self.statusBar().showMessage("Unmount failed", 5000)
             return False
 
+    def _stop_all_background_threads(self) -> None:
+        """Cancel and wait for all background threads to finish before exit."""
+        # Request cancellation on all workers that support it.
+        for worker in (
+            self._scan_worker,
+            self._music_compatibility_scan_worker,
+            self._music_conversion_worker,
+            self._dir_size_scan_worker,
+        ):
+            if worker is not None and hasattr(worker, "request_cancel"):
+                try:
+                    worker.request_cancel()
+                except Exception:
+                    pass
+
+        backup_worker = self._backup_restore_worker
+        if backup_worker is not None and hasattr(backup_worker, "request_cancel"):
+            try:
+                backup_worker.request_cancel()
+            except Exception:
+                pass
+
+        # Wait for each thread to finish (with a timeout to avoid hanging).
+        for thread in (
+            self._scan_thread,
+            self._music_compatibility_scan_thread,
+            self._music_conversion_thread,
+            self._backup_restore_thread,
+            self._dir_size_scan_thread,
+            getattr(self, "_download_thread", None),
+        ):
+            if thread is not None:
+                try:
+                    if thread.isRunning():
+                        thread.quit()
+                        thread.wait(3000)
+                except Exception:
+                    pass
+
     def closeEvent(self, event) -> None:
+        self._stop_all_background_threads()
+
         selected_drive = self._selected_drive_path()
         if not selected_drive:
             event.accept()
@@ -9115,7 +9156,7 @@ class ToolboxWindow(QMainWindow):
             progress.setValue(index - 1)
             QApplication.processEvents()
 
-            image_data = item["image_data"]
+            image_data = item.get("image_data")
             if not image_data:
                 continue
 
