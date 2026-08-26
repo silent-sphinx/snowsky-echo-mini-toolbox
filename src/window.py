@@ -1,22 +1,14 @@
 import os
 import re
-import shutil
-import subprocess
 import sys
+import subprocess
 import threading
 import time
-import zipfile
-import json
 import ssl
 import urllib.error
-import urllib.parse
-import urllib.request
 from collections import OrderedDict
 from pathlib import Path
-import traceback
-import logging
 import tempfile
-
 from PySide6.QtCore import QDir, QModelIndex, QPersistentModelIndex, QObject, QSortFilterProxyModel, QThread, Qt, Signal, Slot, QTimer, QSettings, QAbstractTableModel
 from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPalette, QPen, QPixmap, QRegion, QClipboard
 from .ui_utils import create_progress_dialog
@@ -65,7 +57,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtWidgets import QStyle
 from PySide6.QtCore import QEvent
 
-from .music_compatibility_model import MusicCompatibilityTableModel
+from .music_compatibility_model import MusicCompatibilityTableModel, MusicCompatibilityFilterProxyModel
 
 from .album_art import (
     AlbumArtScanWorker,
@@ -77,7 +69,17 @@ from .album_art import (
     write_embedded_album_art,
 )
 from .album_art_download import AlbumArtDownloadFetchWorker, AlbumArtDownloadDialog
-from .constants import ALBUM_ART_CACHE_LIMIT, APP_VERSION, AUDIO_FILE_EXTENSIONS
+from .constants import (
+    ALBUM_ART_CACHE_LIMIT,
+    APP_VERSION,
+    AUDIO_FILE_EXTENSIONS,
+    TABLE_COMPATIBLE_COLOR,
+    TABLE_COMPATIBLE_TEXT_COLOR,
+    TABLE_INCOMPATIBLE_COLOR,
+    TABLE_INCOMPATIBLE_TEXT_COLOR,
+    TABLE_LIMITED_COLOR,
+    TABLE_LIMITED_TEXT_COLOR,
+)
 from .music_compatibility import (
     KNOWN_AUDIO_FORMATS,
     MusicCompatibilityScanWorker,
@@ -1589,6 +1591,7 @@ class MusicConversionWorker(QObject):
         compression_level: int,
         dry_run: bool,
         backup_root: Path | None,
+        preserve_tags: bool,
     ):
         super().__init__()
         self.target_path = target_path
@@ -1597,6 +1600,7 @@ class MusicConversionWorker(QObject):
         self.compression_level = compression_level
         self.dry_run = dry_run
         self.backup_root = backup_root
+        self.preserve_tags = preserve_tags
         self._cancel_requested = False
         self._active_process: subprocess.Popen | None = None
         # per-conversion timeout in seconds
@@ -1850,9 +1854,24 @@ class MusicConversionWorker(QObject):
                         self.progress.emit(index, total, detail_label)
                         continue
 
+                should_convert = candidate.get("should_convert", True)
+                needs_sanitize = candidate.get("needs_sanitize", True)
+
                 if self.dry_run:
                     planned += 1
-                    self.progress.emit(index, total, f"Would convert: {source_path.name}")
+                    self.progress.emit(index, total, f"Would process: {source_path.name}")
+                    continue
+
+                if needs_sanitize:
+                    try:
+                        from .metadata_sanitizer import MetadataSanitizer
+                        sanitizer = MetadataSanitizer()
+                        sanitizer.sanitize(source_path, preserve_third_party_tags=self.preserve_tags)
+                    except Exception:
+                        pass
+                
+                if not should_convert:
+                    converted += 1
                     continue
 
                 output_path = source_path.with_suffix(".flac")
@@ -2316,11 +2335,11 @@ class LyricsConversionPreviewDialog(QDialog):
             
             if has_lyrics:
                 self.valid_files.append(file_path)
-                status_item.setBackground(QColor("#2E7D32"))
-                status_item.setForeground(QColor("#F2FFF2"))
+                status_item.setBackground(QColor(TABLE_COMPATIBLE_COLOR))
+                status_item.setForeground(QColor(TABLE_COMPATIBLE_TEXT_COLOR))
             else:
-                status_item.setBackground(QColor("#7A2C2C"))
-                status_item.setForeground(QColor("#FFF0F0"))
+                status_item.setBackground(QColor(TABLE_INCOMPATIBLE_COLOR))
+                status_item.setForeground(QColor(TABLE_INCOMPATIBLE_TEXT_COLOR))
                 file_item.setForeground(QColor("#888888"))
                 dest_item.setForeground(QColor("#888888"))
                 
@@ -2770,6 +2789,18 @@ class ToolboxWindow(QMainWindow):
         )
         music_compatibility_controls.addWidget(self.music_compatibility_search_input, 1)
 
+        self.music_compatibility_status_filter = QComboBox()
+        self.music_compatibility_status_filter.addItems([
+            "All Statuses",
+            "SUPPORTED",
+            "LIMITED",
+            "UNSUPPORTED"
+        ])
+        self.music_compatibility_status_filter.currentTextChanged.connect(
+            self._apply_music_compatibility_status_filter
+        )
+        music_compatibility_controls.addWidget(self.music_compatibility_status_filter)
+
         self.music_compatibility_scan_btn = QPushButton("Refresh")
         self.music_compatibility_scan_btn.clicked.connect(self.scan_music_compatibility)
         music_compatibility_controls.addWidget(self.music_compatibility_scan_btn)
@@ -2788,6 +2819,7 @@ class ToolboxWindow(QMainWindow):
 
         self.stat_mc_scanned_box, self.stat_mc_scanned_lbl = create_stat_box("Scanned Files")
         self.stat_mc_supported_box, self.stat_mc_supported_lbl = create_stat_box("Supported")
+        self.stat_mc_limited_box, self.stat_mc_limited_lbl = create_stat_box("Limited")
         self.stat_mc_eq_compatible_box, self.stat_mc_eq_compatible_lbl = create_stat_box("EQ Compatible")
         self.stat_mc_unsupported_box, self.stat_mc_unsupported_lbl = create_stat_box("Unsupported")
         self.stat_mc_unknown_box, self.stat_mc_unknown_lbl = create_stat_box("Unknown")
@@ -2795,6 +2827,7 @@ class ToolboxWindow(QMainWindow):
 
         mc_stats_layout.addWidget(self.stat_mc_scanned_box)
         mc_stats_layout.addWidget(self.stat_mc_supported_box)
+        mc_stats_layout.addWidget(self.stat_mc_limited_box)
         mc_stats_layout.addWidget(self.stat_mc_eq_compatible_box)
         mc_stats_layout.addWidget(self.stat_mc_unsupported_box)
         mc_stats_layout.addWidget(self.stat_mc_unknown_box)
@@ -2832,11 +2865,8 @@ class ToolboxWindow(QMainWindow):
         self.music_compatibility_table = QTableView()
         self.music_compatibility_table_model = MusicCompatibilityTableModel()
         
-        self.music_compatibility_proxy_model = QSortFilterProxyModel()
+        self.music_compatibility_proxy_model = MusicCompatibilityFilterProxyModel()
         self.music_compatibility_proxy_model.setSourceModel(self.music_compatibility_table_model)
-        self.music_compatibility_proxy_model.setFilterCaseSensitivity(Qt.CaseInsensitive)
-        # Filter all columns
-        self.music_compatibility_proxy_model.setFilterKeyColumn(-1)
         
         self.music_compatibility_table.setModel(self.music_compatibility_proxy_model)
 
@@ -2844,7 +2874,7 @@ class ToolboxWindow(QMainWindow):
         self.music_compatibility_table.setItemDelegateForColumn(0, TableCheckDelegate(self.music_compatibility_table))
         self._configure_resizable_table_columns(
             self.music_compatibility_table,
-            [40, 320, 120, 300, 140, 90, 140, 90, 90, 100, 100, 90, 80, 160],
+            [40, 320, 120, 300, 140, 90, 140, 90, 90, 100, 100, 90, 80, 160, 140],
         )
         self.music_compatibility_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
         self.music_compatibility_table.setAlternatingRowColors(True)
@@ -5015,8 +5045,8 @@ class ToolboxWindow(QMainWindow):
                 
                 reason_item = QTableWidgetItem(reason_text)
                 if conflict_reason:
-                    reason_item.setBackground(QColor("#7A5E2C"))
-                    reason_item.setForeground(QColor("#FFF9E6"))
+                    reason_item.setBackground(QColor(TABLE_LIMITED_COLOR))
+                    reason_item.setForeground(QColor(TABLE_LIMITED_TEXT_COLOR))
                 self.file_rename_table.setItem(row_index, 5, reason_item)
         finally:
             self.file_rename_table.setUpdatesEnabled(True)
@@ -5386,7 +5416,7 @@ class ToolboxWindow(QMainWindow):
                 if col < 2:
                     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 if col >= 2 and not text:
-                    item.setBackground(QColor("#7A2C2C"))
+                    item.setBackground(QColor(TABLE_INCOMPATIBLE_COLOR))
                 self.metadata_manager_table.setItem(row, col, item)
 
                 if col == 2:
@@ -6166,7 +6196,7 @@ class ToolboxWindow(QMainWindow):
         self.statusBar().showMessage(f"Updated {field} for {file_name_item.text()}", 3000)
         self.metadata_manager_table.blockSignals(True)
         if not new_val:
-            item.setBackground(QColor("#7A2C2C"))
+            item.setBackground(QColor(TABLE_INCOMPATIBLE_COLOR))
         else:
             item.setBackground(QBrush())
         self.metadata_manager_table.blockSignals(False)
@@ -7151,7 +7181,7 @@ class ToolboxWindow(QMainWindow):
                 display_meta_status = "Found" if not meta_status else meta_status
                 meta_item = QTableWidgetItem(display_meta_status)
                 if "Missing" in display_meta_status or "Error" in display_meta_status:
-                    meta_item.setBackground(QColor("#4A1010"))
+                    meta_item.setBackground(QColor(TABLE_INCOMPATIBLE_COLOR))
                     if display_meta_status == "Missing Artist/Album":
                         meta_item.setToolTip("Both Artist and Album tags are missing. Auto-download will fail.")
                     elif display_meta_status == "Missing Artist":
@@ -7161,7 +7191,7 @@ class ToolboxWindow(QMainWindow):
                     else:
                         meta_item.setToolTip(f"Metadata issue: {display_meta_status}")
                 else:
-                    meta_item.setBackground(QColor("#1E4620"))
+                    meta_item.setBackground(QColor(TABLE_COMPATIBLE_COLOR))
                     meta_item.setToolTip("Essential metadata (Artist & Album) found. Auto-download is supported.")
 
                 items = [
@@ -7181,27 +7211,27 @@ class ToolboxWindow(QMainWindow):
 
                     if col_index == 2:
                         if status == "Compatible":
-                            item.setBackground(QColor("#1E4620"))
+                            item.setBackground(QColor(TABLE_COMPATIBLE_COLOR))
                         elif status == "Incompatible":
-                            item.setBackground(QColor("#4A1010"))
+                            item.setBackground(QColor(TABLE_INCOMPATIBLE_COLOR))
 
                     if status == "Incompatible":
                         if col_index == 3 and progressive == "True":
-                            item.setBackground(QColor("#4A1010"))
+                            item.setBackground(QColor(TABLE_INCOMPATIBLE_COLOR))
                             item.setToolTip("JPEG must be non-progressive.")
                         elif col_index == 4 and file_type != "JPEG":
-                            item.setBackground(QColor("#4A1010"))
+                            item.setBackground(QColor(TABLE_INCOMPATIBLE_COLOR))
                             item.setToolTip("Format must be JPEG.")
                         elif col_index == 5 and resolution:
                             try:
                                 parts = resolution.split("x")
                                 if len(parts) == 2 and (int(parts[0].strip()) > 1000 or int(parts[1].strip()) > 1000):
-                                    item.setBackground(QColor("#4A1010"))
+                                    item.setBackground(QColor(TABLE_INCOMPATIBLE_COLOR))
                                     item.setToolTip("Resolution must be 1000x1000 or lower.")
                             except ValueError:
                                 pass
                     elif status == "Missing Artwork":
-                        item.setBackground(QColor("#6B3E00"))
+                        item.setBackground(QColor(TABLE_LIMITED_COLOR))
                     self.album_art_table.setItem(row_index, col_index, item)
 
             self.album_art_table.setUpdatesEnabled(True)
@@ -7323,6 +7353,7 @@ class ToolboxWindow(QMainWindow):
         self.music_compatibility_table_model.update_data([])
         self.stat_mc_scanned_lbl.setText("-")
         self.stat_mc_supported_lbl.setText("-")
+        self.stat_mc_limited_lbl.setText("-")
         self.stat_mc_eq_compatible_lbl.setText("-")
         self.stat_mc_unsupported_lbl.setText("-")
         self.stat_mc_unknown_lbl.setText("-")
@@ -7406,12 +7437,13 @@ class ToolboxWindow(QMainWindow):
         self._music_compatibility_scan_worker = None
         self._music_compatibility_scan_thread = None
 
-    @Slot(int, int, int, int, int, int, int)
+    @Slot(int, int, int, int, int, int, int, int)
     def _on_music_compatibility_scan_cancelled(
         self,
         scanned: int,
         total: int,
         supported: int,
+        limited: int,
         unsupported: int,
         unknown: int,
         skipped: int,
@@ -7430,6 +7462,7 @@ class ToolboxWindow(QMainWindow):
         )
         self.stat_mc_scanned_lbl.setText(f"{scanned}/{total}")
         self.stat_mc_supported_lbl.setText(str(supported))
+        self.stat_mc_limited_lbl.setText(str(limited))
         self.stat_mc_eq_compatible_lbl.setText(str(supported - eq_incompatible))
         self.stat_mc_unsupported_lbl.setText(str(unsupported))
         self.stat_mc_unknown_lbl.setText(str(unknown))
@@ -7603,13 +7636,25 @@ class ToolboxWindow(QMainWindow):
                 selected_profile,
                 dry_run=dry_run_checkbox.isChecked(),
                 backup_root=backup_root,
+                preserve_tags=preserve_tags_checkbox.isChecked(),
             )
 
         confirm_btn.clicked.connect(_confirm_conversion_request)
 
+        warning_label = QLabel(
+            "⚠️ WARNING: To prevent the hardware abort bug, all metadata tags other than TITLE, ARTIST, ALBUM, ALBUMARTIST, TRACKNUMBER, DISCNUMBER, GENRE, and LYRICS will be permanently removed from the files."
+        )
+        warning_label.setWordWrap(True)
+        warning_label.setStyleSheet("color: #FF6E6E; font-weight: bold; margin-top: 5px; margin-bottom: 5px;")
+
+        preserve_tags_checkbox = QCheckBox("Take the risk: I want to keep my third-party metadata tags")
+        preserve_tags_checkbox.setToolTip("If checked, the Toolbox will only trim tags starting with musicbrainz_ or tidal_, and will try to delicately keep the total count under 32. This is DANGEROUS and may result in missing titles.")
+
         layout.addWidget(title_label)
         layout.addWidget(summary_label)
+        layout.addWidget(warning_label)
         layout.addSpacing(6)
+        layout.addWidget(preserve_tags_checkbox)
         layout.addWidget(eq_checkbox)
         layout.addWidget(backup_checkbox)
         layout.addWidget(backup_path_container)
@@ -7683,7 +7728,10 @@ class ToolboxWindow(QMainWindow):
             if not file_name or not status_text:
                 continue
 
-            should_convert = True
+            should_convert = False
+            if status_text == "UNSUPPORTED":
+                should_convert = True
+
             eq_actionable_states = {"not eq compatible"}
             if include_unknown_for_eq:
                 eq_actionable_states.add("unknown")
@@ -7691,7 +7739,9 @@ class ToolboxWindow(QMainWindow):
             if make_eq_compatible and eq_text in eq_actionable_states:
                 should_convert = True
 
-            if not should_convert:
+            needs_sanitize = (status_text == "LIMITED")
+
+            if not should_convert and not needs_sanitize:
                 continue
 
             candidates.append(
@@ -7699,6 +7749,8 @@ class ToolboxWindow(QMainWindow):
                     "relative_file": file_name.strip(),
                     "sample_rate": sample_rate.strip() if sample_rate else "",
                     "bit_depth": bit_depth.strip() if bit_depth else "",
+                    "should_convert": should_convert,
+                    "needs_sanitize": needs_sanitize,
                 }
             )
 
@@ -7711,6 +7763,7 @@ class ToolboxWindow(QMainWindow):
         *,
         dry_run: bool = False,
         backup_root: Path | None = None,
+        preserve_tags: bool = False,
     ) -> None:
         resolved_ffmpeg = _resolve_ffmpeg_executable()
         if resolved_ffmpeg is None:
@@ -7800,6 +7853,7 @@ class ToolboxWindow(QMainWindow):
             compression_level,
             dry_run,
             backup_root,
+            preserve_tags,
         )
         # Provide the resolved ffmpeg executable path to the worker so it can
         # invoke the bundled/system ffmpeg directly.
@@ -7945,13 +7999,13 @@ class ToolboxWindow(QMainWindow):
         self._music_conversion_worker = None
         self._music_conversion_thread = None
 
-    @Slot(int, int, int, int, int, int)
-    @Slot(int, int, int, int, int, int, int)
+    @Slot(int, int, int, int, int, int, int, int, str)
     def _on_music_compatibility_scan_progress(
         self,
         scanned: int,
         total: int,
         supported: int,
+        limited: int,
         unsupported: int,
         unknown: int,
         skipped: int,
@@ -7977,6 +8031,7 @@ class ToolboxWindow(QMainWindow):
         self.music_compatibility_progress.setFormat(f"Scanning {scanned}/{total}")
         self.stat_mc_scanned_lbl.setText(f"{scanned}/{total}")
         self.stat_mc_supported_lbl.setText(str(supported))
+        self.stat_mc_limited_lbl.setText(str(limited))
         self.stat_mc_eq_compatible_lbl.setText(str(supported - eq_incompatible))
         self.stat_mc_unsupported_lbl.setText(str(unsupported))
         self.stat_mc_unknown_lbl.setText(str(unknown))
@@ -7984,13 +8039,22 @@ class ToolboxWindow(QMainWindow):
 
     @Slot(str)
     def _apply_music_compatibility_table_filter(self, query: str) -> None:
-        self.music_compatibility_proxy_model.setFilterRegularExpression(query)
+        if isinstance(self.music_compatibility_proxy_model, QSortFilterProxyModel) and hasattr(self.music_compatibility_proxy_model, "setSearchQuery"):
+            self.music_compatibility_proxy_model.setSearchQuery(query)
+        else:
+            self.music_compatibility_proxy_model.setFilterRegularExpression(query)
 
-    @Slot(list, int, int, int, int, int, int)
+    @Slot(str)
+    def _apply_music_compatibility_status_filter(self, status: str) -> None:
+        if hasattr(self.music_compatibility_proxy_model, "setStatusFilter"):
+            self.music_compatibility_proxy_model.setStatusFilter(status)
+
+    @Slot(list, int, int, int, int, int, int, int)
     def _on_music_compatibility_scan_finished(
         self,
         rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str, str, str, str, str]],
         supported: int,
+        limited: int,
         unsupported: int,
         unknown: int,
         skipped: int,
@@ -8015,6 +8079,7 @@ class ToolboxWindow(QMainWindow):
             self.music_compatibility_progress.setFormat("No files found")
             self.stat_mc_scanned_lbl.setText("0/0")
             self.stat_mc_supported_lbl.setText("0")
+            self.stat_mc_limited_lbl.setText("0")
             self.stat_mc_eq_compatible_lbl.setText("0")
             self.stat_mc_unsupported_lbl.setText("0")
             self.stat_mc_unknown_lbl.setText("0")
@@ -8027,6 +8092,7 @@ class ToolboxWindow(QMainWindow):
             )
             self.stat_mc_scanned_lbl.setText(f"{total_files}/{total_files}")
             self.stat_mc_supported_lbl.setText(str(supported))
+            self.stat_mc_limited_lbl.setText(str(limited))
             self.stat_mc_eq_compatible_lbl.setText(str(supported - eq_incompatible))
             self.stat_mc_unsupported_lbl.setText(str(unsupported))
             self.stat_mc_unknown_lbl.setText(str(unknown))
@@ -8231,22 +8297,22 @@ class ToolboxWindow(QMainWindow):
 
                 if status_item is not None:
                     if has_lyrics == "Yes":
-                        status_item.setBackground(QColor("#2E7D32"))
-                        status_item.setForeground(QColor("#F2FFF2"))
+                        status_item.setBackground(QColor(TABLE_COMPATIBLE_COLOR))
+                        status_item.setForeground(QColor(TABLE_COMPATIBLE_TEXT_COLOR))
                     elif has_lyrics == "No":
                         status_item.setBackground(QColor("#3C3C3C"))
                         status_item.setForeground(QColor("#E2E2E2"))
                     else:
-                        status_item.setBackground(QColor("#7A2C2C"))
-                        status_item.setForeground(QColor("#FFF0F0"))
+                        status_item.setBackground(QColor(TABLE_INCOMPATIBLE_COLOR))
+                        status_item.setForeground(QColor(TABLE_INCOMPATIBLE_TEXT_COLOR))
 
                 if lrc_item is not None:
                     if lrc_status:
-                        lrc_item.setBackground(QColor("#2E7D32"))
-                        lrc_item.setForeground(QColor("#F2FFF2"))
+                        lrc_item.setBackground(QColor(TABLE_COMPATIBLE_COLOR))
+                        lrc_item.setForeground(QColor(TABLE_COMPATIBLE_TEXT_COLOR))
                     else:
-                        lrc_item.setBackground(QColor("#7A2C2C"))
-                        lrc_item.setForeground(QColor("#FFF0F0"))
+                        lrc_item.setBackground(QColor(TABLE_INCOMPATIBLE_COLOR))
+                        lrc_item.setForeground(QColor(TABLE_INCOMPATIBLE_TEXT_COLOR))
         finally:
             self.lyrics_manager_table.setUpdatesEnabled(True)
             self._reapply_lyrics_manager_sort()
@@ -8694,22 +8760,22 @@ class ToolboxWindow(QMainWindow):
 
                 if status_item is not None:
                     if status == "Found":
-                        status_item.setBackground(QColor("#2E7D32"))
-                        status_item.setForeground(QColor("#F2FFF2"))
+                        status_item.setBackground(QColor(TABLE_COMPATIBLE_COLOR))
+                        status_item.setForeground(QColor(TABLE_COMPATIBLE_TEXT_COLOR))
                     elif status in {"Not found", "Instrumental"}:
                         status_item.setBackground(QColor("#3C3C3C"))
                         status_item.setForeground(QColor("#E2E2E2"))
                     else:
-                        status_item.setBackground(QColor("#7A2C2C"))
-                        status_item.setForeground(QColor("#FFF0F0"))
+                        status_item.setBackground(QColor(TABLE_INCOMPATIBLE_COLOR))
+                        status_item.setForeground(QColor(TABLE_INCOMPATIBLE_TEXT_COLOR))
 
                 if apply_item is not None:
                     if apply_status == "Applied":
-                        apply_item.setBackground(QColor("#2E7D32"))
-                        apply_item.setForeground(QColor("#F2FFF2"))
+                        apply_item.setBackground(QColor(TABLE_COMPATIBLE_COLOR))
+                        apply_item.setForeground(QColor(TABLE_COMPATIBLE_TEXT_COLOR))
                     elif apply_status == "Error":
-                        apply_item.setBackground(QColor("#7A2C2C"))
-                        apply_item.setForeground(QColor("#FFF0F0"))
+                        apply_item.setBackground(QColor(TABLE_INCOMPATIBLE_COLOR))
+                        apply_item.setForeground(QColor(TABLE_INCOMPATIBLE_TEXT_COLOR))
         finally:
             self.lyrics_manager_table.setUpdatesEnabled(True)
             self._reapply_lyrics_manager_sort()
@@ -10687,10 +10753,10 @@ class ToolboxWindow(QMainWindow):
                 value_item.setText(
                     f"{value} (Likely Compatibility Issue - It's recommended to use FAT/exFAT)"
                 )
-                prop_item.setBackground(QColor("#7A3B00"))
-                prop_item.setForeground(QColor("#FFF2CC"))
-                value_item.setBackground(QColor("#7A3B00"))
-                value_item.setForeground(QColor("#FFF2CC"))
+                prop_item.setBackground(QColor(TABLE_LIMITED_COLOR))
+                prop_item.setForeground(QColor(TABLE_LIMITED_TEXT_COLOR))
+                value_item.setBackground(QColor(TABLE_LIMITED_COLOR))
+                value_item.setForeground(QColor(TABLE_LIMITED_TEXT_COLOR))
                 warning_tip = "Backup your data, and reformat this drive as either FAT or exFAT"
                 prop_item.setToolTip(warning_tip)
                 value_item.setToolTip(warning_tip)
@@ -10701,20 +10767,20 @@ class ToolboxWindow(QMainWindow):
                     track_total = None
 
                 if track_total is not None and track_total > 8192:
-                    prop_item.setBackground(QColor("#7A5E2C"))
-                    prop_item.setForeground(QColor("#FFF9E6"))
-                    value_item.setBackground(QColor("#7A5E2C"))
-                    value_item.setForeground(QColor("#FFF9E6"))
+                    prop_item.setBackground(QColor(TABLE_LIMITED_COLOR))
+                    prop_item.setForeground(QColor(TABLE_LIMITED_TEXT_COLOR))
+                    value_item.setBackground(QColor(TABLE_LIMITED_COLOR))
+                    value_item.setForeground(QColor(TABLE_LIMITED_TEXT_COLOR))
                     warning_tip = "Maximum supported track count is 8192"
                     prop_item.setToolTip(warning_tip)
                     value_item.setToolTip(warning_tip)
 
             if prop.lower() == "total space" and size_warning:
                 value_item.setText(f"{value} (WARNING: Drive size over 256GB)")
-                prop_item.setBackground(QColor("#7A3B00"))
-                prop_item.setForeground(QColor("#FFF2CC"))
-                value_item.setBackground(QColor("#7A3B00"))
-                value_item.setForeground(QColor("#FFF2CC"))
+                prop_item.setBackground(QColor(TABLE_LIMITED_COLOR))
+                prop_item.setForeground(QColor(TABLE_LIMITED_TEXT_COLOR))
+                value_item.setBackground(QColor(TABLE_LIMITED_COLOR))
+                value_item.setForeground(QColor(TABLE_LIMITED_TEXT_COLOR))
                 warning_tip = "Large drive detected: capacities over 256GB may cause compatibility issues."
                 prop_item.setToolTip(warning_tip)
                 value_item.setToolTip(warning_tip)

@@ -1173,6 +1173,14 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         channels_text = str(metadata.get("channels") or "-")
         stream_count_text = str(metadata.get("total_stream_count") or "-")
 
+    from .metadata_sanitizer import MetadataSanitizer
+    sanitizer = MetadataSanitizer()
+    meta_ok, meta_reason = sanitizer.check_metadata(path)
+    metadata_comp_status = "COMPATIBLE" if meta_ok else "INCOMPATIBLE"
+    
+    if not meta_ok:
+        status = "LIMITED"
+        reason = reason + ("; " if reason else "") + meta_reason
     return {
         "file": relative_path,
         "extension": extension_display,
@@ -1189,13 +1197,15 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         "stream_count": stream_count_text,
         "filename_compatibility": filename_comp_status,
         "filename_compatibility_reason": filename_comp_reason,
+        "metadata_compatibility": metadata_comp_status,
+        "metadata_compatibility_reason": meta_reason,
     }
 
 
 class MusicCompatibilityScanWorker(QObject):
-    progress = Signal(int, int, int, int, int, int, int, str)
-    finished = Signal(list, int, int, int, int, int, int)
-    cancelled = Signal(int, int, int, int, int, int, int)
+    progress = Signal(int, int, int, int, int, int, int, int, str)
+    finished = Signal(list, int, int, int, int, int, int, int)
+    cancelled = Signal(int, int, int, int, int, int, int, int)
     failed = Signal(str)
 
     def __init__(self, target_path: Path):
@@ -1212,7 +1222,7 @@ class MusicCompatibilityScanWorker(QObject):
             candidate_files: list[Path] = []
             for root_dir, dir_names, file_names in os.walk(self.target_path):
                 if self._cancel_requested:
-                    self.cancelled.emit(0, 0, 0, 0, 0, 0, 0)
+                    self.cancelled.emit(0, 0, 0, 0, 0, 0, 0, 0)
                     return
 
                 # Do not descend into hidden directories.
@@ -1220,7 +1230,7 @@ class MusicCompatibilityScanWorker(QObject):
 
                 for file_name in file_names:
                     if self._cancel_requested:
-                        self.cancelled.emit(0, 0, 0, 0, 0, 0, 0)
+                        self.cancelled.emit(0, 0, 0, 0, 0, 0, 0, 0)
                         return
                     if file_name.startswith("."):
                         continue
@@ -1233,17 +1243,18 @@ class MusicCompatibilityScanWorker(QObject):
 
             total_files = len(candidate_files)
             supported = 0
+            limited = 0
             unsupported = 0
             unknown = 0
             skipped = 0
             eq_incompatible = 0
             rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str]] = []
 
-            self.progress.emit(0, total_files, supported, unsupported, unknown, skipped, eq_incompatible, "")
+            self.progress.emit(0, total_files, supported, limited, unsupported, unknown, skipped, eq_incompatible, "")
 
             for index, file_path in enumerate(candidate_files, start=1):
                 if self._cancel_requested:
-                    self.cancelled.emit(index - 1, total_files, supported, unsupported, unknown, skipped, eq_incompatible)
+                    self.cancelled.emit(index - 1, total_files, supported, limited, unsupported, unknown, skipped, eq_incompatible)
                     return
 
                 result = _evaluate_music_file_with_cache(file_path, self.target_path)
@@ -1263,6 +1274,8 @@ class MusicCompatibilityScanWorker(QObject):
                         result.get("stream_count", "-"),
                         result.get("filename_compatibility", "-"),
                         result.get("filename_compatibility_reason", "-"),
+                        result.get("metadata_compatibility", "-"),
+                        result.get("metadata_compatibility_reason", "-"),
                         result["category"],
                     )
                 )
@@ -1276,13 +1289,15 @@ class MusicCompatibilityScanWorker(QObject):
                     unknown += 1
                 else:
                     skipped += 1
+                if result["status"] == "LIMITED":
+                    limited += 1
 
                 # Count EQ-incompatible (and unknown) supported files
                 if category == "supported" and result["eq_compatibility"].lower() != "eq compatible":
                     eq_incompatible += 1
 
-                self.progress.emit(index, total_files, supported, unsupported, unknown, skipped, eq_incompatible, file_path.name)
+                self.progress.emit(index, total_files, supported, limited, unsupported, unknown, skipped, eq_incompatible, file_path.name)
 
-            self.finished.emit(rows, supported, unsupported, unknown, skipped, total_files, eq_incompatible)
+            self.finished.emit(rows, supported, limited, unsupported, unknown, skipped, total_files, eq_incompatible)
         except Exception as exc:
             self.failed.emit(str(exc))
