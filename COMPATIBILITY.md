@@ -45,3 +45,17 @@ The device handles most file names well, but there are exceptions based on teste
 * **Zalgo / Complex Diacritics:** RENDERS AS STANDARD TEXT. The text will render, but complex combining characters/diacritics are stripped and ignored.
 * **Latin Extended / Other Unicode:** SUPPORTED. Characters like `café`, Cyrillic, Greek, Arabic, Hebrew, and Math symbols work correctly.
 * **Long Names / Special Punctuation:** SUPPORTED. Works within reasonable filesystem bounds.
+
+## Metadata (Tag) Compatibility
+
+The device has a very simplistic internal metadata parser that can be easily confused by non-standard tags often injected by advanced library managers (like MusicBrainz Picard).
+
+**Supported Tags:**
+
+- TITLE (also matches Title)
+- ARTIST (also matches Artist)
+- ALBUM (also matches Album)
+- ALBUMARTIST (also matches Album Artist)
+- TRACKNUMBER (also matches Track)
+- DISCNUMBER (also matches Discnumber)
+- GENRE (also matches Genre)

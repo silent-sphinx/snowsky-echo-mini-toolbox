@@ -1,5 +1,10 @@
 from PySide6.QtCore import QAbstractTableModel, Qt, QModelIndex
 from PySide6.QtGui import QColor
+from .constants import (
+    TABLE_COMPATIBLE_COLOR,
+    TABLE_INCOMPATIBLE_COLOR,
+    TABLE_LIMITED_COLOR,
+)
 
 class MusicCompatibilityTableModel(QAbstractTableModel):
     def __init__(self, parent=None):
@@ -19,6 +24,7 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
             "DSD",
             "Streams",
             "File Name Compatibility",
+            "Metadata Compatibility",
         ]
         self._rows = []
         self._checked_files = set()
@@ -37,6 +43,7 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
             11: 8,  # DSD
             12: 11, # Streams
             13: 12, # File Name Compatibility
+            14: 14, # Metadata Compatibility
         }
 
     def update_data(self, rows):
@@ -44,7 +51,7 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
         self._rows = rows
         self._checked_files.clear()
         for row in self._rows:
-            if row[14] == "unsupported":  # category is index 14
+            if row[16] == "unsupported":  # category is index 16
                 self._checked_files.add(row[0])  # file path is index 0
         self.endResetModel()
         
@@ -79,10 +86,14 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
             return Qt.Checked if row_data[0] in self._checked_files else Qt.Unchecked
 
         elif role == Qt.ToolTipRole:
-            if col == 3:
+            if col == 2 and row_data[3] == "LIMITED":
+                return "This audio file will play on your Snowsky device, but there are caveats preventing an ideal experience. Consult the orange or red table cells for more information."
+            elif col == 3:
                 return row_data[4] # reason
             elif col == 13:
                 return row_data[13] # filename_compatibility_reason
+            elif col == 14:
+                return row_data[15] # metadata_compatibility_reason
             elif col != 0:
                 if col in self._mapping:
                     return str(row_data[self._mapping[col]])
@@ -91,32 +102,37 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
             status = row_data[3]
             eq_comp = row_data[9]
             filename_comp = row_data[12]
+            metadata_comp = row_data[14]
             
             if col == 2:
-                if status == "SUPPORTED": return QColor("#2E7D32")
+                if status == "SUPPORTED": return QColor(TABLE_COMPATIBLE_COLOR)
                 elif status == "SKIPPED": return QColor("#3C3C3C")
-                elif status in ("UNSUPPORTED", "UNKNOWN"): return QColor("#7A2C2C")
+                elif status in ("UNSUPPORTED", "UNKNOWN"): return QColor(TABLE_INCOMPATIBLE_COLOR)
+                elif status == "LIMITED": return QColor(TABLE_LIMITED_COLOR)
             elif col == 4:
-                if eq_comp == "Not EQ Compatible": return QColor("#7A2C2C")
-                elif eq_comp == "EQ Compatible": return QColor("#2E7D32")
-                elif eq_comp == "UNKNOWN": return QColor("#7A5E2C")
+                if eq_comp == "Not EQ Compatible": return QColor(TABLE_INCOMPATIBLE_COLOR)
+                elif eq_comp == "EQ Compatible": return QColor(TABLE_COMPATIBLE_COLOR)
+                elif eq_comp == "UNKNOWN": return QColor(TABLE_LIMITED_COLOR)
             elif col in (6, 7):
                 try:
                     sr = int(row_data[5])
-                    if sr > 192000: return QColor("#7A2C2C")
+                    if sr > 192000: return QColor(TABLE_INCOMPATIBLE_COLOR)
                 except: pass
                 try:
                     bd = int(row_data[6])
-                    if bd > 16: return QColor("#7A2C2C")
+                    if bd > 16: return QColor(TABLE_INCOMPATIBLE_COLOR)
                 except: pass
             elif col == 10:
                 try:
                     bs = int(row_data[7])
-                    if bs > 4096: return QColor("#7A5E2C")
+                    if bs > 4096: return QColor(TABLE_LIMITED_COLOR)
                 except: pass
             elif col == 13:
-                if filename_comp == "INCOMPATIBLE": return QColor("#7A5E2C")
-                elif filename_comp == "COMPATIBLE": return QColor("#2E7D32")
+                if filename_comp == "INCOMPATIBLE": return QColor(TABLE_INCOMPATIBLE_COLOR)
+                elif filename_comp == "COMPATIBLE": return QColor(TABLE_COMPATIBLE_COLOR)
+            elif col == 14:
+                if metadata_comp == "INCOMPATIBLE": return QColor(TABLE_INCOMPATIBLE_COLOR)
+                elif metadata_comp == "COMPATIBLE": return QColor(TABLE_COMPATIBLE_COLOR)
 
         elif role == Qt.TextAlignmentRole:
             if col in (6, 7, 8, 10, 11, 12):
@@ -158,3 +174,46 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
         if index.column() == 0:
             flags |= Qt.ItemIsUserCheckable
         return flags
+
+from PySide6.QtCore import QSortFilterProxyModel
+
+class MusicCompatibilityFilterProxyModel(QSortFilterProxyModel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._status_filter = "All"
+        self._search_query = ""
+
+    def setStatusFilter(self, status: str):
+        self._status_filter = status
+        self.invalidateFilter()
+
+    def setSearchQuery(self, query: str):
+        self._search_query = query.lower()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row: int, source_parent) -> bool:
+        model = self.sourceModel()
+        if not model:
+            return True
+
+        # Check status filter
+        if self._status_filter != "All" and self._status_filter != "All Statuses":
+            status_index = model.index(source_row, 2, source_parent)
+            status_val = model.data(status_index, Qt.DisplayRole)
+            if not status_val or status_val.strip().upper() != self._status_filter.upper():
+                return False
+
+        # Check search query
+        if self._search_query:
+            row_matches_search = False
+            for col in range(1, model.columnCount(source_parent)):
+                index = model.index(source_row, col, source_parent)
+                val = model.data(index, Qt.DisplayRole)
+                if val and self._search_query in str(val).lower():
+                    row_matches_search = True
+                    break
+            
+            if not row_matches_search:
+                return False
+
+        return True

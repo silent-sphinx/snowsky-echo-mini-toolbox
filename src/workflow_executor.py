@@ -370,8 +370,12 @@ class WorkflowExecutionWorker(QObject):
     def _step_make_music_compatible(self, step: WorkflowStep, eq_compatible: bool) -> tuple[bool, str]:
         # 1. Scan for candidates
         candidates = []
+        from .album_art import iter_audio_files
         audio_files = list(iter_audio_files(self.target_path))
         total = len(audio_files)
+        
+        from .metadata_sanitizer import MetadataSanitizer
+        sanitizer = MetadataSanitizer()
         
         for index, file_path in enumerate(audio_files, start=1):
             if self._cancel_requested:
@@ -379,12 +383,17 @@ class WorkflowExecutionWorker(QObject):
             if index == total or index % 10 == 0:
                 self.step_progress.emit(index, total, f"Scanning {file_path.name}")
             
+            from .music_compatibility import _evaluate_music_file_with_cache
             result = _evaluate_music_file_with_cache(file_path, self.target_path)
             
             should_convert = False
             status = result.get("status", "").strip().upper()
             eq_text = result.get("eq_compatibility", "").strip().lower()
             
+            if status == "LIMITED":
+                # Strip conflicting metadata tags (e.g. 'artists') silently
+                sanitizer.sanitize(file_path)
+                
             if status == "UNSUPPORTED":
                 should_convert = True
                 
