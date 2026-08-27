@@ -115,7 +115,7 @@ pyside_datas, pyside_binaries, pyside_hiddenimports = _collect_pyside_modules(
     PYSIDE6_MODULES
 )
 
-datas = [] + _filter_webengine_entries(pyside_datas)
+datas = [('assets', 'assets')] + _filter_webengine_entries(pyside_datas)
 
 # Add platform-specific binary extensions
 _exe_ext = '.exe' if sys.platform == 'win32' else ''
