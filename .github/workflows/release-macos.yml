@@ -11,8 +11,18 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Show system information
         run: |
           echo "macOS build runner"
           uname -a
           uname -m
+
+      - name: Show Python version
+        run: |
+          python --version
+          python -m pip --version
