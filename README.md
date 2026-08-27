@@ -26,6 +26,7 @@ The Snowsky Echo Mini is a fantastic little device, but its affordable hardware 
     - [Build from source](#build-from-source)
     - [Compatibility Rules](#compatibility-rules)
     - [Contributing](#contributing)
+    - [Troubleshooting](#troubleshooting)
 
 <!-- /TOC -->
 
@@ -145,12 +146,29 @@ Contributions are welcome.
 Basic flow:
 
 1. Open an issue describing the change or bug.
-1. Create a focused branch.
-1. Keep pull requests small and include test or validation steps.
-1. Update documentation when behavior changes.
+2. Create a focused branch.
+3. Keep pull requests small and include test or validation steps.
+4. Update documentation when behavior changes.
 
 If you add a new tab or workflow, include:
 
 - What users will see and do
 - How errors are handled
 - Any dependency or platform notes
+
+## Troubleshooting
+
+### macOS App Fails to Open (Stuck Bouncing in Dock)
+
+If you download the macOS `.dmg` release from GitHub, you might find that the application icon bounces in the Dock indefinitely and never opens the main window. This is caused by macOS Gatekeeper blocking the execution of unsigned developer builds.
+
+To resolve this issue:
+
+1. **Delete any old version first:** If you are upgrading from a previous release, do **not** simply drag-and-replace (overwrite) the app. Drag the old `Snowsky Echo Mini Toolbox.app` from your `/Applications` folder to the Trash first to avoid macOS path-level cache conflicts.
+2. **Clear the quarantine flag on the installer:** Before mounting the DMG, open your Terminal and run the following command to remove the macOS quarantine attribute from the downloaded DMG file:
+   ```bash
+   xattr -cr ~/Downloads/snowsky-echo-mini-toolbox-dev-macOS-arm64.dmg
+   ```
+   *(If your downloaded file has a different name, make sure to adjust the filename in the command).*
+3. **Mount and Install:** Double-click the cleared `.dmg` to mount it, and drag `Snowsky Echo Mini Toolbox.app` into `/Applications`.
+4. **Open the App:** It should now open immediately!
