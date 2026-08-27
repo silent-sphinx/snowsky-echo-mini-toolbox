@@ -13,11 +13,10 @@ The Snowsky Echo Mini is a fantastic little device, but its affordable hardware 
 
 <!-- TOC -->
 
-## Table of Contents
-
 - [Snowsky Echo Mini Toolbox](#snowsky-echo-mini-toolbox)
+    - [Table of Contents](#table-of-contents)
     - [Main Features](#main-features)
-    - [Important Notes](#important-notes)
+    - [Please Backup Your Data](#please-backup-your-data)
     - [Installation](#installation)
         - [Required Dependencies Linux Only](#required-dependencies-linux-only)
         - [Supported Operating Systems](#supported-operating-systems)
@@ -27,6 +26,7 @@ The Snowsky Echo Mini is a fantastic little device, but its affordable hardware 
     - [Compatibility Rules](#compatibility-rules)
     - [Contributing](#contributing)
     - [Troubleshooting](#troubleshooting)
+        - [macOS App Fails to Open Stuck Bouncing in Dock](#macos-app-fails-to-open-stuck-bouncing-in-dock)
 
 <!-- /TOC -->
 
@@ -70,8 +70,9 @@ The following operating systems & architectures are offically supported.
 | Operating System | Architecture | Format |
 | ---- | ---- | ---- |
 | Windows | 64-bit | Installation (.exe) |
-| Linux   | AMD64 (64-bit) | .tar.gz & .deb |
+| Linux   | - | .tar.gz & .deb |
 | MacOS | ARM64 (Apple Silicon) | .dmg |
+| MacOS | x64 Intel | .dmg |
 
 #### Notice for Windows Users
 
