@@ -1,28 +1,224 @@
-name: macOS Build
+name: Build macOS Release
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string (e.g., 1.6.0) for manual builds'
+        required: false
+        default: 'dev'
+
+permissions:
+  contents: write
 
 jobs:
-  test:
-    runs-on: macos-14
+  build:
+    name: Build macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-latest
+            ffmpeg_asset: ffmpeg-osx-arm64.zip
+            binary_dir: macos_silicon
+
+          - arch: x64
+            runner: macos-15-intel
+            ffmpeg_asset: ffmpeg-osx-x64.zip
+            binary_dir: macos_intel
 
     steps:
-      - name: Check out repository
+      # ------------------------------------------------------------
+      # Source Checkout
+      # ------------------------------------------------------------
+      - name: Check out source
         uses: actions/checkout@v4
 
+      # ------------------------------------------------------------
+      # Version Extraction & Generation
+      # ------------------------------------------------------------
+      - name: Determine version
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ inputs.version || 'dev' }}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Release version: $VERSION"
+
+      - name: Generate version file
+        run: |
+          cat > src/generated_version.py <<EOF
+          APP_VERSION = "$VERSION"
+          EOF
+          echo "Generated version file contents:"
+          cat src/generated_version.py
+
+      # ------------------------------------------------------------
+      # Build Environment Setup
+      # ------------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Show system information
+      - name: Install Python dependencies
         run: |
-          echo "macOS build runner"
-          uname -a
-          uname -m
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
 
-      - name: Show Python version
+      # ------------------------------------------------------------
+      # FFmpeg Download and Installation
+      # ------------------------------------------------------------
+      - name: Download FFmpeg
         run: |
-          python --version
-          python -m pip --version
+          mkdir -p "build_binaries/${{ matrix.binary_dir }}"
+          curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            "https://github.com/Tyrrrz/FFmpegBin/releases/latest/download/${{ matrix.ffmpeg_asset }}" \
+            --output ffmpeg.zip
+
+          unzip -q ffmpeg.zip -d ffmpeg_extract
+          echo "Downloaded FFmpeg files:"
+          find ffmpeg_extract -type f -print
+
+      - name: Install FFmpeg binaries
+        run: |
+          FF_DIR="build_binaries/${{ matrix.binary_dir }}"
+
+          FFPROBE_PATH="$(find ffmpeg_extract -type f -name ffprobe -print -quit)"
+          FFMPEG_PATH="$(find ffmpeg_extract -type f -name ffmpeg -print -quit)"
+
+          if [ -z "$FFPROBE_PATH" ]; then
+            echo "ERROR: ffprobe was not found in FFmpeg archive"
+            exit 1
+          fi
+
+          if [ -z "$FFMPEG_PATH" ]; then
+            echo "ERROR: ffmpeg was not found in FFmpeg archive"
+            exit 1
+          fi
+
+          cp "$FFPROBE_PATH" "$FF_DIR/ffprobe"
+          cp "$FFMPEG_PATH" "$FF_DIR/ffmpeg"
+
+          chmod +x "$FF_DIR/ffprobe"
+          chmod +x "$FF_DIR/ffmpeg"
+
+          echo "Installed binaries in $FF_DIR:"
+          ls -lh "$FF_DIR"
+
+      # ------------------------------------------------------------
+      # Verification
+      # ------------------------------------------------------------
+      - name: Verify FFmpeg architecture
+        run: |
+          FF_DIR="build_binaries/${{ matrix.binary_dir }}"
+          echo "ffmpeg info:"
+          file "$FF_DIR/ffmpeg"
+          lipo -archs "$FF_DIR/ffmpeg" || true
+
+          echo "ffprobe info:"
+          file "$FF_DIR/ffprobe"
+          lipo -archs "$FF_DIR/ffprobe" || true
+
+      # ------------------------------------------------------------
+      # PyInstaller Build
+      # ------------------------------------------------------------
+      - name: Build application
+        run: |
+          pyinstaller \
+            --noconfirm \
+            --clean \
+            "Snowsky Echo Mini Toolbox.spec"
+
+      - name: Verify application bundle
+        run: |
+          APP="dist/Snowsky Echo Mini Toolbox.app"
+          if [ ! -d "$APP" ]; then
+            echo "ERROR: application bundle was not created"
+            exit 1
+          fi
+          echo "Application bundle created at: $APP"
+          echo "Verifying bundled FFmpeg and ffprobe:"
+          find "$APP" -name ffmpeg -o -name ffprobe
+
+      # ------------------------------------------------------------
+      # DMG Creation
+      # ------------------------------------------------------------
+      - name: Create DMG
+        run: |
+          APP_NAME="Snowsky Echo Mini Toolbox"
+          APP_SLUG="snowsky-echo-mini-toolbox"
+          STAGE_DIR="dist/dmg_stage"
+          DMG="dist/${APP_SLUG}-${VERSION}-macOS-${{ matrix.arch }}.dmg"
+
+          rm -rf "$STAGE_DIR"
+          mkdir -p "$STAGE_DIR"
+
+          cp -R "dist/${APP_NAME}.app" "$STAGE_DIR/"
+          ln -s /Applications "$STAGE_DIR/Applications"
+
+          hdiutil create \
+            -volname "$APP_NAME" \
+            -srcfolder "$STAGE_DIR" \
+            -ov \
+            -format UDZO \
+            "$DMG"
+
+          rm -rf "$STAGE_DIR"
+          echo "Created DMG at: $DMG"
+          ls -lh "$DMG"
+
+      # ------------------------------------------------------------
+      # Upload DMG Artifact
+      # ------------------------------------------------------------
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  # ==================================================================
+  # Create the GitHub Release
+  # ==================================================================
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != 'dev')
+
+    steps:
+      - name: Download ARM64 DMG
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64
+          path: release-assets
+
+      - name: Download Intel DMG
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-x64
+          path: release-assets
+
+      - name: List release assets
+        run: |
+          find release-assets -type f -maxdepth 2 -print
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/**/*.dmg
+          generate_release_notes: true
