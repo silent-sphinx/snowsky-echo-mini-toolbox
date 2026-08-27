@@ -3,7 +3,7 @@
 
 #define MyAppName "Snowsky Echo Mini Toolbox"
 #ifndef MyAppVersion
-#define MyAppVersion "1.5.1"
+#define MyAppVersion "dev"
 #endif
 #define MyAppPublisher "Snowsky"
 #define MyAppExeName "Snowsky Echo Mini Toolbox.exe"
