@@ -278,11 +278,177 @@ jobs:
           if-no-files-found: error
 
   # ==================================================================
+  # Linux Build Job
+  # ==================================================================
+  build-linux:
+    name: Build Linux amd64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ inputs.version || 'dev' }}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Release version: $VERSION"
+
+      - name: Generate version file
+        run: |
+          cat > src/generated_version.py <<EOF
+          APP_VERSION = "$VERSION"
+          EOF
+          echo "Generated version file contents:"
+          cat src/generated_version.py
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Download FFmpeg
+        run: |
+          mkdir -p "build_binaries/linux_amd64"
+          curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            "https://github.com/Tyrrrz/FFmpegBin/releases/latest/download/ffmpeg-linux-x64.zip" \
+            --output ffmpeg.zip
+
+          unzip -q ffmpeg.zip -d ffmpeg_extract
+          echo "Downloaded FFmpeg files:"
+          find ffmpeg_extract -type f -print
+
+      - name: Install FFmpeg binaries
+        run: |
+          FF_DIR="build_binaries/linux_amd64"
+
+          FFPROBE_PATH="$(find ffmpeg_extract -type f -name ffprobe -print -quit)"
+          FFMPEG_PATH="$(find ffmpeg_extract -type f -name ffmpeg -print -quit)"
+
+          if [ -z "$FFPROBE_PATH" ]; then
+            echo "ERROR: ffprobe was not found in FFmpeg archive"
+            exit 1
+          fi
+
+          if [ -z "$FFMPEG_PATH" ]; then
+            echo "ERROR: ffmpeg was not found in FFmpeg archive"
+            exit 1
+          fi
+
+          cp "$FFPROBE_PATH" "$FF_DIR/ffprobe"
+          cp "$FFMPEG_PATH" "$FF_DIR/ffmpeg"
+
+          chmod +x "$FF_DIR/ffprobe"
+          chmod +x "$FF_DIR/ffmpeg"
+
+          echo "Installed binaries in $FF_DIR:"
+          ls -lh "$FF_DIR"
+
+      - name: Verify FFmpeg architecture
+        run: |
+          FF_DIR="build_binaries/linux_amd64"
+          echo "ffmpeg info:"
+          file "$FF_DIR/ffmpeg"
+
+          echo "ffprobe info:"
+          file "$FF_DIR/ffprobe"
+
+      - name: Build application
+        run: |
+          pyinstaller \
+            --noconfirm \
+            --clean \
+            "Snowsky Echo Mini Toolbox.spec"
+
+      - name: Verify application
+        run: |
+          APP="dist/Snowsky Echo Mini Toolbox"
+          if [ ! -d "$APP" ]; then
+            echo "ERROR: application directory was not created"
+            exit 1
+          fi
+          echo "Application directory created at: $APP"
+
+      - name: Create tar.gz package
+        run: |
+          APP_NAME="Snowsky Echo Mini Toolbox"
+          APP_SLUG="snowsky-echo-mini-toolbox"
+          tar -C dist -czf "dist/${APP_SLUG}-${VERSION}-linux-amd64.tar.gz" "$APP_NAME"
+          echo "Created tarball:"
+          ls -lh dist/*.tar.gz
+
+      - name: Build Debian package
+        run: |
+          APP_NAME="Snowsky Echo Mini Toolbox"
+          APP_SLUG="snowsky-echo-mini-toolbox"
+          DIST_APP_DIR="dist/$APP_NAME"
+          PKG_ROOT="dist/deb_pkg_root"
+          PKG_NAME="${APP_SLUG}_${VERSION}_amd64.deb"
+          PKG_PATH="dist/$PKG_NAME"
+
+          rm -rf "$PKG_ROOT"
+          mkdir -p \
+              "$PKG_ROOT/DEBIAN" \
+              "$PKG_ROOT/opt/$APP_SLUG" \
+              "$PKG_ROOT/usr/bin"
+
+          # App binaries
+          cp -a "$DIST_APP_DIR/." "$PKG_ROOT/opt/$APP_SLUG/"
+
+          # Launcher wrapper
+          cat > "$PKG_ROOT/usr/bin/$APP_SLUG" <<'SH'
+          #!/usr/bin/env bash
+          exec "/opt/snowsky-echo-mini-toolbox/Snowsky Echo Mini Toolbox" "$@"
+          SH
+          chmod 0755 "$PKG_ROOT/usr/bin/$APP_SLUG"
+
+          # Control file
+          cat > "$PKG_ROOT/DEBIAN/control" <<EOF
+          Package: $APP_SLUG
+          Version: $VERSION
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Silent Sphinx <115553492+silent-sphinx@users.noreply.github.com>
+          Depends: libxkbcommon-x11-0, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-render-util0, libxcb-xkb1
+          Description: Snowsky Echo Mini Toolbox
+           Desktop tool for preparing music folders and USB drives for Snowsky Echo Mini.
+          EOF
+
+          dpkg-deb --build "$PKG_ROOT" "$PKG_PATH"
+          rm -rf "$PKG_ROOT"
+          echo "Created debian package:"
+          ls -lh dist/*.deb
+
+      - name: Upload Linux Packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+          if-no-files-found: error
+
+  # ==================================================================
   # Create the Unified GitHub Release
   # ==================================================================
   release:
     name: Publish GitHub Release
-    needs: [build-macos, build-windows]
+    needs: [build-macos, build-windows, build-linux]
     runs-on: ubuntu-latest
     if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != 'dev')
 
@@ -305,6 +471,12 @@ jobs:
           name: windows-installer
           path: release-assets
 
+      - name: Download Linux Packages
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: release-assets
+
       - name: List release assets
         run: |
           find release-assets -type f -maxdepth 2 -print
@@ -315,4 +487,6 @@ jobs:
           files: |
             release-assets/**/*.dmg
             release-assets/**/*.exe
+            release-assets/**/*.tar.gz
+            release-assets/**/*.deb
           generate_release_notes: true
