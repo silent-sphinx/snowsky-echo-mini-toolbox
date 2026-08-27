@@ -9,7 +9,7 @@ on:
       version:
         description: 'Version string (e.g., 1.6.0) for manual builds'
         required: false
-        default: 'dev'
+        default: '0.0.0-dev'
 
 permissions:
   contents: write
@@ -45,7 +45,7 @@ jobs:
           if [ "${{ github.ref_type }}" = "tag" ]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION="${{ inputs.version || 'dev' }}"
+            VERSION="${{ inputs.version || '0.0.0-dev' }}"
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Release version: $VERSION"
@@ -188,7 +188,7 @@ jobs:
             $VERSION = "${{ github.ref_name }}".TrimStart('v')
           } else {
             $VERSION = "${{ inputs.version }}"
-            if ([string]::IsNullOrEmpty($VERSION)) { $VERSION = "dev" }
+            if ([string]::IsNullOrEmpty($VERSION)) { $VERSION = "0.0.0-dev" }
           }
           Add-Content -Path $env:GITHUB_ENV -Value "VERSION=$VERSION"
           Write-Host "Release version: $VERSION"
@@ -293,7 +293,7 @@ jobs:
           if [ "${{ github.ref_type }}" = "tag" ]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION="${{ inputs.version || 'dev' }}"
+            VERSION="${{ inputs.version || '0.0.0-dev' }}"
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Release version: $VERSION"
@@ -450,7 +450,7 @@ jobs:
     name: Publish GitHub Release
     needs: [build-macos, build-windows, build-linux]
     runs-on: ubuntu-latest
-    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != 'dev')
+    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '0.0.0-dev')
 
     steps:
       - name: Download ARM64 DMG
