@@ -51,6 +51,7 @@ class AlbumArtDownloadFetchWorker(QObject):
             results = []
             total = len(self.selected_files)
             ssl_context = ssl.create_default_context(cafile=certifi.where())
+            album_cache = {}
 
             for i, (file_path, search_term) in enumerate(self.selected_files, start=1):
                 self.progress.emit(i, total, f"Reading tags for {file_path.name}...")
@@ -80,6 +81,16 @@ class AlbumArtDownloadFetchWorker(QObject):
 
                 artist = audio.get("artist", [""])[0]
                 album = audio.get("album", [""])[0]
+                
+                cache_key = (artist, album, search_term)
+                if cache_key in album_cache:
+                    self.progress.emit(i, total, f"Using cached artwork for '{album}' by '{artist}'...")
+                    cached_data = album_cache[cache_key]
+                    results.append({
+                        "path": file_path, "artist": artist, "album": album,
+                        "mbid": cached_data["mbid"], "images": cached_data["images"], "error": cached_data["error"]
+                    })
+                    continue
 
                 if search_term:
                     self.progress.emit(i, total, f"Searching MusicBrainz for custom term '{search_term}'...")
@@ -129,14 +140,17 @@ class AlbumArtDownloadFetchWorker(QObject):
                         break
                         
                 if isinstance(mb_data, Exception):
+                    error_msg = f"MusicBrainz error: {mb_data}"
+                    album_cache[cache_key] = {"mbid": None, "images": [], "error": error_msg}
                     results.append({
                         "path": file_path, "artist": artist, "album": album,
-                        "mbid": None, "images": [], "error": f"MusicBrainz error: {mb_data}"
+                        "mbid": None, "images": [], "error": error_msg
                     })
                     continue
 
                 releases = mb_data.get("releases", [])
                 if not releases:
+                    album_cache[cache_key] = {"mbid": None, "images": [], "error": "No release found on MusicBrainz"}
                     results.append({
                         "path": file_path, "artist": artist, "album": album,
                         "mbid": None, "images": [], "error": "No release found on MusicBrainz"
@@ -170,11 +184,13 @@ class AlbumArtDownloadFetchWorker(QObject):
                         last_error = f"Download failed: {exc}"
 
                 if fetched_images:
+                    album_cache[cache_key] = {"mbid": releases[0]["id"], "images": fetched_images, "error": None}
                     results.append({
                         "path": file_path, "artist": artist, "album": album,
                         "mbid": releases[0]["id"], "images": fetched_images, "error": None
                     })
                 else:
+                    album_cache[cache_key] = {"mbid": releases[0]["id"], "images": [], "error": last_error}
                     results.append({
                         "path": file_path, "artist": artist, "album": album,
                         "mbid": releases[0]["id"], "images": [], "error": last_error
@@ -236,6 +252,9 @@ class AlbumArtDownloadDialog(QDialog):
             self.table.insertRow(row)
 
             images = res.get("images", [])
+            
+            if images:
+                res["image_data"] = images[0]
 
             # Apply Checkbox
             checkbox = QCheckBox()
@@ -294,7 +313,6 @@ class AlbumArtDownloadDialog(QDialog):
                 
                 if pixmaps:
                     preview_lbl.setPixmap(pixmaps[0].scaled(90, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                    
                     def on_combo_changed(idx, lbl=preview_lbl, pms=pixmaps):
                         if idx < 0 or idx >= len(pms):
                             return
@@ -304,8 +322,7 @@ class AlbumArtDownloadDialog(QDialog):
                     
                     if len(images) > 1:
                         results_layout.addWidget(combo)
-                    
-                    checkbox.setProperty("combo_box", combo)
+                        checkbox.setProperty("combo_box", combo)
             else:
                 preview_lbl.setText("No Image")
 

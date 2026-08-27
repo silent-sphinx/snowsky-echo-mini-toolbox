@@ -191,7 +191,13 @@ def to_non_progressive_jpeg(data: bytes, quality: int = 90) -> bytes | None:
     if not data:
         return None
 
-    image = QImage.fromData(data)
+    # Safely convert to QByteArray to prevent PySide6 memoryview/segfault bugs
+    if not isinstance(data, QByteArray):
+        ba = QByteArray(data)
+    else:
+        ba = data
+
+    image = QImage.fromData(ba)
     if image.isNull():
         return None
 
@@ -214,7 +220,12 @@ def to_non_progressive_jpeg(data: bytes, quality: int = 90) -> bytes | None:
     if not ok:
         return None
 
-    return bytes(encoded)
+    # Ensure we return a pure python bytes object, not a memory view or QByteArray
+    out_data = encoded.data()
+    if not isinstance(out_data, bytes):
+        out_data = bytes(out_data)
+        
+    return out_data
 
 
 def write_embedded_album_art(path: Path, jpeg_data: bytes) -> tuple[bool, str]:
