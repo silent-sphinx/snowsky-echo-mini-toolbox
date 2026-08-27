@@ -9,48 +9,48 @@ An easy (unofficial) desktop app to prepare your music folders and USB drives fo
 
 ![Overview](Overview.png)
 
+The Snowsky Echo Mini is a fantastic little device, but its affordable hardware can sometimes limit compatibility and available features. This tool aims to remove the hassle of getting your music ready to play by automatically identifying incompatible media and converting it to a supported format. It can also fix album artwork and download lyrics, giving you everything you need to enjoy your music without the usual compatibility headaches.
+
+<!-- TOC -->
+
 ## Table of Contents
 
 - [Snowsky Echo Mini Toolbox](#snowsky-echo-mini-toolbox)
-  - [Has the tool failed to fix your media?](#has-the-tool-failed-to-fix-your-media)
-  - [Table of Contents](#table-of-contents)
-  - [Main Features](#main-features)
-  - [Important Notes](#important-notes)
-  - [Installation](#installation)
-    - [Required Dependencies (Linux Only)](#required-dependencies-linux-only)
-    - [Supported Operating Systems](#supported-operating-systems)
-      - [Notice for Windows Users](#notice-for-windows-users)
-        - [Setup Instructions](#setup-instructions)
-  - [Build from source](#build-from-source)
-  - [Compatibility Rules](#compatibility-rules)
-  - [Contributing](#contributing)
+    - [Main Features](#main-features)
+    - [Important Notes](#important-notes)
+    - [Installation](#installation)
+        - [Required Dependencies Linux Only](#required-dependencies-linux-only)
+        - [Supported Operating Systems](#supported-operating-systems)
+            - [Notice for Windows Users](#notice-for-windows-users)
+                - [Setup Instructions](#setup-instructions)
+    - [Build from source](#build-from-source)
+    - [Compatibility Rules](#compatibility-rules)
+    - [Contributing](#contributing)
+
+<!-- /TOC -->
 
 ## Main Features
 
-- Music Compatibility:
-  - Checks if your media is compatible with the Snowsky Echo Mini.
-  - Automatically convert your incompatible media to a compatible audio format.
-- About Folder/Drive:
-  - Identify drive incompatibility issues
-- Album Art:
-  - Finds files with missing or incompatible album art.
-  - Convert incompatible media automatically
-- Lyrics Manager:
-  - Scans embedded lyrics.
-  - Can create .lrc lyric files and do LRCLIB bulk lookup.
-- Metadata Manager:
+- **Music Compatibility**:
+  - Identify incompatible media and auto-fix.
+- **Album Art**:
+  - Identify incompatible album art and auto-fix.
+  - Download new album art via the MusicBrainz API and Cover Art Archive.
+- **Lyrics Manager**:
+  - Identify embedded lyrics and convert them to compatible `.lrc` files.
+  - Download new lyrics via LRCLIB bulk lookup.
+- **Metadata Manager**:
   - Edit audio tags and properties in bulk.
-- File Rename:
-  - Suggests cleaner file names from metadata before you apply changes.
-- File Cleanup:
-  - Groups files by type so you can remove unwanted categories safely.
-- Backup/Restore:
-  - Creates ZIP backups, or copy/move your library to another location.
+- **File Rename**:
+  - Suggest cleaner file names from metadata before applying changes.
+- **File Cleanup**:
+  - Group files by type so you can safely remove unwanted categories.
+- **Backup & Restore**:
+  - Create ZIP backups, or copy/move your library to another location.
 
-## Important Notes
+## Please Backup Your Data
 
-- This program has the ability to modify your Snowsky Echo Mini Library, ALWAYS check to see if the program is making the intended changes on your data, before applying.
-- Make use of the backup tools to protect your library from inadvertant changes.
+- This program will directly edit music files on your selected device. This can result in unintended data loss, it is always RECOMMENDED to use the backup tools provided to ensure you have a second copy of your data in-case of failure.
 
 ## Installation
 
