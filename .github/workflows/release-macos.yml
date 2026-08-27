@@ -1,0 +1,18 @@
+name: macOS Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-14
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show system information
+        run: |
+          echo "macOS build runner"
+          uname -a
+          uname -m
