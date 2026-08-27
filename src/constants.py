@@ -16,7 +16,10 @@ AUDIO_FILE_EXTENSIONS = {
 }
 
 ALBUM_ART_CACHE_LIMIT = 48
-APP_VERSION = "1.5.1"
+try:
+    from src.generated_version import APP_VERSION
+except ImportError:
+    APP_VERSION = "dev"
 
 TABLE_COMPATIBLE_COLOR = "#2E7D32"
 TABLE_COMPATIBLE_TEXT_COLOR = "#F2FFF2"

@@ -17,5 +17,4 @@ build/
 build_binaries/
 dist/
 build_instructions/dist_tmp/
-
-*test*
+src/generated_version.py
