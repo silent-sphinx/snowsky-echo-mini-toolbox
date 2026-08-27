@@ -239,7 +239,7 @@ jobs:
           Copy-Item $FFPROBE_PATH "$FF_DIR\ffprobe.exe" -Force
           Copy-Item $FFMPEG_PATH "$FF_DIR\ffmpeg.exe" -Force
 
-          Write-Host "Installed binaries in $FF_DIR:"
+          Write-Host "Installed binaries in ${FF_DIR}:"
           Get-ChildItem $FF_DIR
 
       - name: Build application
