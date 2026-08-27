@@ -2661,9 +2661,21 @@ class ToolboxWindow(QMainWindow):
         )
         self.album_art_search_input.setClearButtonEnabled(True)
         self.album_art_search_input.textChanged.connect(
-            self._apply_album_art_table_filter
+            self._apply_album_art_filters
         )
         album_art_controls.addWidget(self.album_art_search_input, 1)
+
+        self.album_art_status_filter = QComboBox()
+        self.album_art_status_filter.addItems([
+            "All Statuses",
+            "Compatible",
+            "Incompatible",
+            "Missing Artwork"
+        ])
+        self.album_art_status_filter.currentTextChanged.connect(
+            self._apply_album_art_filters
+        )
+        album_art_controls.addWidget(self.album_art_status_filter)
 
         self.album_art_refresh_btn = QPushButton("Refresh")
         self.album_art_refresh_btn.setToolTip("Re-scan album art compatibility")
@@ -6274,23 +6286,35 @@ class ToolboxWindow(QMainWindow):
                 self.stat_mm_artist_lbl.setText(str(missing_artist_count))
                 self.stat_mm_album_lbl.setText(str(missing_album_count))
 
-    def _apply_album_art_table_filter(self, query: str) -> None:
+    @Slot()
+    def _apply_album_art_filters(self, *args) -> None:
         if not hasattr(self, "album_art_table"):
             return
 
-        normalized_query = query.strip().lower()
-        filter_all = not normalized_query
+        query = self.album_art_search_input.text().strip().lower()
+        status_filter = self.album_art_status_filter.currentText()
+        filter_all_text = not query
+        filter_all_status = status_filter == "All Statuses"
 
         for row in range(self.album_art_table.rowCount()):
-            text_match = filter_all
-            if not filter_all:
+            text_match = filter_all_text
+            status_match = filter_all_status
+
+            if not filter_all_text:
                 for col in range(1, self.album_art_table.columnCount()):
                     item = self.album_art_table.item(row, col)
-                    if item and normalized_query in item.text().lower():
+                    if item and query in item.text().lower():
                         text_match = True
                         break
 
-            self.album_art_table.setRowHidden(row, not text_match)
+            if not filter_all_status:
+                status_item = self.album_art_table.item(row, 2)
+                if status_item and status_item.text() == status_filter:
+                    status_match = True
+                else:
+                    status_match = False
+
+            self.album_art_table.setRowHidden(row, not (text_match and status_match))
 
     def _sort_lyrics_manager_table(self, col: int) -> None:
         if col == 0:
@@ -7243,7 +7267,7 @@ class ToolboxWindow(QMainWindow):
         self.album_art_progress_label.setText("Idle")
         self.album_art_stack.setCurrentIndex(1)
         self.statusBar().showMessage("Album art compatibility scan completed")
-        self._apply_album_art_table_filter(self.album_art_search_input.text())
+        self._apply_album_art_filters()
 
         if scanned_audio == 0:
             self.album_art_progress.setRange(0, 1)

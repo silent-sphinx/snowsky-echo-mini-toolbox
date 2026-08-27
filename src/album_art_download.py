@@ -1,6 +1,9 @@
 import json
 import logging
+import re
 import ssl
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -90,19 +93,45 @@ class AlbumArtDownloadFetchWorker(QObject):
                         continue
 
                     self.progress.emit(i, total, f"Searching MusicBrainz for '{album}' by '{artist}'...")
-                    query = f'artist:"{artist}" AND release:"{album}"'
+                    # Clean up album name by removing bracketed text like [Explicit] or (Deluxe Edition)
+                    # which often prevents exact phrase matches on MusicBrainz.
+                    clean_album = re.sub(r'\[.*?\]|\(.*?\)', '', album).strip()
+                    if not clean_album:
+                        clean_album = album # Fallback if the whole name was in brackets
+                    query = f'artist:"{artist}" AND release:"{clean_album}"'
 
                 encoded_query = urllib.parse.quote(query)
                 mb_url = f"https://musicbrainz.org/ws/2/release/?query={encoded_query}&fmt=json"
                 req = urllib.request.Request(mb_url, headers={"User-Agent": USER_AGENT})
                 
-                try:
-                    with urllib.request.urlopen(req, context=ssl_context, timeout=10) as response:
-                        mb_data = json.loads(response.read())
-                except Exception as exc:
+                mb_data = None
+                max_retries = 3
+                backoff = 2.0
+                
+                for attempt in range(max_retries):
+                    try:
+                        with urllib.request.urlopen(req, context=ssl_context, timeout=10) as response:
+                            mb_data = json.loads(response.read())
+                            # Keep baseline 1s delay per MusicBrainz guidelines, but we now handle 
+                            # rate limits gracefully if we still hit them
+                            time.sleep(1.0) 
+                            break
+                    except urllib.error.HTTPError as exc:
+                        if exc.code in (503, 429) and attempt < max_retries - 1:
+                            self.progress.emit(i, total, f"Rate limited by MusicBrainz! Retrying in {backoff}s...")
+                            time.sleep(backoff)
+                            backoff *= 2
+                        else:
+                            mb_data = exc
+                            break
+                    except Exception as exc:
+                        mb_data = exc
+                        break
+                        
+                if isinstance(mb_data, Exception):
                     results.append({
                         "path": file_path, "artist": artist, "album": album,
-                        "mbid": None, "images": [], "error": f"MusicBrainz error: {exc}"
+                        "mbid": None, "images": [], "error": f"MusicBrainz error: {mb_data}"
                     })
                     continue
 
