@@ -325,10 +325,11 @@ jobs:
             --location \
             --silent \
             --show-error \
-            "https://github.com/Tyrrrz/FFmpegBin/releases/latest/download/ffmpeg-linux-x64.zip" \
-            --output ffmpeg.zip
+            "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
+            --output ffmpeg.tar.xz
 
-          unzip -q ffmpeg.zip -d ffmpeg_extract
+          mkdir ffmpeg_extract
+          tar -xf ffmpeg.tar.xz -C ffmpeg_extract
           echo "Downloaded FFmpeg files:"
           find ffmpeg_extract -type f -print
 
