@@ -2,7 +2,9 @@
 ; Build the app first with PyInstaller so dist\Snowsky Echo Mini Toolbox exists.
 
 #define MyAppName "Snowsky Echo Mini Toolbox"
+#ifndef MyAppVersion
 #define MyAppVersion "1.5.1"
+#endif
 #define MyAppPublisher "Snowsky"
 #define MyAppExeName "Snowsky Echo Mini Toolbox.exe"
 

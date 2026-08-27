@@ -1,4 +1,4 @@
-name: Build macOS Release
+name: Build and Release
 
 on:
   push:
@@ -15,7 +15,10 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  # ==================================================================
+  # macOS Build Job
+  # ==================================================================
+  build-macos:
     name: Build macOS ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
 
@@ -34,15 +37,9 @@ jobs:
             binary_dir: macos_intel
 
     steps:
-      # ------------------------------------------------------------
-      # Source Checkout
-      # ------------------------------------------------------------
       - name: Check out source
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------
-      # Version Extraction & Generation
-      # ------------------------------------------------------------
       - name: Determine version
         run: |
           if [ "${{ github.ref_type }}" = "tag" ]; then
@@ -61,9 +58,6 @@ jobs:
           echo "Generated version file contents:"
           cat src/generated_version.py
 
-      # ------------------------------------------------------------
-      # Build Environment Setup
-      # ------------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -75,9 +69,6 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # ------------------------------------------------------------
-      # FFmpeg Download and Installation
-      # ------------------------------------------------------------
       - name: Download FFmpeg
         run: |
           mkdir -p "build_binaries/${{ matrix.binary_dir }}"
@@ -119,9 +110,6 @@ jobs:
           echo "Installed binaries in $FF_DIR:"
           ls -lh "$FF_DIR"
 
-      # ------------------------------------------------------------
-      # Verification
-      # ------------------------------------------------------------
       - name: Verify FFmpeg architecture
         run: |
           FF_DIR="build_binaries/${{ matrix.binary_dir }}"
@@ -133,9 +121,6 @@ jobs:
           file "$FF_DIR/ffprobe"
           lipo -archs "$FF_DIR/ffprobe" || true
 
-      # ------------------------------------------------------------
-      # PyInstaller Build
-      # ------------------------------------------------------------
       - name: Build application
         run: |
           pyinstaller \
@@ -154,9 +139,6 @@ jobs:
           echo "Verifying bundled FFmpeg and ffprobe:"
           find "$APP" -name ffmpeg -o -name ffprobe
 
-      # ------------------------------------------------------------
-      # DMG Creation
-      # ------------------------------------------------------------
       - name: Create DMG
         run: |
           APP_NAME="Snowsky Echo Mini Toolbox"
@@ -181,9 +163,6 @@ jobs:
           echo "Created DMG at: $DMG"
           ls -lh "$DMG"
 
-      # ------------------------------------------------------------
-      # Upload DMG Artifact
-      # ------------------------------------------------------------
       - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
@@ -192,11 +171,118 @@ jobs:
           if-no-files-found: error
 
   # ==================================================================
-  # Create the GitHub Release
+  # Windows Build Job
+  # ==================================================================
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $VERSION = "${{ github.ref_name }}".TrimStart('v')
+          } else {
+            $VERSION = "${{ inputs.version }}"
+            if ([string]::IsNullOrEmpty($VERSION)) { $VERSION = "dev" }
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "VERSION=$VERSION"
+          Write-Host "Release version: $VERSION"
+
+      - name: Generate version file
+        shell: pwsh
+        run: |
+          Set-Content -Path src/generated_version.py -Value "APP_VERSION = `"$env:VERSION`""
+          Write-Host "Generated version file contents:"
+          Get-Content -Path src/generated_version.py
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Download FFmpeg
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "build_binaries/windows_x64" | Out-Null
+          curl -fL "https://github.com/Tyrrrz/FFmpegBin/releases/latest/download/ffmpeg-windows-x64.zip" -o ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_extract -Force
+          Write-Host "Downloaded and extracted FFmpeg files:"
+          Get-ChildItem -Path ffmpeg_extract -Recurse
+
+      - name: Install FFmpeg binaries
+        shell: pwsh
+        run: |
+          $FF_DIR = "build_binaries/windows_x64"
+          $FFPROBE_PATH = (Get-ChildItem -Path ffmpeg_extract -Filter ffprobe.exe -Recurse | Select-Object -First 1).FullName
+          $FFMPEG_PATH = (Get-ChildItem -Path ffmpeg_extract -Filter ffmpeg.exe -Recurse | Select-Object -First 1).FullName
+
+          if ([string]::IsNullOrEmpty($FFPROBE_PATH)) {
+            Write-Error "ERROR: ffprobe.exe was not found in FFmpeg archive"
+            exit 1
+          }
+          if ([string]::IsNullOrEmpty($FFMPEG_PATH)) {
+            Write-Error "ERROR: ffmpeg.exe was not found in FFmpeg archive"
+            exit 1
+          }
+
+          Copy-Item $FFPROBE_PATH "$FF_DIR\ffprobe.exe" -Force
+          Copy-Item $FFMPEG_PATH "$FF_DIR\ffmpeg.exe" -Force
+
+          Write-Host "Installed binaries in $FF_DIR:"
+          Get-ChildItem $FF_DIR
+
+      - name: Build application
+        run: |
+          pyinstaller --noconfirm --clean "Snowsky Echo Mini Toolbox.spec"
+
+      - name: Verify application
+        shell: pwsh
+        run: |
+          $BUILT_EXE = "dist\Snowsky Echo Mini Toolbox\Snowsky Echo Mini Toolbox.exe"
+          if (-not (Test-Path $BUILT_EXE)) {
+            Write-Error "ERROR: application executable was not created"
+            exit 1
+          }
+          Write-Host "Application executable created at: $BUILT_EXE"
+
+      - name: Compile Installer
+        run: |
+          iscc /DMyOutputDir="${{ github.workspace }}\dist" /DMyOutputBaseFilename="snowsky-echo-mini-toolbox-${{ env.VERSION }}-Windows-Setup" /DMyAppVersion="${{ env.VERSION }}" .\build_assets\windows_installer.iss
+
+      - name: Verify Installer
+        shell: pwsh
+        run: |
+          $SETUP_EXE = Get-ChildItem -Path dist -Filter "*Windows-Setup.exe" | Select-Object -First 1
+          if (-not $SETUP_EXE) {
+            Write-Error "ERROR: Windows installer executable was not created"
+            exit 1
+          }
+          Write-Host "Installer created at: $($SETUP_EXE.FullName)"
+
+      - name: Upload Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/*Windows-Setup.exe
+          if-no-files-found: error
+
+  # ==================================================================
+  # Create the Unified GitHub Release
   # ==================================================================
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build-macos, build-windows]
     runs-on: ubuntu-latest
     if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != 'dev')
 
@@ -213,6 +299,12 @@ jobs:
           name: macos-x64
           path: release-assets
 
+      - name: Download Windows Installer
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: release-assets
+
       - name: List release assets
         run: |
           find release-assets -type f -maxdepth 2 -print
@@ -220,5 +312,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/**/*.dmg
+          files: |
+            release-assets/**/*.dmg
+            release-assets/**/*.exe
           generate_release_notes: true
