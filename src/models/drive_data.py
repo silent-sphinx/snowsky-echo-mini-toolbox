@@ -31,6 +31,9 @@ class TrackMetadata:
     has_lyrics: bool = False
     lyrics_text: Optional[str] = None
     
+    # All raw tags extracted
+    all_tags: Dict[str, str] = field(default_factory=dict)
+    
     @property
     def display_size(self) -> str:
         if self.size_bytes < 1024 * 1024:

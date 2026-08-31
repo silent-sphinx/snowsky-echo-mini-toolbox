@@ -103,6 +103,13 @@ class DriveScannerThread(QThread):
             
         # Extract tags
         if audio.tags:
+            # Capture all raw tags for display (skip binary/lyrics)
+            for key, val in audio.tags.items():
+                k_lower = str(key).lower()
+                if "apic" in k_lower or "pic" in k_lower or "covr" in k_lower or "lyrics" in k_lower or "sylt" in k_lower or "uslt" in k_lower:
+                    continue
+                meta.all_tags[str(key)] = str(val)
+                
             # Common tags (mutagen makes this slightly painful depending on format)
             if isinstance(audio, FLAC):
                 meta.title = audio.get("title", [meta.title])[0]

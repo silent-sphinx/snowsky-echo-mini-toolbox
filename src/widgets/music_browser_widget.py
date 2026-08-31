@@ -229,15 +229,22 @@ class MusicBrowserWidget(QWidget):
             
         # Metadata
         self._meta_table.setRowCount(0)
-        tags = [
-            ("Title", meta.title),
-            ("Artist", meta.artist),
-            ("Album", meta.album),
-            ("Genre", meta.genre),
-            ("Track", str(meta.track_num)),
-            ("Year", str(meta.year)),
-        ]
         
+        if meta.all_tags:
+            tags = list(meta.all_tags.items())
+            # Sort tags alphabetically by key for cleaner display
+            tags.sort(key=lambda x: x[0])
+        else:
+            # Fallback to standard attributes if mutagen extraction completely failed
+            tags = [
+                ("Title", meta.title),
+                ("Artist", meta.artist),
+                ("Album", meta.album),
+                ("Genre", meta.genre),
+                ("Track", str(meta.track_num)),
+                ("Year", str(meta.year)),
+            ]
+            
         for i, (k, v) in enumerate(tags):
             self._meta_table.insertRow(i)
             self._meta_table.setItem(i, 0, QTableWidgetItem(k))
