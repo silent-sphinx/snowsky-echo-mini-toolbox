@@ -16,7 +16,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QProgressBar,
+    QSizePolicy
 )
+import os
 
 from .widgets.metadata_manager import MetadataManager
 from .widgets.drive_info_widget import DriveInfoWidget
@@ -107,11 +109,17 @@ class MainWindow(QMainWindow):
                 self.centralWidget().width() // 2 - self._drive_panel.width() // 2,
                 self.centralWidget().height() // 2 - self._drive_panel.height() // 2
             )
+            
+    def closeEvent(self, event) -> None:
+        if hasattr(self, '_scanner_thread') and self._scanner_thread.isRunning():
+            self._scanner_thread.cancel()
+            self._scanner_thread.wait()
+        super().closeEvent(event)
 
     def _build_top_bar(self) -> QWidget:
         """Build the top application bar with title and drive selector placeholder."""
         bar = QWidget()
-        bar.setStyleSheet(f"background-color: {Colours.BG_DARKEST}; border-bottom: 1px solid {Colours.BORDER_SUBTLE};")
+        bar.setStyleSheet(f"background-color: {Colours.BG_DARKEST};")
         bar.setFixedHeight(50)
 
         layout = QHBoxLayout(bar)
@@ -141,7 +149,11 @@ class MainWindow(QMainWindow):
         self._global_progress = QProgressBar()
         self._global_progress.setTextVisible(False)
         self._global_progress.setRange(0, 0) # Indeterminate pulsing
-        self._global_progress.setFixedWidth(200)
+        
+        # Fix layout jitter by using fixed container size
+        self._global_progress.setFixedWidth(400)
+        self._prog_container.setFixedWidth(500)
+        
         self._global_progress.setStyleSheet(f"""
             QProgressBar {{
                 background-color: {Colours.BG_DARKEST};
@@ -158,7 +170,7 @@ class MainWindow(QMainWindow):
         self._prog_container.hide()
         layout.addWidget(self._prog_container)
 
-        # Spacer to push button to right
+        # Spacer to center the progress container and push the drive selector to the right
         layout.addStretch()
 
         # Mock Drive Selector
@@ -256,6 +268,7 @@ class MainWindow(QMainWindow):
         if total > 0:
             self._global_progress.setMaximum(total)
             self._global_progress.setValue(current)
+            
             self._prog_status_lbl.setText(f"Scanning media: {current} / {total}")
             
     def _on_scan_finished(self, data_model) -> None:
