@@ -68,7 +68,6 @@ class MainWindow(QMainWindow):
 
         # ── Tabs ────────────────────────────────────────────────
         self._tabs = QTabWidget()
-        self._tabs.setDocumentMode(True)  # cleaner look on macOS/Windows
         
         # Index 0: Drive Information
         self._drive_info = DriveInfoWidget()

@@ -45,8 +45,8 @@ class DriveScannerThread(QThread):
             for file in files:
                 if file.startswith('.'):
                     continue
-                _, ext = os.path.splitext(file)
-                if ext.lower() in SUPPORTED_MEDIA_EXTENSIONS:
+                ext = os.path.splitext(file)[1].lower()
+                if ext in SUPPORTED_MEDIA_EXTENSIONS or ext == ".lrc":
                     supported_files.append(os.path.join(root, file))
                     
         total_files = len(supported_files)
@@ -78,6 +78,7 @@ class DriveScannerThread(QThread):
         self.scan_finished.emit(data_model)
         
     def _extract_metadata(self, filepath: str) -> TrackMetadata:
+        """Extract metadata from a single file."""
         filename = os.path.basename(filepath)
         _, ext = os.path.splitext(filename)
         size = os.path.getsize(filepath)
@@ -89,9 +90,15 @@ class DriveScannerThread(QThread):
             size_bytes=size
         )
         
-        # Parse with mutagen
-        audio = mutagen.File(filepath)
-        if audio is None:
+        if filepath.lower().endswith(".lrc"):
+            meta.format_name = "LRC Lyrics File"
+            return meta
+            
+        try:
+            audio = mutagen.File(filepath, easy=False)
+            if audio is None:
+                return meta
+        except:
             return meta
             
         meta.format_name = type(audio).__name__

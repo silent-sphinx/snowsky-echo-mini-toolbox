@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QBrush
 
 from ..theme import Colours
-from ..models.drive_data import DriveDataModel
+from ..models.drive_data import DriveDataModel, TrackMetadata
 from ..utils.metadata_writer import save_metadata
 
 
@@ -47,6 +47,7 @@ class MusicBrowserWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._data_model: DriveDataModel = None
+        self._is_updating_checks = False
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -90,9 +91,11 @@ class MusicBrowserWidget(QWidget):
         self._tree.setHeaderHidden(True)
         self._tree.setAnimated(True)
         self._tree.setSortingEnabled(True)
+        self._tree.setSelectionMode(QTreeView.ExtendedSelection)
         self._tree_model = QStandardItemModel()
         self._tree.setModel(self._tree_model)
         self._tree.selectionModel().selectionChanged.connect(self._on_selection_changed)
+        self._tree_model.itemChanged.connect(self._on_item_changed)
         
         tree_layout.addWidget(self._tree)
         
@@ -115,6 +118,12 @@ class MusicBrowserWidget(QWidget):
         self._props_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._props_table.horizontalHeader().setStretchLastSection(True)
         self._props_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        
+        # Prevent squeezing smaller than the title text
+        fm = self._props_table.horizontalHeader().fontMetrics()
+        min_width = fm.horizontalAdvance("PROPERTY") + 40 # 40px padding buffer
+        self._props_table.horizontalHeader().setMinimumSectionSize(min_width)
+        
         props_lyt.addWidget(self._props_table)
         
         # 2. Music Metadata Tab
@@ -129,6 +138,10 @@ class MusicBrowserWidget(QWidget):
         # Edit triggers are enabled by default, we'll restrict column 0 in code
         self._meta_table.horizontalHeader().setStretchLastSection(True)
         self._meta_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        
+        fm_meta = self._meta_table.horizontalHeader().fontMetrics()
+        min_width_meta = fm_meta.horizontalAdvance("VALUE") + 40
+        self._meta_table.horizontalHeader().setMinimumSectionSize(min_width_meta)
         
         self._meta_delegate = HighlightDelegate(self._meta_table)
         self._meta_table.setItemDelegate(self._meta_delegate)
@@ -159,9 +172,40 @@ class MusicBrowserWidget(QWidget):
         # 3. Lyrics Tab
         self._lyrics_tab = QWidget()
         lyrics_lyt = QVBoxLayout(self._lyrics_tab)
-        lyrics_lyt.setContentsMargins(8, 8, 8, 8)
+        lyrics_lyt.setContentsMargins(16, 16, 16, 16)
+        lyrics_lyt.setSpacing(16)
+        
+        # Warning Block
+        self._lyrics_warning_block = QWidget()
+        self._lyrics_warning_block.setStyleSheet(f"""
+            QWidget {{
+                background-color: rgba(230, 124, 0, 0.1);
+                border: 1px solid {Colours.STATUS_LIMITED};
+                border-radius: 0px;
+            }}
+        """)
+        warning_lyt = QVBoxLayout(self._lyrics_warning_block)
+        warning_lyt.setContentsMargins(16, 12, 16, 12)
+        
+        self._lyrics_disclaimer = QLabel("Embedded lyrics are unsupported by the Snowsky Echo Mini.\nAn identically named .lrc file must exist in the same folder to display lyrics on the device. Convert embedded lyrics in the Lyrics Manager tab.")
+        self._lyrics_disclaimer.setStyleSheet(f"color: {Colours.STATUS_LIMITED_TEXT}; border: none; background: transparent; font-weight: 500; font-size: 13px;")
+        self._lyrics_disclaimer.setWordWrap(True)
+        warning_lyt.addWidget(self._lyrics_disclaimer)
+        lyrics_lyt.addWidget(self._lyrics_warning_block)
+        
+        # Lyrics visual area
         self._lyrics_text = QPlainTextEdit()
         self._lyrics_text.setReadOnly(True)
+        self._lyrics_text.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background-color: {Colours.BG_DARKEST};
+                border: 1px solid {Colours.BORDER_STRONG};
+                border-radius: 0px;
+                padding: 12px;
+                font-size: 13px;
+                line-height: 1.5;
+            }}
+        """)
         lyrics_lyt.addWidget(self._lyrics_text)
         
         self._tabs.addTab(self._props_tab, "Properties")
@@ -216,12 +260,14 @@ class MusicBrowserWidget(QWidget):
                 # It's a directory
                 icon = QApplication.style().standardIcon(QStyle.SP_DirIcon)
                 item.setIcon(icon)
+                item.setCheckable(True)
                 self._build_tree(sub_dict, item, full_path)
             else:
                 # It's a file
-                icon = QApplication.style().standardIcon(QStyle.SP_FileIcon)
-                item.setIcon(icon)
-                
+                item.setCheckable(True)
+            
+            # Store the full filepath in UserRole for retrieval on click
+            item.setData(full_path, Qt.UserRole)
             parent_item.appendRow(item)
 
     def _on_selection_changed(self, selected, deselected) -> None:
@@ -242,7 +288,47 @@ class MusicBrowserWidget(QWidget):
         else:
             self._clear_details()
             
-    def _populate_details(self, meta) -> None:
+    def _on_item_changed(self, item: QStandardItem) -> None:
+        if self._is_updating_checks or not item.isCheckable():
+            return
+            
+        self._is_updating_checks = True
+        try:
+            state = item.checkState()
+            self._set_check_state_recursive(item, state)
+        finally:
+            self._is_updating_checks = False
+            
+    def _set_check_state_recursive(self, item: QStandardItem, state: Qt.CheckState) -> None:
+        for row in range(item.rowCount()):
+            child = item.child(row)
+            if child and child.isCheckable():
+                child.setCheckState(state)
+                self._set_check_state_recursive(child, state)
+                
+    def _populate_details(self, meta: TrackMetadata) -> None:
+        self._clear_details()
+        
+        is_lrc = meta.filepath.lower().endswith(".lrc")
+        
+        # Toggle tab visibility
+        self._tabs.setTabVisible(0, not is_lrc) # Properties
+        self._tabs.setTabVisible(1, not is_lrc) # Music Metadata
+        self._tabs.setTabVisible(2, not is_lrc) # Album Art
+        self._tabs.setTabVisible(3, True)       # Lyrics (either file contents or disclaimer)
+        
+        if is_lrc:
+            self._tabs.setCurrentIndex(3)
+            self._lyrics_warning_block.hide()
+            try:
+                with open(meta.filepath, 'r', encoding='utf-8') as f:
+                    self._lyrics_text.setPlainText(f.read())
+            except Exception as e:
+                self._lyrics_text.setPlainText(f"Failed to read LRC file: {str(e)}")
+            return
+            
+        self._lyrics_warning_block.show()
+        
         # Properties
         self._props_table.setRowCount(0)
         props = [
@@ -336,6 +422,10 @@ class MusicBrowserWidget(QWidget):
         self._meta_table.setRowCount(0)
         self._art_lbl.setText("No Album Art")
         self._lyrics_text.setPlainText("")
+        
+        # Hide all tabs when a folder or nothing is selected
+        for i in range(self._tabs.count()):
+            self._tabs.setTabVisible(i, False)
         
     def _on_discard_metadata_clicked(self) -> None:
         # Reload the metadata for the current selection from the cache

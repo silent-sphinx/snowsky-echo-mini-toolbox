@@ -110,9 +110,14 @@ def create_palette() -> QPalette:
 
 
 # ── Global QSS Stylesheet ──────────────────────────────────────────────────
+import os
 
 def global_stylesheet() -> str:
     """Return the global QSS stylesheet string."""
+    tick_path = os.path.join(os.path.dirname(__file__), "assets", "tick.svg")
+    # Qt requires forward slashes even on Windows for QSS URLs
+    tick_path = tick_path.replace('\\', '/')
+    
     return f"""
         /* ── Base ─────────────────────────────────────────── */
         * {{
@@ -143,7 +148,6 @@ def global_stylesheet() -> str:
             background-color: {Colours.BG_SURFACE};
             color: {Colours.TEXT_SECONDARY};
             border: 1px solid {Colours.BORDER_SUBTLE};
-            border-bottom: none;
             border-top-left-radius: 0px;
             border-top-right-radius: 0px;
             padding: 8px 20px;
@@ -154,8 +158,11 @@ def global_stylesheet() -> str:
 
         QTabBar::tab:selected {{
             background-color: {Colours.BG_DARK};
-            color: {Colours.ACCENT};
-            border-bottom: 2px solid {Colours.ACCENT};
+            color: {Colours.TEXT_PRIMARY};
+            border-top: 2px solid {Colours.ACCENT};
+            border-bottom: 1px solid {Colours.BG_DARK}; /* Blends into pane */
+            margin-bottom: -1px; /* Overlap pane border */
+            padding-bottom: 9px; /* Keep height consistent */
             font-weight: 600;
         }}
 
@@ -190,6 +197,47 @@ def global_stylesheet() -> str:
 
         QTableView::item:hover {{
             background-color: {Colours.BG_HOVER};
+        }}
+        
+        /* ── Tree View ────────────────────────────────────── */
+        QTreeView {{
+            background-color: transparent;
+            color: {Colours.TEXT_PRIMARY};
+            border: none;
+            outline: none;
+        }}
+        
+        QTreeView::item {{
+            padding: 4px 0px;
+            border: none;
+        }}
+        
+        QTreeView::item:selected {{
+            background-color: {Colours.ACCENT_BG};
+            /* Removed left border as it causes visual glitches on tree items */
+        }}
+
+        QTreeView::item:hover {{
+            background-color: {Colours.BG_HOVER};
+        }}
+        
+        QTreeView::indicator {{
+            width: 14px;
+            height: 14px;
+            border-radius: 0px;
+            border: 1px solid {Colours.BORDER_DEFAULT};
+            background-color: {Colours.BG_SURFACE};
+            margin-right: 6px;
+        }}
+
+        QTreeView::indicator:checked {{
+            background-color: {Colours.ACCENT};
+            border-color: {Colours.ACCENT};
+            image: url({tick_path});
+        }}
+
+        QTreeView::indicator:hover {{
+            border-color: {Colours.BORDER_STRONG};
         }}
 
         /* ── Header View ──────────────────────────────────── */
@@ -354,6 +402,7 @@ def global_stylesheet() -> str:
         QCheckBox::indicator:checked {{
             background-color: {Colours.ACCENT};
             border-color: {Colours.ACCENT};
+            image: url({tick_path});
         }}
 
         QCheckBox::indicator:hover {{
