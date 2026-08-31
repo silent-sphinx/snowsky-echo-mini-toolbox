@@ -15,11 +15,14 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QVBoxLayout,
     QWidget,
+    QProgressBar,
 )
 
 from .widgets.metadata_manager import MetadataManager
 from .widgets.drive_info_widget import DriveInfoWidget
 from .widgets.drive_selector_panel import DriveSelectorPanel
+from .widgets.music_browser_widget import MusicBrowserWidget
+from .threads.drive_scanner import DriveScannerThread
 from .theme import Colours
 
 
@@ -73,8 +76,11 @@ class MainWindow(QMainWindow):
         self._metadata_manager = MetadataManager()
         self._tabs.addTab(self._metadata_manager, "Metadata Browser")
         
+        # Index 2: Music Browser
+        self._music_browser = MusicBrowserWidget()
+        self._tabs.addTab(self._music_browser, "Music Browser")
+        
         # Add placeholders for future tabs
-        self._tabs.addTab(QWidget(), "Music Browser")
         self._tabs.addTab(QWidget(), "Album Art")
         self._tabs.addTab(QWidget(), "Music Compatibility")
         self._tabs.addTab(QWidget(), "Lyrics Manager")
@@ -116,8 +122,43 @@ class MainWindow(QMainWindow):
         title = QLabel("Snowsky Echo Mini Toolbox")
         title.setStyleSheet(f"color: {Colours.TEXT_PRIMARY}; font-size: 18px; font-weight: 800; letter-spacing: -0.5px;")
         layout.addWidget(title)
+        
+        # Spacer to push progress to center
+        layout.addStretch()
 
-        # Spacer
+        # ── Global Progress Container (Centered) ────────────────
+        self._prog_container = QWidget()
+        prog_lyt = QVBoxLayout(self._prog_container)
+        prog_lyt.setContentsMargins(0, 0, 0, 0)
+        prog_lyt.setSpacing(6)
+        prog_lyt.setAlignment(Qt.AlignCenter)
+        
+        self._prog_status_lbl = QLabel("Processing data...")
+        self._prog_status_lbl.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;")
+        self._prog_status_lbl.setAlignment(Qt.AlignCenter)
+        prog_lyt.addWidget(self._prog_status_lbl)
+
+        self._global_progress = QProgressBar()
+        self._global_progress.setTextVisible(False)
+        self._global_progress.setRange(0, 0) # Indeterminate pulsing
+        self._global_progress.setFixedWidth(200)
+        self._global_progress.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: {Colours.BG_DARKEST};
+                border: none;
+                min-height: 2px;
+                max-height: 2px;
+            }}
+            QProgressBar::chunk {{
+                background-color: #FFFFFF;
+            }}
+        """)
+        prog_lyt.addWidget(self._global_progress)
+        
+        self._prog_container.hide()
+        layout.addWidget(self._prog_container)
+
+        # Spacer to push button to right
         layout.addStretch()
 
         # Mock Drive Selector
@@ -195,4 +236,50 @@ class MainWindow(QMainWindow):
         else:
             self._tabs.setTabVisible(0, False)
             self._tabs.setCurrentIndex(1)
+            
+        # Set global processing state
+        self._set_processing_state(True, "Initializing scan...")
+        
+        # Cancel any existing scan
+        if hasattr(self, '_scanner_thread') and self._scanner_thread.isRunning():
+            self._scanner_thread.cancel()
+            self._scanner_thread.wait()
+            
+        # Start the global data scanner
+        self._scanner_thread = DriveScannerThread(path, self)
+        self._scanner_thread.progress_updated.connect(self._on_scan_progress)
+        self._scanner_thread.scan_finished.connect(self._on_scan_finished)
+        self._scanner_thread.start()
+
+    def _on_scan_progress(self, current: int, total: int, filepath: str) -> None:
+        """Update global progress bar during deep scan."""
+        if total > 0:
+            self._global_progress.setMaximum(total)
+            self._global_progress.setValue(current)
+            self._prog_status_lbl.setText(f"Scanning media: {current} / {total}")
+            
+    def _on_scan_finished(self, data_model) -> None:
+        """Handle completion of the global drive scan."""
+        self._set_processing_state(False)
+        
+        # Pass the unified data model to the child tabs
+        self._music_browser.populate_data(data_model)
+        
+        # Update the DriveInfoWidget track count
+        if self._tabs.isTabVisible(0):
+            self._drive_info._on_track_count_finished(len(data_model.tracks))
+
+    def _set_processing_state(self, is_processing: bool, status_text: str = "Processing data...") -> None:
+        """Toggle the global loading state and UI indicators."""
+        if is_processing:
+            self._prog_status_lbl.setText(status_text)
+            self._prog_container.show()
+        else:
+            self._prog_container.hide()
+            # Reset progress bar for next time
+            self._global_progress.setRange(0, 0)
+            
+        # Notify child tabs that need to show empty/loading states
+        self._metadata_manager.set_processing_state(is_processing)
+        self._music_browser.set_processing_state(is_processing)
 

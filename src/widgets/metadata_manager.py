@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -72,13 +73,40 @@ class MetadataManager(QWidget):
         sep.setFixedHeight(1)
         layout.addWidget(sep)
 
+        # ── Stacked Widget ──────────────────────────────────────
+        self._stack = QStackedWidget()
+        
+        # Page 0: Loading State
+        loading_page = QWidget()
+        loading_layout = QVBoxLayout(loading_page)
+        loading_layout.setAlignment(Qt.AlignCenter)
+        
+        load_lbl = QLabel("Results will be ready soon.")
+        load_lbl.setStyleSheet(f"color: {Colours.TEXT_PRIMARY}; font-size: 20px; font-weight: 700;")
+        load_lbl.setAlignment(Qt.AlignCenter)
+        
+        sub_lbl = QLabel("Music is being processed...")
+        sub_lbl.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 14px;")
+        sub_lbl.setAlignment(Qt.AlignCenter)
+        
+        loading_layout.addWidget(load_lbl)
+        loading_layout.addWidget(sub_lbl)
+        
+        self._stack.addWidget(loading_page)
+        
+        # Page 1: Data State
+        data_page = QWidget()
+        data_layout = QVBoxLayout(data_page)
+        data_layout.setContentsMargins(0, 0, 0, 0)
+        data_layout.setSpacing(12)
+
         # ── Toolbar (search + filters) ──────────────────────────
         toolbar = self._build_toolbar()
-        layout.addWidget(toolbar)
+        data_layout.addWidget(toolbar)
 
         # ── Stat cards ──────────────────────────────────────────
         stats = self._build_stat_cards()
-        layout.addLayout(stats)
+        data_layout.addLayout(stats)
 
         # ── Table ───────────────────────────────────────────────
         self._table_view = MetadataTableView(self)
@@ -96,11 +124,14 @@ class MetadataManager(QWidget):
         self._table_view.setItemDelegateForColumn(Column.ALBUM, self._missing_album_delegate)
 
         self._table_view.apply_column_widths()
-        layout.addWidget(self._table_view, 1)  # stretch factor 1 — fills remaining space
+        data_layout.addWidget(self._table_view, 1)  # stretch factor 1 — fills remaining space
 
         # ── Status bar ──────────────────────────────────────────
         status = self._build_status_bar()
-        layout.addLayout(status)
+        data_layout.addLayout(status)
+        
+        self._stack.addWidget(data_page)
+        layout.addWidget(self._stack, 1)
 
     def _build_header(self) -> QWidget:
         """Build the section header with title and subtitle."""
@@ -298,3 +329,10 @@ class MetadataManager(QWidget):
                 self._status_selected.setText(f"{count} selected")
             else:
                 self._status_selected.setText("")
+                
+    def set_processing_state(self, is_processing: bool) -> None:
+        """Toggle between loading view and data view."""
+        if is_processing:
+            self._stack.setCurrentIndex(0)
+        else:
+            self._stack.setCurrentIndex(1)

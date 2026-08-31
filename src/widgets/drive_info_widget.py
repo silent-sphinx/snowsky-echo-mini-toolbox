@@ -5,7 +5,8 @@ Displays an overview of the selected root drive, including storage capacity,
 file system format, and placeholder firmware status.
 """
 
-from PySide6.QtCore import Qt, QStorageInfo
+import os
+from PySide6.QtCore import Qt, QStorageInfo, QThread, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QFrame,
@@ -17,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..theme import Colours
-from ..constants import MAX_TRACK_LIMIT
+from ..constants import MAX_TRACK_LIMIT, SUPPORTED_MEDIA_EXTENSIONS
 
 
 class DriveInfoWidget(QWidget):
@@ -47,36 +48,53 @@ class DriveInfoWidget(QWidget):
         self._capacity_card = self._build_capacity_card()
         cards_layout.addWidget(self._capacity_card, 2)
         
-        self._format_card = self._build_info_card("File System", "Unknown")
+        self._format_card = self._build_format_card()
         cards_layout.addWidget(self._format_card, 1)
 
         self._track_limit_card = self._build_track_limit_card()
         cards_layout.addWidget(self._track_limit_card, 2)
 
         layout.addLayout(cards_layout)
+        layout.addStretch()
 
-    def _build_info_card(self, title: str, value: str) -> QFrame:
+    def _build_format_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("infoCard")
+        card.setObjectName("formatCard")
         card.setStyleSheet(f"""
-            QFrame#infoCard {{
+            QFrame#formatCard {{
                 background-color: {Colours.BG_SURFACE};
                 border: 1px solid {Colours.BORDER_SUBTLE};
                 border-radius: 0px;
             }}
         """)
+        card.setFixedHeight(120)
         
         lyt = QVBoxLayout(card)
         lyt.setContentsMargins(16, 16, 16, 16)
         
-        title_lbl = QLabel(title)
+        hdr_lyt = QHBoxLayout()
+        title_lbl = QLabel("File System")
         title_lbl.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 11px; font-weight: 600; text-transform: uppercase;")
-        lyt.addWidget(title_lbl)
+        hdr_lyt.addWidget(title_lbl)
         
-        val_lbl = QLabel(value)
-        val_lbl.setObjectName("valLbl")
-        val_lbl.setStyleSheet(f"color: {Colours.TEXT_PRIMARY}; font-size: 18px; font-weight: 700;")
-        lyt.addWidget(val_lbl)
+        self._format_badge = QLabel("UNSUPPORTED")
+        self._format_badge.setStyleSheet(f"background-color: {Colours.STATUS_UNSUPPORTED}; color: #FFFFFF; font-size: 9px; font-weight: 800; padding: 2px 4px; border-radius: 2px;")
+        self._format_badge.hide()
+        hdr_lyt.addStretch()
+        hdr_lyt.addWidget(self._format_badge)
+        lyt.addLayout(hdr_lyt)
+        
+        self._format_val = QLabel("Unknown")
+        self._format_val.setStyleSheet(f"color: {Colours.TEXT_PRIMARY}; font-size: 18px; font-weight: 700;")
+        lyt.addWidget(self._format_val)
+        
+        self._format_msg = QLabel("Player requires FAT16, FAT32 or exFAT.")
+        self._format_msg.setStyleSheet(f"color: {Colours.STATUS_UNSUPPORTED}; font-size: 11px; margin-top: 4px;")
+        self._format_msg.setWordWrap(True)
+        self._format_msg.hide()
+        lyt.addWidget(self._format_msg)
+        
+        lyt.addStretch()
         
         return card
 
@@ -90,6 +108,7 @@ class DriveInfoWidget(QWidget):
                 border-radius: 0px;
             }}
         """)
+        card.setFixedHeight(120)
         
         lyt = QVBoxLayout(card)
         lyt.setContentsMargins(16, 16, 16, 16)
@@ -120,6 +139,7 @@ class DriveInfoWidget(QWidget):
             }}
         """)
         lyt.addWidget(self._progress)
+        lyt.addStretch()
         
         return card
 
@@ -133,6 +153,7 @@ class DriveInfoWidget(QWidget):
                 border-radius: 0px;
             }}
         """)
+        card.setFixedHeight(120)
         
         lyt = QVBoxLayout(card)
         lyt.setContentsMargins(16, 16, 16, 16)
@@ -143,11 +164,11 @@ class DriveInfoWidget(QWidget):
         title_lbl.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 11px; font-weight: 600; text-transform: uppercase;")
         hdr_lyt.addWidget(title_lbl)
         
-        # We use a dummy value 234 for now since we haven't wired up the scanner
-        current_tracks = 234
+        # We start with 0 and update when the background scan finishes
+        current_tracks = 0
         max_tracks = MAX_TRACK_LIMIT
         
-        self._track_text = QLabel(f"{current_tracks} / {max_tracks}")
+        self._track_text = QLabel(f"Scanning... / {max_tracks}")
         self._track_text.setStyleSheet(f"color: {Colours.TEXT_PRIMARY}; font-size: 13px; font-weight: 600;")
         hdr_lyt.addStretch()
         hdr_lyt.addWidget(self._track_text)
@@ -169,6 +190,7 @@ class DriveInfoWidget(QWidget):
             }}
         """)
         lyt.addWidget(self._track_progress)
+        lyt.addStretch()
         
         return card
 
@@ -184,8 +206,22 @@ class DriveInfoWidget(QWidget):
         self._title_lbl.setText(f"{name} ({info.rootPath()})")
         
         # Update file system format
-        fs_type = bytes(info.fileSystemType()).decode("utf-8", errors="ignore")
-        self._format_card.findChild(QLabel, "valLbl").setText(fs_type or "Unknown")
+        fs_type = bytes(info.fileSystemType()).decode("utf-8", errors="ignore").upper()
+        if not fs_type:
+            fs_type = "UNKNOWN"
+            
+        self._format_val.setText(fs_type)
+        
+        # Check if file system is supported
+        supported_fs = ["FAT16", "FAT32", "EXFAT", "FAT", "MSDOS"]
+        if fs_type not in supported_fs and fs_type != "UNKNOWN":
+            self._format_badge.show()
+            self._format_msg.show()
+            self._format_val.setStyleSheet(f"color: {Colours.STATUS_UNSUPPORTED}; font-size: 18px; font-weight: 700;")
+        else:
+            self._format_badge.hide()
+            self._format_msg.hide()
+            self._format_val.setStyleSheet(f"color: {Colours.TEXT_PRIMARY}; font-size: 18px; font-weight: 700;")
         
         # Update capacity
         total = info.bytesTotal()
@@ -202,3 +238,36 @@ class DriveInfoWidget(QWidget):
             self._progress.setValue(pct)
         else:
             self._progress.setValue(0)
+            
+        # We don't start the background track scan here anymore.
+        # It is driven globally by MainWindow and updated via _on_track_count_finished.
+        self._track_text.setText(f"Scanning... / {MAX_TRACK_LIMIT}")
+        self._track_progress.setValue(0)
+
+
+    def _on_track_count_finished(self, count: int) -> None:
+        """Slot called when the background track scan completes."""
+        self._track_text.setText(f"{count} / {MAX_TRACK_LIMIT}")
+        self._track_progress.setValue(count)
+        
+        # Color the bar red if over limit
+        if count > MAX_TRACK_LIMIT:
+            self._track_progress.setStyleSheet(f"""
+                QProgressBar {{
+                    background-color: {Colours.BG_DARKEST};
+                    border: none;
+                }}
+                QProgressBar::chunk {{
+                    background-color: {Colours.STATUS_UNSUPPORTED};
+                }}
+            """)
+        else:
+            self._track_progress.setStyleSheet(f"""
+                QProgressBar {{
+                    background-color: {Colours.BG_DARKEST};
+                    border: none;
+                }}
+                QProgressBar::chunk {{
+                    background-color: {Colours.ACCENT};
+                }}
+            """)

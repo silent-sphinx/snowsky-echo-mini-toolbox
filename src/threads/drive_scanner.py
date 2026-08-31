@@ -1,0 +1,148 @@
+import os
+import mutagen
+from mutagen.flac import FLAC
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, APIC, SYLT, USLT, TXXX
+from PySide6.QtCore import QThread, Signal
+from typing import Optional
+
+from ..constants import SUPPORTED_MEDIA_EXTENSIONS
+from ..models.drive_data import DriveDataModel, TrackMetadata
+
+
+class DriveScannerThread(QThread):
+    """
+    Background thread that scans a drive for all supported media files and
+    extracts deep metadata via mutagen.
+    
+    Signals:
+        progress_updated (int, int, str): current_track, total_tracks, current_file
+        scan_finished (DriveDataModel): Emitted when scan is complete.
+    """
+    progress_updated = Signal(int, int, str)
+    scan_finished = Signal(object)  # Passes the DriveDataModel
+
+    def __init__(self, path: str, parent=None):
+        super().__init__(parent)
+        self.path = path
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        data_model = DriveDataModel(self.path)
+        
+        # Phase 1: Fast walk to count files and collect paths
+        supported_files = []
+        for root, dirs, files in os.walk(self.path):
+            if self._is_cancelled:
+                return
+                
+            # Exclude hidden directories from being traversed
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            
+            for file in files:
+                if file.startswith('.'):
+                    continue
+                _, ext = os.path.splitext(file)
+                if ext.lower() in SUPPORTED_MEDIA_EXTENSIONS:
+                    supported_files.append(os.path.join(root, file))
+                    
+        total_files = len(supported_files)
+        
+        # Phase 2: Deep metadata extraction
+        for i, filepath in enumerate(supported_files):
+            if self._is_cancelled:
+                return
+                
+            self.progress_updated.emit(i + 1, total_files, filepath)
+            
+            try:
+                meta = self._extract_metadata(filepath)
+                data_model.add_track(meta)
+            except Exception as e:
+                # Fallback to basic metadata if mutagen fails
+                print(f"Error parsing {filepath}: {e}")
+                filename = os.path.basename(filepath)
+                _, ext = os.path.splitext(filename)
+                size = os.path.getsize(filepath)
+                meta = TrackMetadata(
+                    filepath=filepath,
+                    filename=filename,
+                    extension=ext.lower(),
+                    size_bytes=size
+                )
+                data_model.add_track(meta)
+
+        self.scan_finished.emit(data_model)
+        
+    def _extract_metadata(self, filepath: str) -> TrackMetadata:
+        filename = os.path.basename(filepath)
+        _, ext = os.path.splitext(filename)
+        size = os.path.getsize(filepath)
+        
+        meta = TrackMetadata(
+            filepath=filepath,
+            filename=filename,
+            extension=ext.lower(),
+            size_bytes=size
+        )
+        
+        # Parse with mutagen
+        audio = mutagen.File(filepath)
+        if audio is None:
+            return meta
+            
+        meta.format_name = type(audio).__name__
+        if audio.info:
+            meta.duration_seconds = getattr(audio.info, "length", 0.0)
+            meta.bitrate_kbps = getattr(audio.info, "bitrate", 0) // 1000 if getattr(audio.info, "bitrate", 0) else 0
+            meta.sample_rate_hz = getattr(audio.info, "sample_rate", 0)
+            meta.channels = getattr(audio.info, "channels", 0)
+            
+        # Extract tags
+        if audio.tags:
+            # Common tags (mutagen makes this slightly painful depending on format)
+            if isinstance(audio, FLAC):
+                meta.title = audio.get("title", [meta.title])[0]
+                meta.artist = audio.get("artist", [meta.artist])[0]
+                meta.album = audio.get("album", [meta.album])[0]
+                meta.genre = audio.get("genre", [""])[0]
+                meta.year = audio.get("date", [""])[0]
+                meta.track_num = audio.get("tracknumber", [""])[0]
+                
+                # Check for lyrics
+                if "lyrics" in audio or "unsyncedlyrics" in audio:
+                    meta.has_lyrics = True
+                    meta.lyrics_text = audio.get("lyrics", audio.get("unsyncedlyrics", [None]))[0]
+                    
+                # Check for pictures
+                if audio.pictures:
+                    meta.has_album_art = True
+                    
+            elif audio.tags:
+                # Try generic dict access
+                try:
+                    meta.title = str(audio.tags.get("TIT2", audio.get("title", [meta.title])[0]))
+                except: pass
+                
+                try:
+                    meta.artist = str(audio.tags.get("TPE1", audio.get("artist", [meta.artist])[0]))
+                except: pass
+                
+                try:
+                    meta.album = str(audio.tags.get("TALB", audio.get("album", [meta.album])[0]))
+                except: pass
+                
+                # ID3 checks for art and lyrics
+                if hasattr(audio.tags, "getall"):
+                    if audio.tags.getall("APIC"):
+                        meta.has_album_art = True
+                    if audio.tags.getall("USLT") or audio.tags.getall("SYLT"):
+                        meta.has_lyrics = True
+                        uslts = audio.tags.getall("USLT")
+                        if uslts:
+                            meta.lyrics_text = uslts[0].text
+
+        return meta
