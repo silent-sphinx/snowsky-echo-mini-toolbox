@@ -17,11 +17,15 @@ from PySide6.QtWidgets import (
     QApplication,
     QStyle,
     QStyledItemDelegate,
+    QPushButton,
+    QMessageBox,
+    QLineEdit
 )
 from PySide6.QtGui import QBrush
 
 from ..theme import Colours
 from ..models.drive_data import DriveDataModel
+from ..utils.metadata_writer import save_metadata
 
 
 class HighlightDelegate(QStyledItemDelegate):
@@ -110,7 +114,7 @@ class MusicBrowserWidget(QWidget):
         self._props_table.setAlternatingRowColors(True)
         self._props_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._props_table.horizontalHeader().setStretchLastSection(True)
-        self._props_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._props_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
         props_lyt.addWidget(self._props_table)
         
         # 2. Music Metadata Tab
@@ -122,14 +126,26 @@ class MusicBrowserWidget(QWidget):
         self._meta_table.setHorizontalHeaderLabels(["Tag", "Value"])
         self._meta_table.verticalHeader().setVisible(False)
         self._meta_table.setAlternatingRowColors(True)
-        self._meta_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        # Edit triggers are enabled by default, we'll restrict column 0 in code
         self._meta_table.horizontalHeader().setStretchLastSection(True)
-        self._meta_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._meta_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
         
         self._meta_delegate = HighlightDelegate(self._meta_table)
         self._meta_table.setItemDelegate(self._meta_delegate)
         
         meta_lyt.addWidget(self._meta_table)
+        
+        meta_btns_lyt = QHBoxLayout()
+        self._meta_discard_btn = QPushButton("Discard Changes")
+        self._meta_discard_btn.clicked.connect(self._on_discard_metadata_clicked)
+        meta_btns_lyt.addWidget(self._meta_discard_btn)
+        
+        self._meta_save_btn = QPushButton("Save Changes")
+        self._meta_save_btn.setObjectName("accentButton")
+        self._meta_save_btn.clicked.connect(self._on_save_metadata_clicked)
+        meta_btns_lyt.addWidget(self._meta_save_btn)
+        
+        meta_lyt.addLayout(meta_btns_lyt)
         
         # 2. Album Art Tab
         self._art_tab = QWidget()
@@ -271,21 +287,35 @@ class MusicBrowserWidget(QWidget):
         for i, (k, v) in enumerate(tags):
             self._meta_table.insertRow(i)
             
-            key_item = QTableWidgetItem(k)
-            val_item = QTableWidgetItem(str(v))
+            # Key column: Persistent textbox
+            key_edit = QLineEdit(k)
+            key_edit.setStyleSheet("border: none; background: transparent; padding: 4px 8px;")
+            self._meta_table.setCellWidget(i, 0, key_edit)
+            
+            # Dummy items for background painting
+            key_bg_item = QTableWidgetItem()
+            val_bg_item = QTableWidgetItem()
+            
+            # Value column: Persistent textbox
+            val_edit = QLineEdit(str(v))
+            val_edit.setStyleSheet("border: none; background: transparent; padding: 4px 8px;")
+            self._meta_table.setCellWidget(i, 1, val_edit)
             
             # Highlight recognized tags
             if k.lower() in recognized_tags:
                 green_brush = QBrush(QColor(40, 80, 40)) # Subtle dark green
-                key_item.setBackground(green_brush)
-                val_item.setBackground(green_brush)
+                key_bg_item.setBackground(green_brush)
+                val_bg_item.setBackground(green_brush)
                 
                 tooltip = "Tag Recognised by Snowsky"
-                key_item.setToolTip(tooltip)
-                val_item.setToolTip(tooltip)
+                key_edit.setToolTip(tooltip)
+                val_edit.setToolTip(tooltip)
                 
-            self._meta_table.setItem(i, 0, key_item)
-            self._meta_table.setItem(i, 1, val_item)
+            self._meta_table.setItem(i, 0, key_bg_item)
+            self._meta_table.setItem(i, 1, val_bg_item)
+            
+        # Ensure rows are tall enough to display the QLineEdits
+        self._meta_table.resizeRowsToContents()
             
         # Album Art
         if meta.has_album_art:
@@ -306,3 +336,45 @@ class MusicBrowserWidget(QWidget):
         self._meta_table.setRowCount(0)
         self._art_lbl.setText("No Album Art")
         self._lyrics_text.setPlainText("")
+        
+    def _on_discard_metadata_clicked(self) -> None:
+        # Reload the metadata for the current selection from the cache
+        indexes = self._tree.selectionModel().selectedIndexes()
+        if indexes:
+            # Trigger standard selection changed logic to rebuild the details panel
+            self._on_selection_changed(self._tree.selectionModel().selection(), None)
+            
+    def _on_save_metadata_clicked(self) -> None:
+        if not self._data_model:
+            return
+            
+        indexes = self._tree.selectionModel().selectedIndexes()
+        if not indexes:
+            return
+            
+        index = indexes[0]
+        item = self._tree_model.itemFromIndex(index)
+        filepath = item.data(Qt.UserRole)
+        
+        # Gather tags from table
+        new_tags = {}
+        for row in range(self._meta_table.rowCount()):
+            key_widget = self._meta_table.cellWidget(row, 0)
+            val_widget = self._meta_table.cellWidget(row, 1)
+            
+            if key_widget and val_widget:
+                k = key_widget.text().strip()
+                if k:
+                    new_tags[k] = val_widget.text()
+                
+        self._meta_save_btn.setText("Saving...")
+        QApplication.processEvents()
+        
+        success, msg = save_metadata(filepath, new_tags)
+        self._meta_save_btn.setText("Save Changes")
+        
+        if success:
+            self._data_model.update_metadata(filepath, new_tags)
+            QMessageBox.information(self, "Success", "Metadata saved successfully.")
+        else:
+            QMessageBox.critical(self, "Error", f"Failed to save metadata:\n{msg}")

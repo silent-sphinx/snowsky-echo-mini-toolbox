@@ -83,3 +83,32 @@ class DriveDataModel:
 
     def get_track(self, filepath: str) -> Optional[TrackMetadata]:
         return self.tracks.get(filepath)
+        
+    def update_metadata(self, filepath: str, new_tags: dict) -> None:
+        """Update the in-memory metadata for a specific track after it's saved."""
+        track = self.get_track(filepath)
+        if not track:
+            return
+            
+        # Update raw tags
+        for k, v in new_tags.items():
+            track.all_tags[k] = str(v)
+            
+        # Re-sync primary attributes if they were updated
+        def _get_case_insensitive(tags_dict: dict, keys: list) -> str:
+            for k in tags_dict:
+                if k.lower() in keys:
+                    return tags_dict[k]
+            return ""
+
+        track.title = _get_case_insensitive(track.all_tags, ["title", "tit2"]) or track.title
+        track.artist = _get_case_insensitive(track.all_tags, ["artist", "tpe1"]) or track.artist
+        track.album = _get_case_insensitive(track.all_tags, ["album", "talb"]) or track.album
+        track.genre = _get_case_insensitive(track.all_tags, ["genre", "tcon"]) or track.genre
+        
+        # Track number and Year require string manipulation
+        year = _get_case_insensitive(track.all_tags, ["year", "date", "tdrc"])
+        if year: track.year = year
+        
+        track_num = _get_case_insensitive(track.all_tags, ["tracknumber", "track", "trck"])
+        if track_num: track.track_num = track_num
