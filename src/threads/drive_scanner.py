@@ -108,7 +108,16 @@ class DriveScannerThread(QThread):
                 k_lower = str(key).lower()
                 if "apic" in k_lower or "pic" in k_lower or "covr" in k_lower or "lyrics" in k_lower or "sylt" in k_lower or "uslt" in k_lower:
                     continue
-                meta.all_tags[str(key)] = str(val)
+                
+                # Mutagen often returns lists for values. Unpack them if possible.
+                if isinstance(val, list) and len(val) == 1:
+                    clean_val = str(val[0])
+                elif isinstance(val, list):
+                    clean_val = ", ".join(str(v) for v in val)
+                else:
+                    clean_val = str(val)
+                    
+                meta.all_tags[str(key)] = clean_val
                 
             # Common tags (mutagen makes this slightly painful depending on format)
             if isinstance(audio, FLAC):

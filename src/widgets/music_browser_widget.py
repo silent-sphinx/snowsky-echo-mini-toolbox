@@ -1,6 +1,6 @@
 import os
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QStandardItemModel, QStandardItem
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -15,11 +15,24 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QApplication,
-    QStyle
+    QStyle,
+    QStyledItemDelegate,
 )
+from PySide6.QtGui import QBrush
 
 from ..theme import Colours
 from ..models.drive_data import DriveDataModel
+
+
+class HighlightDelegate(QStyledItemDelegate):
+    """Custom delegate to enforce background colors over QSS/Alternating rows."""
+    def paint(self, painter, option, index):
+        bg = index.data(Qt.BackgroundRole)
+        if bg:
+            painter.fillRect(option.rect, bg)
+            # Prevent base class from trying to draw the background again
+            option.backgroundBrush = QBrush(Qt.NoBrush)
+        super().paint(painter, option, index)
 
 
 class MusicBrowserWidget(QWidget):
@@ -112,6 +125,10 @@ class MusicBrowserWidget(QWidget):
         self._meta_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._meta_table.horizontalHeader().setStretchLastSection(True)
         self._meta_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        
+        self._meta_delegate = HighlightDelegate(self._meta_table)
+        self._meta_table.setItemDelegate(self._meta_delegate)
+        
         meta_lyt.addWidget(self._meta_table)
         
         # 2. Album Art Tab
@@ -244,11 +261,31 @@ class MusicBrowserWidget(QWidget):
                 ("Track", str(meta.track_num)),
                 ("Year", str(meta.year)),
             ]
+        
+        # Tags known to be parsed by the Snowsky Echo Mini firmware
+        recognized_tags = {
+            "title", "artist", "album", "albumartist", "album artist",
+            "tracknumber", "track", "discnumber", "genre", "tit2", "tpe1", "talb", "tpe2", "trck", "tpos", "tcon"
+        }
             
         for i, (k, v) in enumerate(tags):
             self._meta_table.insertRow(i)
-            self._meta_table.setItem(i, 0, QTableWidgetItem(k))
-            self._meta_table.setItem(i, 1, QTableWidgetItem(str(v)))
+            
+            key_item = QTableWidgetItem(k)
+            val_item = QTableWidgetItem(str(v))
+            
+            # Highlight recognized tags
+            if k.lower() in recognized_tags:
+                green_brush = QBrush(QColor(40, 80, 40)) # Subtle dark green
+                key_item.setBackground(green_brush)
+                val_item.setBackground(green_brush)
+                
+                tooltip = "Tag Recognised by Snowsky"
+                key_item.setToolTip(tooltip)
+                val_item.setToolTip(tooltip)
+                
+            self._meta_table.setItem(i, 0, key_item)
+            self._meta_table.setItem(i, 1, val_item)
             
         # Album Art
         if meta.has_album_art:
