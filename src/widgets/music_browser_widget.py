@@ -1,6 +1,6 @@
 import os
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush, QPixmap, QImage
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -26,6 +26,7 @@ from PySide6.QtGui import QBrush
 from ..theme import Colours
 from ..models.drive_data import DriveDataModel, TrackMetadata
 from ..utils.metadata_writer import save_metadata
+from ..utils.album_art import extract_album_art
 
 
 class HighlightDelegate(QStyledItemDelegate):
@@ -160,14 +161,26 @@ class MusicBrowserWidget(QWidget):
         
         meta_lyt.addLayout(meta_btns_lyt)
         
-        # 2. Album Art Tab
+        # 3. Album Art Tab
         self._art_tab = QWidget()
         art_lyt = QVBoxLayout(self._art_tab)
-        art_lyt.setContentsMargins(8, 8, 8, 8)
-        self._art_lbl = QLabel("No Album Art")
-        self._art_lbl.setAlignment(Qt.AlignCenter)
-        self._art_lbl.setStyleSheet(f"color: {Colours.TEXT_SECONDARY};")
-        art_lyt.addWidget(self._art_lbl)
+        art_lyt.setContentsMargins(16, 16, 16, 16)
+        
+        self._art_image_lbl = QLabel("No Album Art")
+        self._art_image_lbl.setAlignment(Qt.AlignCenter)
+        self._art_image_lbl.setStyleSheet(f"color: {Colours.TEXT_SECONDARY};")
+        self._art_image_lbl.setMinimumHeight(250)
+        
+        self._art_table = QTableWidget(0, 2)
+        self._art_table.setHorizontalHeaderLabels(["Property", "Value"])
+        self._art_table.verticalHeader().setVisible(False)
+        self._art_table.setAlternatingRowColors(True)
+        self._art_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._art_table.horizontalHeader().setStretchLastSection(True)
+        self._art_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        
+        art_lyt.addWidget(self._art_image_lbl, stretch=1)
+        art_lyt.addWidget(self._art_table, stretch=0)
         
         # 3. Lyrics Tab
         self._lyrics_tab = QWidget()
@@ -375,7 +388,7 @@ class MusicBrowserWidget(QWidget):
             
             # Key column: Persistent textbox
             key_edit = QLineEdit(k)
-            key_edit.setStyleSheet("border: none; background: transparent; padding: 4px 8px;")
+            key_edit.setStyleSheet("QLineEdit { border: none; background: transparent; padding: 4px 8px; }")
             self._meta_table.setCellWidget(i, 0, key_edit)
             
             # Dummy items for background painting
@@ -384,7 +397,7 @@ class MusicBrowserWidget(QWidget):
             
             # Value column: Persistent textbox
             val_edit = QLineEdit(str(v))
-            val_edit.setStyleSheet("border: none; background: transparent; padding: 4px 8px;")
+            val_edit.setStyleSheet("QLineEdit { border: none; background: transparent; padding: 4px 8px; }")
             self._meta_table.setCellWidget(i, 1, val_edit)
             
             # Highlight recognized tags
@@ -404,12 +417,39 @@ class MusicBrowserWidget(QWidget):
         self._meta_table.resizeRowsToContents()
             
         # Album Art
+        self._art_table.setRowCount(0)
         if meta.has_album_art:
-            self._art_lbl.setText("[Album Art Embedded - Image Decoding TODO]")
-            self._art_lbl.setStyleSheet(f"color: {Colours.ACCENT}; font-weight: 700;")
+            art_info = extract_album_art(meta.filepath)
+            if art_info:
+                # Load Pixmap
+                img = QImage.fromData(art_info.image_data)
+                pixmap = QPixmap.fromImage(img)
+                scaled_pixmap = pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self._art_image_lbl.setPixmap(scaled_pixmap)
+                
+                # Setup table
+                scan_type = "Progressive" if art_info.is_progressive else "Baseline (Non-progressive)"
+                if "jpeg" not in art_info.mime_type.lower() and "jpg" not in art_info.mime_type.lower():
+                    scan_type = "N/A"
+                    
+                display_size = f"{art_info.size_bytes / 1024:.1f} KB" if art_info.size_bytes < 1024 * 1024 else f"{art_info.size_bytes / (1024 * 1024):.1f} MB"
+                    
+                art_props = [
+                    ("MIME Type", art_info.mime_type),
+                    ("Dimensions", f"{art_info.width} x {art_info.height} px"),
+                    ("Data Size", display_size),
+                    ("JPEG Scan", scan_type),
+                ]
+                
+                for i, (k, v) in enumerate(art_props):
+                    self._art_table.insertRow(i)
+                    self._art_table.setItem(i, 0, QTableWidgetItem(k))
+                    self._art_table.setItem(i, 1, QTableWidgetItem(v))
+            else:
+                self._art_image_lbl.setText("[Failed to extract album art]")
         else:
-            self._art_lbl.setText("No Album Art")
-            self._art_lbl.setStyleSheet(f"color: {Colours.TEXT_SECONDARY};")
+            self._art_image_lbl.setPixmap(QPixmap())
+            self._art_image_lbl.setText("No Album Art embedded in this file.")
             
         # Lyrics
         if meta.has_lyrics and meta.lyrics_text:
@@ -420,7 +460,9 @@ class MusicBrowserWidget(QWidget):
     def _clear_details(self) -> None:
         self._props_table.setRowCount(0)
         self._meta_table.setRowCount(0)
-        self._art_lbl.setText("No Album Art")
+        self._art_table.setRowCount(0)
+        self._art_image_lbl.setPixmap(QPixmap())
+        self._art_image_lbl.setText("No Album Art")
         self._lyrics_text.setPlainText("")
         
         # Hide all tabs when a folder or nothing is selected
