@@ -5,7 +5,9 @@
 [![UI](https://img.shields.io/badge/UI-PySide6-41CD52)](https://doc.qt.io/qtforpython-6/)
 ![Status](https://img.shields.io/badge/status-active%20development-2ea44f)
 
-An easy (unofficial) desktop app to prepare your music folders and USB drives for the Snowsky Echo Mini.
+An easy (unofficial) desktop app to prepare your music folders and USB drives for the Snowsky Echo Mini. 
+
+> This branch is a rewrite of the Snowsky Echo Mini Toolbox tool. Find the current software version in main.
 
 ![Overview](Overview.png)
 
@@ -14,7 +16,6 @@ The Snowsky Echo Mini is a fantastic little device, but its affordable hardware 
 <!-- TOC -->
 
 - [Snowsky Echo Mini Toolbox](#snowsky-echo-mini-toolbox)
-    - [Table of Contents](#table-of-contents)
     - [Main Features](#main-features)
     - [Please Backup Your Data](#please-backup-your-data)
     - [Installation](#installation)

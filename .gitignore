@@ -18,3 +18,5 @@ build_binaries/
 dist/
 build_instructions/dist_tmp/
 src/generated_version.py
+
+old_src

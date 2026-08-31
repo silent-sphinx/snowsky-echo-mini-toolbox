@@ -40,11 +40,13 @@ The device has specific requirements for embedded album artwork to be displayed 
 
 The device handles most file names well, but there are exceptions based on tested edge cases:
 
-* **Emojis:** UNSUPPORTED. File names containing emojis (standard, skin tones, zero-width joiners, flags, etc.) do not work.
-* **Complex Asian Scripts:** UNSUPPORTED. Specific scripts like Hindi (Devanagari), Bengali, Khmer, and Burmese are not supported. (Note: Thai, Chinese, Japanese, and Korean are supported).
-* **Zalgo / Complex Diacritics:** RENDERS AS STANDARD TEXT. The text will render, but complex combining characters/diacritics are stripped and ignored.
-* **Latin Extended / Other Unicode:** SUPPORTED. Characters like `café`, Cyrillic, Greek, Arabic, Hebrew, and Math symbols work correctly.
-* **Long Names / Special Punctuation:** SUPPORTED. Works within reasonable filesystem bounds.
+| Name | Failure Description | Media Plays? | Supported Visually? |
+| ---- | ------------------- | ------------ | ------------------- |
+| Emojis | File names containing emojis (standard, skin tones, zero-width joiners, flags, etc.) | ✅ | ❌ |
+| Complex Asian Scripts | Specific scripts like Hindi (Devanagari), Bengali, Khmer, and Burmese are not supported. (Note: Thai, Chinese, Japanese, and Korean are supported). | ✅ | ❌ |
+| Zalgo / Complex Diacritics | The text will render, but complex combining characters/diacritics are stripped and ignored. | ✅ | ⚠️ |
+| Latin Extended / Other Unicode | Characters like `café`, Cyrillic, Greek, Arabic, Hebrew, and Math symbols work correctly. | ✅ | ✅ |
+| Long Names/ Special Punctuation | Works within reasonable filesystem bounds. | ✅ | ✅ |
 
 ## Metadata (Tag) Compatibility
 

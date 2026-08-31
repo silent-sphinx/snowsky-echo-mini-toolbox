@@ -1,29 +1,13 @@
-AUDIO_FILE_EXTENSIONS = {
-    ".mp3",
-    ".ogg",
-    ".m4a",
-    ".wma",
-    ".wav",
-    ".flac",
-    ".ape",
-    ".dsf",
-    ".dff",
-    ".aac",
-    ".alac",
-    ".aiff",
-    ".aif",
-    ".opus",
+"""
+Global application constants and configurations.
+"""
+
+# Supported media format extensions recognized by the Snowsky Echo Mini firmware.
+# Extracted from firmware reverse-engineering (Table 2).
+SUPPORTED_MEDIA_EXTENSIONS = {
+    ".mp1", ".mp2", ".mp3", ".wma", ".wav", ".ape", ".fla", ".flac", 
+    ".aac", ".m4a", ".ogg", ".mp4", ".3gp", ".dff", ".dsf", ".cue"
 }
 
-ALBUM_ART_CACHE_LIMIT = 48
-try:
-    from src.generated_version import APP_VERSION
-except ImportError:
-    APP_VERSION = "dev"
-
-TABLE_COMPATIBLE_COLOR = "#2E7D32"
-TABLE_COMPATIBLE_TEXT_COLOR = "#F2FFF2"
-TABLE_INCOMPATIBLE_COLOR = "#7A2C2C"
-TABLE_INCOMPATIBLE_TEXT_COLOR = "#FFF0F0"
-TABLE_LIMITED_COLOR = "#C67100"
-TABLE_LIMITED_TEXT_COLOR = "#FFF9E6"
+# Maximum track limit supported by the Snowsky Echo Mini firmware hardware
+MAX_TRACK_LIMIT = 8192
