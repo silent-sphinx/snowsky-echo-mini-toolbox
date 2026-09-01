@@ -272,6 +272,8 @@ class MusicCompatibilityWidget(QWidget):
                 text_width = font_metrics.horizontalAdvance(CompColumn.HEADERS[col].upper()) + 45
                 header.resizeSection(col, max(baselines[col], text_width))
 
+        self._table.resizeColumnToContents(CompColumn.FILE)
+        
         QTimer.singleShot(100, self._update_stats)
 
     def _update_stats(self) -> None:

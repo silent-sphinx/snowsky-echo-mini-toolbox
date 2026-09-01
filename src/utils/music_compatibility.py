@@ -951,6 +951,90 @@ def _check_id3v2_utf8_encoding(path: Path) -> tuple[str, str]:
         return "INCOMPATIBLE", f"{len(utf8_frames)} tags use UTF-8 encoding — device has no UTF-8 decoder, text will display as garbage"
 
     return "COMPATIBLE", ""
+    has_tit2 = "TIT2" in tags
+    has_tpe1 = "TPE1" in tags
+    
+    if not has_tit2 and not has_tpe1:
+        return "COMPATIBLE", ""
+        
+    accumulated_size = 10 # 10 bytes for ID3 header
+    
+    for frame_id, frame in tags.items():
+        if frame_id in ("TIT2", "TPE1"):
+            # If we reached a core tag and accumulated size > 4096, it's pushed out
+            if accumulated_size > 4096:
+                return "INCOMPATIBLE", f"ID3v2 Read Window Bug: Large preceding frames push '{frame_id}' beyond 4KB SRAM buffer"
+                
+        # Approximate size of the frame
+        if frame_id.startswith("APIC"):
+            accumulated_size += len(getattr(frame, "data", b"")) + 100
+        elif frame_id.startswith(("COMM", "USLT", "SYLT")):
+            text_data = getattr(frame, "text", [""])[0] if getattr(frame, "text", []) else ""
+            accumulated_size += len(str(text_data).encode("utf-8", "ignore")) + 100
+        elif frame_id.startswith("TXXX"):
+            desc = getattr(frame, "desc", "")
+            text_data = getattr(frame, "text", [""])[0] if getattr(frame, "text", []) else ""
+            accumulated_size += len(str(desc).encode("utf-8", "ignore")) + len(str(text_data).encode("utf-8", "ignore")) + 100
+        else:
+            accumulated_size += 100
+            
+    return "COMPATIBLE", ""
+
+
+
+def _check_id3v2_read_window(path: Path) -> tuple[str, str]:
+    """Check if large unrecognized frames push core tags beyond the 4KB firmware read window."""
+    try:
+        tags = mutagen.id3.ID3(str(path))
+    except Exception:
+        return "COMPATIBLE", ""
+        
+    has_tit2 = "TIT2" in tags
+    has_tpe1 = "TPE1" in tags
+    
+    if not has_tit2 and not has_tpe1:
+        return "COMPATIBLE", ""
+        
+    accumulated_size = 10 # 10 bytes for ID3 header
+    
+    for frame_id, frame in tags.items():
+        if frame_id in ("TIT2", "TPE1"):
+            # If we reached a core tag and accumulated size > 4096, it's pushed out
+            if accumulated_size > 4096:
+                return "INCOMPATIBLE", f"ID3v2 Read Window Bug: Large preceding frames push '{frame_id}' beyond 4KB SRAM buffer"
+                
+        # Approximate size of the frame
+        if frame_id.startswith("APIC"):
+            accumulated_size += len(getattr(frame, "data", b"")) + 100
+        elif frame_id.startswith(("COMM", "USLT", "SYLT")):
+            text_data = getattr(frame, "text", [""])[0] if getattr(frame, "text", []) else ""
+            accumulated_size += len(str(text_data).encode("utf-8", "ignore")) + 100
+        elif frame_id.startswith("TXXX"):
+            desc = getattr(frame, "desc", "")
+            text_data = getattr(frame, "text", [""])[0] if getattr(frame, "text", []) else ""
+            accumulated_size += len(str(desc).encode("utf-8", "ignore")) + len(str(text_data).encode("utf-8", "ignore")) + 100
+        else:
+            accumulated_size += 100
+            
+    return "COMPATIBLE", ""
+
+
+def _check_cue_sheet_limits(path: Path) -> tuple[str, str]:
+    """Check if CUE sheet exceeds the 99-track hardware limit."""
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        
+        # Count TRACK declarations
+        # e.g., TRACK 01 AUDIO
+        track_count = content.count("TRACK ")
+        
+        if track_count > 99:
+            return "INCOMPATIBLE", f"CUE sheet contains {track_count} tracks — firmware crashes with > 99 tracks due to fixed buffer"
+            
+        return "COMPATIBLE", ""
+    except Exception:
+        return "UNKNOWN", "Failed to parse CUE sheet"
 
 
 def _check_tag_string_lengths(path: Path) -> tuple[str, str]:
@@ -1123,6 +1207,51 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
                     status = "SUPPORTED"
                     category = "supported"
                     reason = "Lossy format supported"
+    # ── Handle .cue explicitly ───────────────────────────────────────
+    elif extension == ".cue":
+        status = "UNKNOWN"
+        category = "unknown"
+        reason = "-"
+        
+        cue_status, cue_reason = _check_cue_sheet_limits(path)
+        if cue_status == "INCOMPATIBLE":
+            status = "UNSUPPORTED"
+            category = "unsupported"
+            reason = cue_reason
+        else:
+            status = "SUPPORTED"
+            category = "supported"
+            reason = "CUE sheet limits valid"
+            
+        return {
+            "file": _relative_path_for_target(path, target_dir),
+            "extension": extension_display,
+            "codec": "-",
+            "status": status,
+            "category": category,
+            "reason": reason,
+            "sample_rate": "-",
+            "bit_depth": "-",
+            "block_size": "-",
+            "dsd_profile": "-",
+            "eq_compatibility": "-",
+            "channels": "-",
+            "stream_count": "-",
+            "filename_compatibility": filename_comp_status,
+            "filename_compatibility_reason": filename_comp_reason,
+            "metadata_compatibility": "COMPATIBLE" if cue_status == "COMPATIBLE" else "INCOMPATIBLE",
+            "metadata_compatibility_reason": cue_reason,
+            "channel_compatibility": "-",
+            "channel_compatibility_reason": "-",
+            "wav_codec_compatibility": "-",
+            "wav_codec_compatibility_reason": "-",
+            "dsd_bitdepth_compatibility": "-",
+            "dsd_bitdepth_compatibility_reason": "-",
+            "tag_encoding_compatibility": "-",
+            "tag_encoding_compatibility_reason": "-",
+            "tag_length_compatibility": "-",
+            "tag_length_compatibility_reason": "-",
+        }
     elif extension in PCM_FORMATS:
         metadata = _read_audio_metadata(path)
         ffprobe_error = metadata.get("ffprobe_error")
@@ -1347,6 +1476,13 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
     if extension in ID3_FORMATS and category != "skipped":
         tag_encoding_comp_status, tag_encoding_comp_reason = _check_id3v2_utf8_encoding(path)
 
+    
+    # ── ID3v2 Read Window validation ──────────────────────────────────
+    id3_window_comp_status = "-"
+    id3_window_comp_reason = "-"
+    if extension in ID3_FORMATS and category != "skipped":
+        id3_window_comp_status, id3_window_comp_reason = _check_id3v2_read_window(path)
+
     # ── Tag string length validation ──────────────────────────────────
     tag_length_comp_status = "-"
     tag_length_comp_reason = "-"
@@ -1357,6 +1493,12 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
     from .metadata_sanitizer import MetadataSanitizer
     sanitizer = MetadataSanitizer()
     meta_ok, meta_reason = sanitizer.check_metadata(path)
+    
+    # Merge new metadata checks
+    if id3_window_comp_status == "INCOMPATIBLE":
+        meta_ok = False
+        meta_reason = id3_window_comp_reason
+
     metadata_comp_status = "COMPATIBLE" if meta_ok else "INCOMPATIBLE"
 
     # ── Aggregate sub-check failures into overall status ──────────────
@@ -1380,6 +1522,7 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         channel_comp_status == "INCOMPATIBLE"
         or wav_codec_comp_status == "INCOMPATIBLE"
         or dsd_bitdepth_comp_status == "INCOMPATIBLE"
+        or id3_window_comp_status == "INCOMPATIBLE"
     )
 
     if sub_check_failures and category not in ("skipped", "unsupported"):
