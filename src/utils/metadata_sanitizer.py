@@ -12,7 +12,13 @@ class MetadataSanitizer:
 
     def check_metadata(self, file_path: str | Path) -> tuple[bool, str]:
         """
-        Check if the metadata contains more than 32 "Unknown" tags.
+        Check if the metadata contains too many unknown tags that would
+        exceed the device's parser limits.
+        
+        For FLAC: checks Vorbis Comments against the 20-tag unknown limit.
+        For ID3v2 formats (MP3, WAV, DSF): checks for excessive non-standard
+        frames that push core tags outside the firmware's ~2-4KB read window.
+        
         Returns a tuple: (is_compatible, reason_if_not)
         """
         try:
@@ -20,24 +26,39 @@ class MetadataSanitizer:
             if audio is None or audio.tags is None:
                 return True, ""
                 
-            # The 32 unknown tag limit specifically affects the device's Vorbis Comment
-            # parser. MP3 files (ID3 tags) use completely different keys and firmware logic.
-            if not isinstance(audio, mutagen.flac.FLAC):
+            # FLAC: Vorbis Comment parser has a hard unknown tag limit
+            if isinstance(audio, mutagen.flac.FLAC):
+                unknown_count = 0
+                for key in audio.tags.keys():
+                    if key.lower() not in self.known_tags:
+                        unknown_count += 1
+
+                if unknown_count > self.limit:
+                    return False, f"Snowsky Hardware Limit Exceeded: File contains {unknown_count} unknown tags, exceeding the device's hardcoded safety limit of {self.limit}. The device's parser will abort and crash. Click 'Fix Compatibility' to strip useless tracking tags and safely reduce the count."
+                
                 return True, ""
 
-            unknown_count = 0
-            for key in audio.tags.keys():
-                if key.lower() not in self.known_tags:
-                    unknown_count += 1
+            # ID3v2 formats: the firmware reads a fixed ~2-4KB window of the
+            # ID3v2 header. Non-standard frames (TXXX, COMM, USLT, etc.) at
+            # the start push core tags (TIT2, TPE1) outside this window.
+            core_id3_frames = {"TIT2", "TPE1", "TALB", "TPE2", "TCON", "TRCK", "TPOS", "APIC"}
+            if hasattr(audio.tags, "getall"):
+                unknown_count = 0
+                for frame_id in audio.tags.keys():
+                    # Extract base frame ID (e.g. "TXXX:foo" -> "TXXX")
+                    base_id = str(frame_id).split(":")[0].upper()
+                    if base_id not in core_id3_frames:
+                        unknown_count += 1
 
-            if unknown_count > self.limit:
-                return False, f"Snowsky Hardware Limit Exceeded: File contains {unknown_count} unknown tags, exceeding the device's hardcoded safety limit of {self.limit}. The device's parser will abort and crash. Click 'Fix Compatibility' to strip useless tracking tags and safely reduce the count."
-            
+                if unknown_count > self.limit:
+                    return False, f"Snowsky Hardware Limit Exceeded: File contains {unknown_count} non-standard ID3 frames, exceeding the device's safety limit of {self.limit}. Excess frames push core tags outside the firmware's read window, causing missing metadata on the device."
+
             return True, ""
 
         except Exception as e:
             logger.debug(f"Failed to check metadata for {file_path}: {e}")
             return True, ""
+
 
     def sanitize(self, file_path: str | Path, preserve_third_party_tags: bool = False) -> bool:
         """

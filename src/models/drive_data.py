@@ -38,6 +38,9 @@ class TrackMetadata:
     comp_status: str = "UNKNOWN"
     comp_category: str = "unknown"
     comp_reason: str = ""
+    
+    # UI State
+    is_checked: bool = False
     comp_eq: str = "-"
     comp_codec: str = "-"
     comp_sample_rate: str = "-"
@@ -50,6 +53,16 @@ class TrackMetadata:
     comp_filename_reason: str = "-"
     comp_metadata: str = "-"
     comp_metadata_reason: str = "-"
+    comp_channel_compat: str = "-"
+    comp_channel_compat_reason: str = "-"
+    comp_wav_codec: str = "-"
+    comp_wav_codec_reason: str = "-"
+    comp_dsd_bitdepth: str = "-"
+    comp_dsd_bitdepth_reason: str = "-"
+    comp_tag_encoding: str = "-"
+    comp_tag_encoding_reason: str = "-"
+    comp_tag_length: str = "-"
+    comp_tag_length_reason: str = "-"
     
     @property
     def display_size(self) -> str:

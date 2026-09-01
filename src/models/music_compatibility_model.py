@@ -10,31 +10,51 @@ from ..models.drive_data import TrackMetadata
 from ..theme import Colours
 
 class CompColumn:
-    TITLE = 0
-    ARTIST = 1
-    ALBUM = 2
-    STATUS = 3
-    REASON = 4
-    EQ = 5
-    CODEC = 6
-    SAMPLE_RATE = 7
-    BIT_DEPTH = 8
-    CHANNELS = 9
-    EXTENSION = 10
-    BLOCK_SIZE = 11
-    DSD = 12
+    # Checkbox
+    CHECK = 0
+    # Track Info
+    TITLE = 1
+    ARTIST = 2
+    ALBUM = 3
+    # Status
+    STATUS = 4
+    REASON = 5
+    # Properties
+    EXTENSION = 6
+    CODEC = 7
+    SAMPLE_RATE = 8
+    BIT_DEPTH = 9
+    CHANNELS = 10
+    DSD = 11
+    BLOCK_SIZE = 12
     STREAMS = 13
-    FILENAME = 14
-    METADATA = 15
-    FILE = 16
+    EQ = 14
+    # Validation
+    CHANNEL_COMPAT = 15
+    WAV_CODEC = 16
+    DSD_BITDEPTH = 17
+    TAG_ENCODING = 18
+    TAG_LENGTH = 19
+    FILENAME = 20
+    METADATA = 21
+    # Location
+    FILE = 22
     
-    COUNT = 17
+    COUNT = 23
     
     HEADERS = [
-        "Title", "Artist", "Album", "Status", "Reason", "EQ", "Codec", "Sample Rate",
-        "Bit Depth", "Channels", "Extension", "Block Size", "DSD",
-        "Streams", "File Name", "Metadata", "File Path"
+        "", "Title", "Artist", "Album", 
+        "Status", "Reason", 
+        "Extension", "Codec", "Sample Rate", "Bit Depth", "Channels", "DSD", "Block Size", "Streams", "EQ",
+        "Ch. Compat", "WAV Codec", "DSD Bit Depth", "Tag Encoding", "Tag Length", "File Name", "Metadata", 
+        "File Path"
     ]
+
+    # Columns that use COMPATIBLE/INCOMPATIBLE/UNKNOWN status coloring
+    COMPAT_STATUS_COLUMNS = {
+        CHANNEL_COMPAT, DSD_BITDEPTH, WAV_CODEC,
+        TAG_ENCODING, TAG_LENGTH, FILENAME, METADATA
+    }
 
 class MusicCompatibilityTableModel(QAbstractTableModel):
     def __init__(self, parent=None):
@@ -59,6 +79,43 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
     def columnCount(self, parent=QModelIndex()) -> int:
         if parent.isValid(): return 0
         return CompColumn.COUNT
+
+    def _get_compat_status_for_column(self, track: TrackMetadata, col: int) -> str | None:
+        """Return the compatibility status string for a given compat-status column."""
+        if col == CompColumn.CHANNEL_COMPAT:
+            return track.comp_channel_compat
+        elif col == CompColumn.DSD_BITDEPTH:
+            return track.comp_dsd_bitdepth
+        elif col == CompColumn.WAV_CODEC:
+            return track.comp_wav_codec
+        elif col == CompColumn.TAG_ENCODING:
+            return track.comp_tag_encoding
+        elif col == CompColumn.TAG_LENGTH:
+            return track.comp_tag_length
+        elif col == CompColumn.FILENAME:
+            return track.comp_filename
+        elif col == CompColumn.METADATA:
+            return track.comp_metadata
+        return None
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        if not index.isValid():
+            return Qt.NoItemFlags
+        if index.column() == CompColumn.CHECK:
+            return Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
+        return Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        
+    def setData(self, index: QModelIndex, value: any, role: int = Qt.EditRole) -> bool:
+        if not index.isValid():
+            return False
+            
+        if role == Qt.CheckStateRole and index.column() == CompColumn.CHECK:
+            track = self._tracks[index.row()]
+            track.is_checked = (value in (Qt.Checked, Qt.CheckState.Checked, 2))
+            self.dataChanged.emit(index, index, [Qt.CheckStateRole])
+            return True
+            
+        return False
         
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
         if not index.isValid(): return None
@@ -69,8 +126,12 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
         
         track = self._tracks[row]
         
+        if role == Qt.CheckStateRole and col == CompColumn.CHECK:
+            return Qt.Checked if track.is_checked else Qt.Unchecked
+        
         if role == Qt.DisplayRole:
-            if col == CompColumn.TITLE: return track.title
+            if col == CompColumn.CHECK: return ""
+            elif col == CompColumn.TITLE: return track.title
             elif col == CompColumn.ARTIST: return track.artist
             elif col == CompColumn.ALBUM: return track.album
             elif col == CompColumn.STATUS: return track.comp_status
@@ -80,9 +141,14 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
             elif col == CompColumn.SAMPLE_RATE: return track.comp_sample_rate
             elif col == CompColumn.BIT_DEPTH: return track.comp_bit_depth
             elif col == CompColumn.CHANNELS: return track.comp_channels
+            elif col == CompColumn.CHANNEL_COMPAT: return track.comp_channel_compat
             elif col == CompColumn.EXTENSION: return track.extension
             elif col == CompColumn.BLOCK_SIZE: return track.comp_block_size
             elif col == CompColumn.DSD: return track.comp_dsd_profile
+            elif col == CompColumn.DSD_BITDEPTH: return track.comp_dsd_bitdepth
+            elif col == CompColumn.WAV_CODEC: return track.comp_wav_codec
+            elif col == CompColumn.TAG_ENCODING: return track.comp_tag_encoding
+            elif col == CompColumn.TAG_LENGTH: return track.comp_tag_length
             elif col == CompColumn.STREAMS: return track.comp_streams
             elif col == CompColumn.FILENAME: return track.comp_filename
             elif col == CompColumn.METADATA: return track.comp_metadata
@@ -103,25 +169,47 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
                 if track.comp_eq == "EQ Compatible": return c_green
                 elif track.comp_eq == "Not EQ Compatible": return c_red
                 elif track.comp_eq == "UNKNOWN": return c_yellow
-            elif col == CompColumn.FILENAME:
-                if track.comp_filename == "COMPATIBLE": return c_green
-                elif track.comp_filename == "INCOMPATIBLE": return c_red
-            elif col == CompColumn.METADATA:
-                if track.comp_metadata == "COMPATIBLE": return c_green
-                elif track.comp_metadata == "INCOMPATIBLE": return c_red
+            elif col in CompColumn.COMPAT_STATUS_COLUMNS:
+                status = self._get_compat_status_for_column(track, col)
+                if status == "COMPATIBLE": return c_green
+                elif status == "INCOMPATIBLE": return c_red
+                elif status == "UNKNOWN": return c_yellow
                 
         elif role == Qt.TextAlignmentRole:
-            if col in (CompColumn.SAMPLE_RATE, CompColumn.BIT_DEPTH, CompColumn.CHANNELS, CompColumn.BLOCK_SIZE, CompColumn.DSD, CompColumn.STREAMS):
+            center_cols = (
+                CompColumn.SAMPLE_RATE, CompColumn.BIT_DEPTH, CompColumn.CHANNELS,
+                CompColumn.BLOCK_SIZE, CompColumn.DSD, CompColumn.STREAMS,
+                CompColumn.CHANNEL_COMPAT, CompColumn.DSD_BITDEPTH, CompColumn.WAV_CODEC,
+                CompColumn.TAG_ENCODING, CompColumn.TAG_LENGTH,
+            )
+            if col in center_cols:
                 return int(Qt.AlignCenter | Qt.AlignVCenter)
             return int(Qt.AlignLeft | Qt.AlignVCenter)
             
         elif role == Qt.ForegroundRole:
-            if role == Qt.BackgroundRole: pass # handled above
-            # Return black text for yellow backgrounds so it's readable, white otherwise
-            if col == CompColumn.STATUS and track.comp_status == "LIMITED": return QColor(Colours.BACKGROUND_PRIMARY)
-            if col == CompColumn.EQ and track.comp_eq == "UNKNOWN": return QColor(Colours.BACKGROUND_PRIMARY)
+            # Dark text on yellow backgrounds for readability
+            if col == CompColumn.STATUS and track.comp_status == "LIMITED": return QColor(Colours.BG_DARKEST)
+            if col == CompColumn.EQ and track.comp_eq == "UNKNOWN": return QColor(Colours.BG_DARKEST)
+            # Also dark text for UNKNOWN compat status columns
+            if col in CompColumn.COMPAT_STATUS_COLUMNS:
+                status = self._get_compat_status_for_column(track, col)
+                if status == "UNKNOWN":
+                    return QColor(Colours.BG_DARKEST)
             return QColor(Colours.TEXT_PRIMARY)
-            
+
+        elif role == Qt.ToolTipRole:
+            # Show full reason text as tooltip
+            if col == CompColumn.STATUS: return track.comp_reason
+            elif col == CompColumn.EQ:
+                if track.comp_eq == "Not EQ Compatible": return "File sample rate or bit depth exceeds EQ limit (192kHz/16-bit)"
+            elif col == CompColumn.CHANNEL_COMPAT: return track.comp_channel_compat_reason
+            elif col == CompColumn.DSD_BITDEPTH: return track.comp_dsd_bitdepth_reason
+            elif col == CompColumn.WAV_CODEC: return track.comp_wav_codec_reason
+            elif col == CompColumn.TAG_ENCODING: return track.comp_tag_encoding_reason
+            elif col == CompColumn.TAG_LENGTH: return track.comp_tag_length_reason
+            elif col == CompColumn.FILENAME: return track.comp_filename_reason
+            elif col == CompColumn.METADATA: return track.comp_metadata_reason
+
         return None
         
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):

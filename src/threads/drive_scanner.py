@@ -125,6 +125,16 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
             meta.comp_filename_reason = comp_result.get("filename_compatibility_reason", "-")
             meta.comp_metadata = comp_result.get("metadata_compatibility", "-")
             meta.comp_metadata_reason = comp_result.get("metadata_compatibility_reason", "-")
+            meta.comp_channel_compat = comp_result.get("channel_compatibility", "-")
+            meta.comp_channel_compat_reason = comp_result.get("channel_compatibility_reason", "-")
+            meta.comp_wav_codec = comp_result.get("wav_codec_compatibility", "-")
+            meta.comp_wav_codec_reason = comp_result.get("wav_codec_compatibility_reason", "-")
+            meta.comp_dsd_bitdepth = comp_result.get("dsd_bitdepth_compatibility", "-")
+            meta.comp_dsd_bitdepth_reason = comp_result.get("dsd_bitdepth_compatibility_reason", "-")
+            meta.comp_tag_encoding = comp_result.get("tag_encoding_compatibility", "-")
+            meta.comp_tag_encoding_reason = comp_result.get("tag_encoding_compatibility_reason", "-")
+            meta.comp_tag_length = comp_result.get("tag_length_compatibility", "-")
+            meta.comp_tag_length_reason = comp_result.get("tag_length_compatibility_reason", "-")
         except Exception as e:
             print(f"Compatibility scan failed for {filepath}: {e}")
 

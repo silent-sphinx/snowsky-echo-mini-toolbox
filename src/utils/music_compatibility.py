@@ -10,6 +10,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Slot
 import logging
+import mutagen
+from mutagen.id3 import ID3
 
 EMOJI_PATTERN = re.compile(
     r'['
@@ -44,7 +46,7 @@ def _evaluate_file_name_compatibility(filename: str) -> tuple[str, str]:
     return "COMPATIBLE", "File name is compatible"
 
 
-LOSSY_FORMATS = {".mp3", ".ogg", ".m4a", ".wma"}
+LOSSY_FORMATS = {".mp3", ".mp1", ".mp2", ".ogg", ".m4a", ".wma"}
 PCM_FORMATS = {".wav", ".flac", ".ape"}
 DSD_FORMATS = {".dsf", ".dff"}
 EXPLICIT_UNSUPPORTED = {".dts", ".dtshd", ".sacd", ".iso"}
@@ -57,8 +59,6 @@ OTHER_AUDIO_FORMATS = {
     ".m4b",
     ".m4p",
     ".mka",
-    ".mp1",
-    ".mp2",
     ".opus",
     ".oga",
     ".wv",
@@ -69,6 +69,26 @@ KNOWN_AUDIO_FORMATS = (
 
 FLAC_BLOCK_MAX_LIMIT = 4608
 SUPPORTED_DSD_MULTIPLES = {64, 128, 256}
+
+# WAV codec names from ffprobe that correspond to supported firmware format tags:
+# PCM (0x01), MS ADPCM (0x02), IMA ADPCM (0x11), Extensible (0xFFFE)
+WAV_SUPPORTED_CODECS = {
+    "pcm_u8", "pcm_s16le", "pcm_s24le", "pcm_s32le",  # Integer PCM
+    "pcm_s16be", "pcm_s24be", "pcm_s32be",              # Big-endian PCM variants
+    "pcm_alaw", "pcm_mulaw",                             # A-law / mu-law
+    "adpcm_ms",                                          # MS ADPCM (0x02)
+    "adpcm_ima_wav",                                     # IMA ADPCM (0x11)
+}
+# IEEE Float codecs that are explicitly unsupported by the firmware
+WAV_FLOAT_CODECS = {"pcm_f32le", "pcm_f64le", "pcm_f32be", "pcm_f64be"}
+
+# Firmware copies tag strings into fixed-size SRAM arrays; overflow risks crash/corruption
+MAX_TAG_TEXT_LENGTH = 128
+
+# Max stereo channels for most formats (firmware rejects multichannel)
+MAX_CHANNELS_STEREO = 2
+# WMA v2 explicitly supports 6-channel 5.1 via 0x3F channel mask
+WMA_V2_MAX_CHANNELS = 6
 
 _SCAN_RESULT_CACHE_LIMIT = 20000
 _SCAN_RESULT_CACHE: OrderedDict[str, tuple[int, int, dict[str, str]]] = OrderedDict()
@@ -852,6 +872,116 @@ def _validate_codec_for_container(extension: str, codec_name: str | None) -> tup
     return True, ""
 
 
+def _validate_channel_count(extension: str, channels: int | None, codec_name: str | None) -> tuple[str, str]:
+    """Validate that channel count is within firmware limits.
+    
+    Most formats: max 2 (stereo). WMA v2 allows up to 6 (5.1).
+    Returns (status, reason).
+    """
+    if channels is None:
+        return "UNKNOWN", "Channel count unavailable"
+    if channels <= MAX_CHANNELS_STEREO:
+        return "COMPATIBLE", f"{channels}ch"
+
+    # WMA v2 explicitly supports 6ch 5.1 surround
+    if extension == ".wma" and codec_name and "wmav2" in codec_name.lower():
+        if channels <= WMA_V2_MAX_CHANNELS:
+            return "COMPATIBLE", f"{channels}ch (WMA v2 5.1 supported)"
+        return "INCOMPATIBLE", f"{channels}ch exceeds WMA v2 max of {WMA_V2_MAX_CHANNELS}"
+
+    return "INCOMPATIBLE", f"Multichannel audio ({channels}ch) unsupported — firmware limited to stereo"
+
+
+def _validate_wav_codec(codec_name: str | None) -> tuple[str, str]:
+    """Validate WAV format tag / codec is supported by firmware.
+    
+    Supported: Integer PCM (0x01), MS ADPCM (0x02), IMA ADPCM (0x11), Extensible (0xFFFE).
+    Unsupported: IEEE Float (0x03) and others.
+    """
+    if codec_name is None:
+        return "UNKNOWN", "WAV codec unavailable"
+
+    codec_lower = codec_name.lower().strip()
+
+    if codec_lower in WAV_FLOAT_CODECS:
+        return "INCOMPATIBLE", f"IEEE Float WAV ({codec_name}) unsupported — firmware only decodes integer PCM"
+
+    if codec_lower in WAV_SUPPORTED_CODECS:
+        return "COMPATIBLE", f"{codec_name}"
+
+    # Unknown codec — may or may not work
+    return "UNKNOWN", f"Unrecognized WAV codec '{codec_name}' — may not be supported"
+
+
+def _validate_dsd_bit_depth(bit_depth: int | None) -> tuple[str, str]:
+    """Validate DSD bit depth is 1-bit as required by firmware.
+    
+    Firmware explicitly checks `bit_depth < 8` and rejects files declaring 8+ bit depth.
+    """
+    if bit_depth is None:
+        return "COMPATIBLE", "DSD (1-bit assumed)"
+    if bit_depth < 8:
+        return "COMPATIBLE", f"DSD {bit_depth}-bit"
+    return "INCOMPATIBLE", f"DSD file declares {bit_depth}-bit depth — firmware rejects bit_depth ≥ 8"
+
+
+def _check_id3v2_utf8_encoding(path: Path) -> tuple[str, str]:
+    """Check if ID3v2 text frames use UTF-8 encoding (0x03).
+    
+    The firmware has no UTF-8 decoder — UTF-8 encoded tags render as garbage.
+    Safe encodings: ISO-8859-1 (0x00), UTF-16 BOM (0x01), UTF-16BE (0x02).
+    """
+    try:
+        tags = ID3(str(path))
+    except Exception:
+        return "COMPATIBLE", ""
+
+    utf8_frames = []
+    for frame_id, frame in tags.items():
+        # Text frames (T* except TXXX) and TXXX have an .encoding attribute
+        if hasattr(frame, "encoding"):
+            # mutagen encoding: 0=Latin-1, 1=UTF-16, 2=UTF-16BE, 3=UTF-8
+            if frame.encoding == 3:
+                utf8_frames.append(frame_id)
+
+    if utf8_frames:
+        if len(utf8_frames) <= 3:
+            names = ", ".join(utf8_frames)
+            return "INCOMPATIBLE", f"UTF-8 encoded tags ({names}) — device has no UTF-8 decoder, text will display as garbage"
+        return "INCOMPATIBLE", f"{len(utf8_frames)} tags use UTF-8 encoding — device has no UTF-8 decoder, text will display as garbage"
+
+    return "COMPATIBLE", ""
+
+
+def _check_tag_string_lengths(path: Path) -> tuple[str, str]:
+    """Check if any core tag string exceeds the firmware's 128-character SRAM buffer.
+    
+    Tags longer than MAX_TAG_TEXT_LENGTH risk buffer overflow and UI corruption.
+    """
+    try:
+        audio = mutagen.File(str(path), easy=True)
+        if audio is None or audio.tags is None:
+            return "COMPATIBLE", ""
+    except Exception:
+        return "COMPATIBLE", ""
+
+    check_keys = ["title", "artist", "album", "albumartist", "genre"]
+    long_tags = []
+    for key in check_keys:
+        values = audio.tags.get(key)
+        if values:
+            for val in (values if isinstance(values, list) else [values]):
+                text = str(val)
+                if len(text) > MAX_TAG_TEXT_LENGTH:
+                    long_tags.append(f"{key} ({len(text)} chars)")
+
+    if long_tags:
+        if len(long_tags) == 1:
+            return "INCOMPATIBLE", f"Tag exceeds {MAX_TAG_TEXT_LENGTH}-char firmware limit: {long_tags[0]}"
+        return "INCOMPATIBLE", f"{len(long_tags)} tags exceed {MAX_TAG_TEXT_LENGTH}-char firmware limit: {', '.join(long_tags)}"
+
+    return "COMPATIBLE", ""
+
 
 def _evaluate_music_file_with_cache(path: Path, target_dir: Path) -> dict[str, str]:
     cache_key = str(path)
@@ -919,6 +1049,16 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
             "stream_count": "-",
             "filename_compatibility": "-",
             "filename_compatibility_reason": "-",
+            "channel_compatibility": "-",
+            "channel_compatibility_reason": "-",
+            "wav_codec_compatibility": "-",
+            "wav_codec_compatibility_reason": "-",
+            "dsd_bitdepth_compatibility": "-",
+            "dsd_bitdepth_compatibility_reason": "-",
+            "tag_encoding_compatibility": "-",
+            "tag_encoding_compatibility_reason": "-",
+            "tag_length_compatibility": "-",
+            "tag_length_compatibility_reason": "-",
         }
 
     if not extension:
@@ -1169,18 +1309,87 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
 
     channels_text = "-"
     stream_count_text = "-"
+    channels_raw = None
+    codec_name_for_channel_check = None
     if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS):
-        channels_text = str(metadata.get("channels") or "-")
+        channels_raw = metadata.get("channels")
+        channels_text = str(channels_raw or "-")
         stream_count_text = str(metadata.get("total_stream_count") or "-")
+        codec_name_for_channel_check = metadata.get("codec_name")
 
+    # ── Channel count validation ───────────────────────────────────────
+    channel_comp_status = "-"
+    channel_comp_reason = "-"
+    if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS) and category != "skipped":
+        channel_comp_status, channel_comp_reason = _validate_channel_count(
+            extension, channels_raw, codec_name_for_channel_check
+        )
+
+    # ── WAV codec / format tag validation ──────────────────────────────
+    wav_codec_comp_status = "-"
+    wav_codec_comp_reason = "-"
+    if extension == ".wav" and category != "skipped":
+        wav_codec_comp_status, wav_codec_comp_reason = _validate_wav_codec(
+            metadata.get("codec_name") if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS) else None
+        )
+
+    # ── DSD bit depth validation ───────────────────────────────────────
+    dsd_bitdepth_comp_status = "-"
+    dsd_bitdepth_comp_reason = "-"
+    if extension in DSD_FORMATS and category != "skipped":
+        dsd_bit_depth = metadata.get("bit_depth") if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS) else None
+        dsd_bitdepth_comp_status, dsd_bitdepth_comp_reason = _validate_dsd_bit_depth(dsd_bit_depth)
+
+    # ── Tag encoding validation (ID3v2 UTF-8 check) ───────────────────
+    tag_encoding_comp_status = "-"
+    tag_encoding_comp_reason = "-"
+    ID3_FORMATS = {".mp3", ".mp1", ".mp2", ".wav", ".dsf"}
+    if extension in ID3_FORMATS and category != "skipped":
+        tag_encoding_comp_status, tag_encoding_comp_reason = _check_id3v2_utf8_encoding(path)
+
+    # ── Tag string length validation ──────────────────────────────────
+    tag_length_comp_status = "-"
+    tag_length_comp_reason = "-"
+    if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS) and category != "skipped":
+        tag_length_comp_status, tag_length_comp_reason = _check_tag_string_lengths(path)
+
+    # ── Metadata bloat check (sanitizer) ──────────────────────────────
     from .metadata_sanitizer import MetadataSanitizer
     sanitizer = MetadataSanitizer()
     meta_ok, meta_reason = sanitizer.check_metadata(path)
     metadata_comp_status = "COMPATIBLE" if meta_ok else "INCOMPATIBLE"
-    
+
+    # ── Aggregate sub-check failures into overall status ──────────────
+    # Any INCOMPATIBLE sub-check escalates overall status to LIMITED
+    sub_check_failures = []
+    if channel_comp_status == "INCOMPATIBLE":
+        sub_check_failures.append(channel_comp_reason)
+    if wav_codec_comp_status == "INCOMPATIBLE":
+        sub_check_failures.append(wav_codec_comp_reason)
+    if dsd_bitdepth_comp_status == "INCOMPATIBLE":
+        sub_check_failures.append(dsd_bitdepth_comp_reason)
+    if tag_encoding_comp_status == "INCOMPATIBLE":
+        sub_check_failures.append(tag_encoding_comp_reason)
+    if tag_length_comp_status == "INCOMPATIBLE":
+        sub_check_failures.append(tag_length_comp_reason)
     if not meta_ok:
-        status = "LIMITED"
-        reason = reason + ("; " if reason else "") + meta_reason
+        sub_check_failures.append(meta_reason)
+
+    # Channel/WAV codec/DSD bit depth failures are hard blockers → UNSUPPORTED
+    hard_blocker = (
+        channel_comp_status == "INCOMPATIBLE"
+        or wav_codec_comp_status == "INCOMPATIBLE"
+        or dsd_bitdepth_comp_status == "INCOMPATIBLE"
+    )
+
+    if sub_check_failures and category not in ("skipped", "unsupported"):
+        if hard_blocker:
+            status = "UNSUPPORTED"
+            category = "unsupported"
+        else:
+            status = "LIMITED"
+        reason = reason + ("; " if reason else "") + "; ".join(sub_check_failures)
+
     return {
         "file": relative_path,
         "extension": extension_display,
@@ -1199,7 +1408,18 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         "filename_compatibility_reason": filename_comp_reason,
         "metadata_compatibility": metadata_comp_status,
         "metadata_compatibility_reason": meta_reason,
+        "channel_compatibility": channel_comp_status,
+        "channel_compatibility_reason": channel_comp_reason,
+        "wav_codec_compatibility": wav_codec_comp_status,
+        "wav_codec_compatibility_reason": wav_codec_comp_reason,
+        "dsd_bitdepth_compatibility": dsd_bitdepth_comp_status,
+        "dsd_bitdepth_compatibility_reason": dsd_bitdepth_comp_reason,
+        "tag_encoding_compatibility": tag_encoding_comp_status,
+        "tag_encoding_compatibility_reason": tag_encoding_comp_reason,
+        "tag_length_compatibility": tag_length_comp_status,
+        "tag_length_compatibility_reason": tag_length_comp_reason,
     }
+
 
 
 class MusicCompatibilityScanWorker(QObject):

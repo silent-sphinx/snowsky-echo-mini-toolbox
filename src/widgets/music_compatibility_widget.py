@@ -1,5 +1,5 @@
 import os
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QModelIndex
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -21,6 +21,7 @@ from ..models.music_compatibility_model import (
     CompColumn
 )
 from .stat_card import StatCard
+from .grouped_header_view import GroupedHeaderView
 from PySide6.QtWidgets import QStyledItemDelegate
 from PySide6.QtGui import QBrush
 
@@ -38,6 +39,7 @@ class MusicCompatibilityWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._data_model = None
+        self._last_checked_row = None
         self._init_models()
         self._init_ui()
         self._connect_signals()
@@ -182,12 +184,20 @@ class MusicCompatibilityWidget(QWidget):
         self._table.setSortingEnabled(True)
         self._table.verticalHeader().setVisible(False)
         self._table.verticalHeader().setDefaultSectionSize(28)
-        header_view = self._table.horizontalHeader()
+        
+        header_view = GroupedHeaderView(self._table)
+        self._table.setHorizontalHeader(header_view)
         header_view.setStretchLastSection(True)
-        header_view.setSectionsMovable(True)
+        # Add groups based on CompColumn organization
+        # Column 0 is the ungrouped Checkbox column
+        header_view.add_group("Track Info", 1, 3)
+        header_view.add_group("Status", 4, 5)
+        header_view.add_group("Properties", 6, 14)
+        header_view.add_group("Validation", 15, 21)
         
         self._delegate = HighlightDelegate(self._table)
-        self._table.setItemDelegate(self._delegate)
+        for col in range(1, CompColumn.COUNT):
+            self._table.setItemDelegateForColumn(col, self._delegate)
         
         data_layout.addWidget(self._table, 1)
 
@@ -197,6 +207,37 @@ class MusicCompatibilityWidget(QWidget):
     def _connect_signals(self) -> None:
         self._search_input.textChanged.connect(self._on_search_changed)
         self._status_combo.currentTextChanged.connect(self._on_status_filter_changed)
+        self._table.clicked.connect(self._on_table_clicked)
+
+    def _on_table_clicked(self, index: QModelIndex) -> None:
+        if index.column() == CompColumn.CHECK:
+            from PySide6.QtWidgets import QApplication
+            from PySide6.QtCore import Qt
+            modifiers = QApplication.keyboardModifiers()
+            is_shift = bool(modifiers & Qt.ShiftModifier)
+            
+            state = self._proxy_model.data(index, Qt.CheckStateRole)
+            is_checked = state in (Qt.Checked, Qt.CheckState.Checked, 2)
+            new_val = Qt.Checked if is_checked else Qt.Unchecked
+            current_row = index.row()
+            
+            # Handle shift-click range selection
+            if is_shift and getattr(self, '_last_checked_row', None) is not None:
+                start = min(self._last_checked_row, current_row)
+                end = max(self._last_checked_row, current_row)
+                for r in range(start, end + 1):
+                    if r != current_row:
+                        idx = self._proxy_model.index(r, CompColumn.CHECK)
+                        self._proxy_model.setData(idx, new_val, Qt.CheckStateRole)
+            else:
+                # Handle toggling all selected rows
+                selection = self._table.selectionModel()
+                if selection.isSelected(index):
+                    for selected_index in selection.selectedRows(CompColumn.CHECK):
+                        if selected_index.row() != current_row:
+                            self._proxy_model.setData(selected_index, new_val, Qt.CheckStateRole)
+                            
+            self._last_checked_row = current_row
 
     def _on_search_changed(self, text: str) -> None:
         self._proxy_model.set_search_query(text)
@@ -210,12 +251,27 @@ class MusicCompatibilityWidget(QWidget):
         self._source_model.update_data(tracks, data_model.root_path)
         
         header = self._table.horizontalHeader()
-        header.resizeSection(CompColumn.TITLE, 200)
-        header.resizeSection(CompColumn.ARTIST, 150)
-        header.resizeSection(CompColumn.ALBUM, 150)
-        header.resizeSection(CompColumn.STATUS, 100)
-        header.resizeSection(CompColumn.REASON, 300)
+        font_metrics = header.fontMetrics()
         
+        # Hardcoded baseline widths to ensure content fits
+        baselines = {
+            CompColumn.CHECK: 30,
+            CompColumn.TITLE: 200, CompColumn.ARTIST: 150, CompColumn.ALBUM: 150,
+            CompColumn.STATUS: 100, CompColumn.REASON: 300,
+            CompColumn.EXTENSION: 80, CompColumn.CODEC: 100, CompColumn.SAMPLE_RATE: 100,
+            CompColumn.BIT_DEPTH: 90, CompColumn.CHANNELS: 80, CompColumn.DSD: 80,
+            CompColumn.BLOCK_SIZE: 100, CompColumn.STREAMS: 80, CompColumn.EQ: 110,
+            CompColumn.CHANNEL_COMPAT: 110, CompColumn.WAV_CODEC: 110, CompColumn.DSD_BITDEPTH: 130,
+            CompColumn.TAG_ENCODING: 130, CompColumn.TAG_LENGTH: 110, CompColumn.FILENAME: 110,
+            CompColumn.METADATA: 110
+        }
+        
+        for col in range(CompColumn.COUNT):
+            if col in baselines:
+                # Add 45px padding to account for QSS padding, borders, and the sorting arrow
+                text_width = font_metrics.horizontalAdvance(CompColumn.HEADERS[col].upper()) + 45
+                header.resizeSection(col, max(baselines[col], text_width))
+
         QTimer.singleShot(100, self._update_stats)
 
     def _update_stats(self) -> None:

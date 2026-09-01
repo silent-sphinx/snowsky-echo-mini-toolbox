@@ -221,7 +221,7 @@ def global_stylesheet() -> str:
             background-color: {Colours.BG_HOVER};
         }}
         
-        QTreeView::indicator {{
+        QTreeView::indicator, QTableView::indicator {{
             width: 14px;
             height: 14px;
             border-radius: 0px;
@@ -230,13 +230,13 @@ def global_stylesheet() -> str:
             margin-right: 6px;
         }}
 
-        QTreeView::indicator:checked {{
+        QTreeView::indicator:checked, QTableView::indicator:checked {{
             background-color: {Colours.ACCENT};
             border-color: {Colours.ACCENT};
             image: url({tick_path});
         }}
 
-        QTreeView::indicator:hover {{
+        QTreeView::indicator:hover, QTableView::indicator:hover {{
             border-color: {Colours.BORDER_STRONG};
         }}
 
