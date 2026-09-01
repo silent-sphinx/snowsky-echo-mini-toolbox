@@ -11,3 +11,8 @@ SUPPORTED_MEDIA_EXTENSIONS = {
 
 # Maximum track limit supported by the Snowsky Echo Mini firmware hardware
 MAX_TRACK_LIMIT = 8192
+
+try:
+    from .generated_version import APP_VERSION
+except ImportError:
+    APP_VERSION = "beta"

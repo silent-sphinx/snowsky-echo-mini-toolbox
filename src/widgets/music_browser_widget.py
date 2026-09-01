@@ -1,4 +1,6 @@
 import os
+import subprocess
+import json
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush, QPixmap, QImage
 from PySide6.QtWidgets import (
@@ -19,7 +21,10 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QPushButton,
     QMessageBox,
-    QLineEdit
+    QLineEdit,
+    QMenu,
+    QDialog,
+    QInputDialog
 )
 from PySide6.QtGui import QBrush
 
@@ -38,6 +43,96 @@ class HighlightDelegate(QStyledItemDelegate):
             # Prevent base class from trying to draw the background again
             option.backgroundBrush = QBrush(Qt.NoBrush)
         super().paint(painter, option, index)
+
+
+class FfprobeDialog(QDialog):
+    def __init__(self, filepath: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Debug: {os.path.basename(filepath)}")
+        self.resize(700, 500)
+        
+        layout = QVBoxLayout(self)
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background-color: {Colours.BG_DARKEST};
+                color: {Colours.TEXT_PRIMARY};
+                font-family: monospace;
+                font-size: 12px;
+                border: 1px solid {Colours.BORDER_STRONG};
+            }}
+        """)
+        layout.addWidget(self.text_edit)
+        
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-hide_banner", "-v", "verbose", "-show_format", "-show_streams", filepath],
+                capture_output=True, text=True, check=False
+            )
+            output = result.stdout + "\n" + result.stderr
+            self.text_edit.setPlainText(output.strip())
+        except Exception as e:
+            self.text_edit.setPlainText(f"Failed to run ffprobe:\n{e}\n\nPlease ensure ffprobe is installed and accessible.")
+
+
+class StreamsDialog(QDialog):
+    def __init__(self, filepath: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Streams: {os.path.basename(filepath)}")
+        self.resize(800, 400)
+        
+        layout = QVBoxLayout(self)
+        
+        self.table = QTableWidget()
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table)
+        
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_streams", "-print_format", "json", filepath],
+                capture_output=True, text=True, check=False
+            )
+            data = json.loads(result.stdout)
+            streams = data.get("streams", [])
+            
+            audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+            if not audio_streams:
+                audio_streams = streams
+                
+            if not audio_streams:
+                self.table.setColumnCount(1)
+                self.table.setRowCount(1)
+                self.table.setItem(0, 0, QTableWidgetItem("No streams found or failed to parse."))
+                return
+                
+            columns = []
+            for stream in audio_streams:
+                for k in stream.keys():
+                    if k not in columns and not isinstance(stream[k], dict):
+                        columns.append(k)
+                        
+            priority_cols = ["index", "codec_type", "codec_name", "profile", "sample_rate", "channels", "bit_rate"]
+            ordered_cols = [c for c in priority_cols if c in columns]
+            ordered_cols += [c for c in columns if c not in priority_cols]
+            
+            self.table.setColumnCount(len(ordered_cols))
+            self.table.setHorizontalHeaderLabels(ordered_cols)
+            self.table.setRowCount(len(audio_streams))
+            
+            for row_idx, stream in enumerate(audio_streams):
+                for col_idx, col_name in enumerate(ordered_cols):
+                    val = str(stream.get(col_name, ""))
+                    self.table.setItem(row_idx, col_idx, QTableWidgetItem(val))
+                    
+            self.table.resizeColumnsToContents()
+            
+        except Exception as e:
+            self.table.setColumnCount(1)
+            self.table.setRowCount(1)
+            self.table.setItem(0, 0, QTableWidgetItem(f"Error loading streams:\n{e}"))
 
 
 class MusicBrowserWidget(QWidget):
@@ -93,6 +188,10 @@ class MusicBrowserWidget(QWidget):
         self._tree.setAnimated(True)
         self._tree.setSortingEnabled(True)
         self._tree.setSelectionMode(QTreeView.ExtendedSelection)
+        
+        self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_context_menu)
+        
         self._tree_model = QStandardItemModel()
         self._tree.setModel(self._tree_model)
         self._tree.selectionModel().selectionChanged.connect(self._on_selection_changed)
@@ -239,6 +338,83 @@ class MusicBrowserWidget(QWidget):
         self._stack.addWidget(data_page)
         
         layout.addWidget(self._stack)
+        
+    def _on_context_menu(self, position) -> None:
+        index = self._tree.indexAt(position)
+        if not index.isValid():
+            return
+            
+        item = self._tree_model.itemFromIndex(index)
+        filepath = item.data(Qt.UserRole)
+        
+        if not filepath or not os.path.isfile(filepath):
+            return
+            
+        menu = QMenu()
+        
+        is_music_file = not filepath.lower().endswith(".lrc")
+        
+        debug_action = None
+        streams_action = None
+        
+        if is_music_file:
+            debug_action = menu.addAction("Debug")
+            streams_action = menu.addAction("View Streams")
+            menu.addSeparator()
+            
+        rename_action = menu.addAction("Rename")
+        delete_action = menu.addAction("Delete")
+        
+        action = menu.exec(self._tree.viewport().mapToGlobal(position))
+        
+        if action is None:
+            return
+            
+        if debug_action and action == debug_action:
+            dialog = FfprobeDialog(filepath, self)
+            dialog.exec()
+        elif streams_action and action == streams_action:
+            dialog = StreamsDialog(filepath, self)
+            dialog.exec()
+        elif action == rename_action:
+            old_name = os.path.basename(filepath)
+            new_name, ok = QInputDialog.getText(self, "Rename", "New file name:", QLineEdit.Normal, old_name)
+            if ok and new_name and new_name != old_name:
+                dir_path = os.path.dirname(filepath)
+                new_filepath = os.path.join(dir_path, new_name)
+                try:
+                    os.rename(filepath, new_filepath)
+                    item.setText(new_name)
+                    item.setData(new_filepath, Qt.UserRole)
+                    if self._data_model and filepath in self._data_model.tracks:
+                        track = self._data_model.tracks.pop(filepath)
+                        track.filepath = new_filepath
+                        track.filename = new_name
+                        self._data_model.tracks[new_filepath] = track
+                    if self._tree.selectionModel().isSelected(index):
+                        self._populate_details(self._data_model.get_track(new_filepath))
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Failed to rename file:\n{e}")
+        elif action == delete_action:
+            reply = QMessageBox.question(
+                self, "Delete", 
+                f"Are you sure you want to delete '{os.path.basename(filepath)}'?\nThis cannot be undone.", 
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                try:
+                    os.remove(filepath)
+                    parent = item.parent()
+                    if parent:
+                        parent.removeRow(item.row())
+                    else:
+                        self._tree_model.invisibleRootItem().removeRow(item.row())
+                        
+                    if self._data_model and filepath in self._data_model.tracks:
+                        del self._data_model.tracks[filepath]
+                    self._clear_details()
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Failed to delete file:\n{e}")
         
     def set_processing_state(self, is_processing: bool) -> None:
         """Toggle between loading view and data view."""

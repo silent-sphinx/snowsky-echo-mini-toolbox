@@ -24,8 +24,10 @@ from .widgets.metadata_manager import MetadataManager
 from .widgets.drive_info_widget import DriveInfoWidget
 from .widgets.drive_selector_panel import DriveSelectorPanel
 from .widgets.music_browser_widget import MusicBrowserWidget
+from .widgets.music_compatibility_widget import MusicCompatibilityWidget
 from .threads.drive_scanner import DriveScannerThread
 from .theme import Colours
+from .constants import APP_VERSION
 
 
 class MainWindow(QMainWindow):
@@ -73,17 +75,22 @@ class MainWindow(QMainWindow):
         self._drive_info = DriveInfoWidget()
         self._tabs.addTab(self._drive_info, "Drive Information")
         
-        # Index 1: Metadata Browser
+        # Index 1: Music Compatibility
+        self._music_compatibility = MusicCompatibilityWidget()
+        self._tabs.addTab(self._music_compatibility, "Music Compatibility")
+        
+        # Index 2: File Browser (formerly Music Browser)
+        self._music_browser = MusicBrowserWidget()
+        self._tabs.addTab(self._music_browser, "File Browser")
+        
+        # Index 3: Metadata Browser
         self._metadata_manager = MetadataManager()
         self._tabs.addTab(self._metadata_manager, "Metadata Browser")
         
-        # Index 2: Music Browser
-        self._music_browser = MusicBrowserWidget()
-        self._tabs.addTab(self._music_browser, "Music Browser")
-        
-        # Add placeholders for future tabs
+        # Index 4: Album Art (placeholder)
         self._tabs.addTab(QWidget(), "Album Art")
-        self._tabs.addTab(QWidget(), "Music Compatibility")
+        
+        # Index 5: Lyrics Manager (placeholder)
         self._tabs.addTab(QWidget(), "Lyrics Manager")
         
         tab_layout.addWidget(self._tabs)
@@ -125,10 +132,24 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 0, 16, 0)
         layout.setSpacing(16)
 
-        # Title
+        # Title and Version
+        title_container = QWidget()
+        title_layout = QHBoxLayout(title_container)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(8)
+        title_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
         title = QLabel("Snowsky Echo Mini Toolbox")
         title.setStyleSheet(f"color: {Colours.TEXT_PRIMARY}; font-size: 18px; font-weight: 800; letter-spacing: -0.5px;")
-        layout.addWidget(title)
+        
+        version_lbl = QLabel(f"{APP_VERSION}")
+        version_lbl.setStyleSheet(f"color: {Colours.TEXT_TERTIARY}; font-size: 11px; font-weight: 600;")
+        version_lbl.setAlignment(Qt.AlignBottom)
+        
+        title_layout.addWidget(title)
+        title_layout.addWidget(version_lbl)
+        
+        layout.addWidget(title_container)
         
         # Spacer to push progress to center
         layout.addStretch()
@@ -276,10 +297,11 @@ class MainWindow(QMainWindow):
         
         # Pass the unified data model to the child tabs
         self._music_browser.populate_data(data_model)
+        self._music_compatibility.populate_data(data_model)
         
-        # Update the DriveInfoWidget track count
+        # Update the DriveInfoWidget track count and charts
         if self._tabs.isTabVisible(0):
-            self._drive_info._on_track_count_finished(len(data_model.tracks))
+            self._drive_info.populate_data(data_model)
 
     def _set_processing_state(self, is_processing: bool, status_text: str = "Processing data...") -> None:
         """Toggle the global loading state and UI indicators."""
@@ -294,4 +316,5 @@ class MainWindow(QMainWindow):
         # Notify child tabs that need to show empty/loading states
         self._metadata_manager.set_processing_state(is_processing)
         self._music_browser.set_processing_state(is_processing)
+        self._music_compatibility.set_processing_state(is_processing)
 

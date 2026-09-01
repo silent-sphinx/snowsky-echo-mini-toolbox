@@ -516,6 +516,29 @@ def global_stylesheet() -> str:
             color: {Colours.TEXT_PRIMARY};
         }}
 
+        /* ── Menu ─────────────────────────────────────────── */
+        QMenu {{
+            background-color: {Colours.BG_ELEVATED};
+            color: {Colours.TEXT_PRIMARY};
+            border: 1px solid {Colours.BORDER_DEFAULT};
+            padding: 4px 0px;
+        }}
+
+        QMenu::item {{
+            padding: 6px 32px 6px 24px;
+        }}
+
+        QMenu::item:selected {{
+            background-color: {Colours.ACCENT_MUTED};
+            color: #FFFFFF;
+        }}
+
+        QMenu::separator {{
+            height: 1px;
+            background-color: {Colours.TEXT_TERTIARY};
+            margin: 4px 8px;
+        }}
+
         /* ── Splitter ─────────────────────────────────────── */
         QSplitter::handle {{
             background-color: {Colours.BORDER_SUBTLE};

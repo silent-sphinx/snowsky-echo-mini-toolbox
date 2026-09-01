@@ -34,6 +34,23 @@ class TrackMetadata:
     # All raw tags extracted
     all_tags: Dict[str, str] = field(default_factory=dict)
     
+    # Compatibility Metrics
+    comp_status: str = "UNKNOWN"
+    comp_category: str = "unknown"
+    comp_reason: str = ""
+    comp_eq: str = "-"
+    comp_codec: str = "-"
+    comp_sample_rate: str = "-"
+    comp_bit_depth: str = "-"
+    comp_block_size: str = "-"
+    comp_dsd_profile: str = "-"
+    comp_channels: str = "-"
+    comp_streams: str = "-"
+    comp_filename: str = "-"
+    comp_filename_reason: str = "-"
+    comp_metadata: str = "-"
+    comp_metadata_reason: str = "-"
+    
     @property
     def display_size(self) -> str:
         if self.size_bytes < 1024 * 1024:

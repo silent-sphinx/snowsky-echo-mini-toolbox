@@ -12,7 +12,7 @@ from ..constants import SUPPORTED_MEDIA_EXTENSIONS
 from ..models.drive_data import DriveDataModel, TrackMetadata
 
 
-def extract_metadata_worker(filepath: str) -> TrackMetadata:
+def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
     """Extract metadata from a single file. (Runs in separate processes)"""
     filename = os.path.basename(filepath)
     _, ext = os.path.splitext(filename)
@@ -103,6 +103,31 @@ def extract_metadata_worker(filepath: str) -> TrackMetadata:
                     if uslts:
                         meta.lyrics_text = uslts[0].text
 
+    # Run ffprobe compatibility check
+    if not filepath.lower().endswith(".lrc"):
+        try:
+            from pathlib import Path
+            from ..utils.music_compatibility import evaluate_music_file
+            
+            comp_result = evaluate_music_file(Path(filepath), Path(root_path))
+            meta.comp_status = comp_result.get("status", "UNKNOWN")
+            meta.comp_category = comp_result.get("category", "unknown")
+            meta.comp_reason = comp_result.get("reason", "")
+            meta.comp_eq = comp_result.get("eq_compatibility", "-")
+            meta.comp_codec = comp_result.get("codec", "-")
+            meta.comp_sample_rate = comp_result.get("sample_rate", "-")
+            meta.comp_bit_depth = comp_result.get("bit_depth", "-")
+            meta.comp_block_size = comp_result.get("block_size", "-")
+            meta.comp_dsd_profile = comp_result.get("dsd_profile", "-")
+            meta.comp_channels = comp_result.get("channels", "-")
+            meta.comp_streams = comp_result.get("stream_count", "-")
+            meta.comp_filename = comp_result.get("filename_compatibility", "-")
+            meta.comp_filename_reason = comp_result.get("filename_compatibility_reason", "-")
+            meta.comp_metadata = comp_result.get("metadata_compatibility", "-")
+            meta.comp_metadata_reason = comp_result.get("metadata_compatibility_reason", "-")
+        except Exception as e:
+            print(f"Compatibility scan failed for {filepath}: {e}")
+
     return meta
 
 
@@ -152,7 +177,7 @@ class DriveScannerThread(QThread):
         
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks
-            future_to_path = {executor.submit(extract_metadata_worker, path): path for path in supported_files}
+            future_to_path = {executor.submit(extract_metadata_worker, path, self.path): path for path in supported_files}
             
             # Process as they complete
             for i, future in enumerate(concurrent.futures.as_completed(future_to_path)):
