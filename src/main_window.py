@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 import os
 
 from .widgets.metadata_manager import MetadataManager
+from .widgets.album_art_widget import AlbumArtWidget
 from .widgets.drive_info_widget import DriveInfoWidget
 from .widgets.drive_selector_panel import DriveSelectorPanel
 from .widgets.music_browser_widget import MusicBrowserWidget
@@ -87,8 +88,9 @@ class MainWindow(QMainWindow):
         self._metadata_manager = MetadataManager()
         self._tabs.addTab(self._metadata_manager, "Metadata Browser")
         
-        # Index 4: Album Art (placeholder)
-        self._tabs.addTab(QWidget(), "Album Art")
+        # Index 4: Album Art
+        self._album_art = AlbumArtWidget()
+        self._tabs.addTab(self._album_art, "Album Art")
         
         # Index 5: Lyrics Manager (placeholder)
         self._tabs.addTab(QWidget(), "Lyrics Manager")
@@ -298,6 +300,7 @@ class MainWindow(QMainWindow):
         # Pass the unified data model to the child tabs
         self._music_browser.populate_data(data_model)
         self._music_compatibility.populate_data(data_model)
+        self._album_art.populate_data(data_model)
         
         # Update the DriveInfoWidget track count and charts
         if self._tabs.isTabVisible(0):
@@ -317,4 +320,5 @@ class MainWindow(QMainWindow):
         self._metadata_manager.set_processing_state(is_processing)
         self._music_browser.set_processing_state(is_processing)
         self._music_compatibility.set_processing_state(is_processing)
+        self._album_art.set_processing_state(is_processing)
 

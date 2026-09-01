@@ -1,5 +1,4 @@
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -11,7 +10,27 @@ from mutagen.mp4 import MP4, MP4Cover
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
 from PySide6.QtGui import QImage, QImageWriter
 
+from .album_art_validation import (
+    MAX_ART_DIMENSION,
+    image_size_from_bytes,
+    is_progressive_jpeg,
+    jpeg_scan_type,
+    read_embedded_album_art,
+)
+
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "AlbumArtInfo",
+    "MAX_ART_DIMENSION",
+    "extract_album_art",
+    "image_size_from_bytes",
+    "is_progressive_jpeg",
+    "jpeg_scan_type",
+    "read_embedded_album_art",
+    "to_non_progressive_jpeg",
+    "write_embedded_album_art",
+]
 
 
 @dataclass
@@ -22,38 +41,6 @@ class AlbumArtInfo:
     width: int
     height: int
     is_progressive: bool
-
-
-def is_progressive_jpeg(data: bytes) -> bool:
-    """Detect if a JPEG image uses a progressive scan."""
-    if not data.startswith(b'\xff\xd8'):
-        return False
-        
-    i = 2
-    while i < len(data):
-        if data[i] != 0xFF:
-            # Reached entropy coded data or invalid marker, break
-            break
-        marker = data[i+1]
-        
-        if marker == 0xC0: # SOF0 (Baseline)
-            return False
-        if marker == 0xC2: # SOF2 (Progressive)
-            return True
-            
-        # Markers with no payload
-        if marker in (0x01, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9):
-            i += 2
-            continue
-            
-        # Other markers have a 2-byte length directly following them (includes length itself)
-        if i + 3 < len(data):
-            length = (data[i+2] << 8) + data[i+3]
-            i += 2 + length
-        else:
-            break
-            
-    return False
 
 
 def extract_album_art(filepath: str) -> Optional[AlbumArtInfo]:
@@ -109,80 +96,6 @@ def extract_album_art(filepath: str) -> Optional[AlbumArtInfo]:
     )
 
 
-def image_size_from_bytes(data: bytes) -> tuple[int, int] | None:
-    if not data or len(data) < 10:
-        return None
-
-    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
-        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
-
-    if data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
-        return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
-
-    if data.startswith(b"BM") and len(data) >= 26:
-        return int.from_bytes(data[18:22], "little"), int.from_bytes(data[22:26], "little")
-
-    if data.startswith(b"\xFF\xD8"):
-        index = 2
-        while index + 9 < len(data):
-            if data[index] != 0xFF:
-                index += 1
-                continue
-            marker = data[index + 1]
-            index += 2
-            if marker in (0xC0, 0xC1, 0xC2, 0xC3):
-                height = int.from_bytes(data[index + 3 : index + 5], "big")
-                width = int.from_bytes(data[index + 5 : index + 7], "big")
-                return width, height
-            if index + 1 < len(data):
-                segment_len = int.from_bytes(data[index : index + 2], "big")
-                index += segment_len
-            else:
-                break
-
-    return None
-
-
-def read_embedded_album_art(path: Path) -> tuple[bytes | None, str]:
-    try:
-        audio = mutagen.File(path)
-    except Exception as exc:
-        return None, f"Tag read failed: {exc}"
-
-    if not audio or not getattr(audio, "tags", None):
-        return None, "No embedded art"
-
-    if isinstance(audio, FLAC):
-        pictures = getattr(audio, "pictures", [])
-        if pictures:
-            picture = pictures[0]
-            mime = getattr(picture, "mime", "image/unknown") or "image/unknown"
-            return bytes(picture.data), mime
-
-    try:
-        apic_frames = audio.tags.getall("APIC")
-        if apic_frames:
-            frame = apic_frames[0]
-            mime = getattr(frame, "mime", "image/unknown") or "image/unknown"
-            return bytes(frame.data), mime
-    except (AttributeError, TypeError, ValueError):
-        logger.debug("Failed reading ID3 APIC album art from %s", path, exc_info=True)
-
-    if isinstance(audio, MP4):
-        covr = audio.tags.get("covr")
-        if covr:
-            cover = covr[0]
-            mime = "image/unknown"
-            if isinstance(cover, MP4Cover):
-                if cover.imageformat == MP4Cover.FORMAT_JPEG:
-                    mime = "image/jpeg"
-                elif cover.imageformat == MP4Cover.FORMAT_PNG:
-                    mime = "image/png"
-            return bytes(cover), mime
-
-    return None, "No embedded art"
-
-
 def to_non_progressive_jpeg(data: bytes, quality: int = 90) -> bytes | None:
     if not data:
         return None
@@ -192,10 +105,10 @@ def to_non_progressive_jpeg(data: bytes, quality: int = 90) -> bytes | None:
     if image.isNull():
         return None
 
-    if image.width() > 1000 or image.height() > 1000:
+    if image.width() > MAX_ART_DIMENSION or image.height() > MAX_ART_DIMENSION:
         image = image.scaled(
-            1000,
-            1000,
+            MAX_ART_DIMENSION,
+            MAX_ART_DIMENSION,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )

@@ -63,7 +63,28 @@ class TrackMetadata:
     comp_tag_encoding_reason: str = "-"
     comp_tag_length: str = "-"
     comp_tag_length_reason: str = "-"
-    
+
+    # Album Art Metrics
+    art_status: str = "UNKNOWN"
+    art_reason: str = ""
+    art_format: str = "-"
+    art_scan_type: str = "-"
+    art_resolution: str = "-"
+    art_width: int = 0
+    art_height: int = 0
+    art_size: str = "-"
+    art_source: str = "-"
+    art_format_compat: str = "-"
+    art_format_compat_reason: str = "-"
+    art_scan_compat: str = "-"
+    art_scan_compat_reason: str = "-"
+    art_resolution_compat: str = "-"
+    art_resolution_compat_reason: str = "-"
+    art_metadata_status: str = "-"
+
+    # Album Art UI State (separate from is_checked used by Music Compatibility)
+    art_is_checked: bool = False
+
     @property
     def display_size(self) -> str:
         if self.size_bytes < 1024 * 1024:

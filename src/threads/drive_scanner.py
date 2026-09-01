@@ -138,6 +138,17 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
         except Exception as e:
             print(f"Compatibility scan failed for {filepath}: {e}")
 
+        # Album art validation (also authoritative for has_album_art, since it
+        # covers MP4 covr atoms that the tag pass above does not read).
+        try:
+            from pathlib import Path
+            from ..utils.album_art_planner import apply_album_art_result
+            from ..utils.album_art_validation import evaluate_album_art
+
+            apply_album_art_result(meta, evaluate_album_art(Path(filepath)))
+        except Exception as e:
+            print(f"Album art scan failed for {filepath}: {e}")
+
     return meta
 
 
