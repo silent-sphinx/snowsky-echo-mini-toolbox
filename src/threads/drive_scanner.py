@@ -3,6 +3,7 @@ import mutagen
 from mutagen.flac import FLAC
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, SYLT, USLT, TXXX
+from mutagen.mp4 import MP4
 import multiprocessing
 import concurrent.futures
 from PySide6.QtCore import QThread, Signal
@@ -78,7 +79,37 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
             # Check for pictures
             if audio.pictures:
                 meta.has_album_art = True
-                
+
+        elif isinstance(audio, MP4):
+            def _mp4_tag(atom: str) -> str:
+                values = audio.tags.get(atom) if audio.tags else None
+                if not values:
+                    return ""
+                first = values[0]
+                return str(first) if not isinstance(first, bytes) else first.decode("utf-8", "replace")
+
+            meta.title = _mp4_tag("\xa9nam") or meta.title
+            meta.artist = _mp4_tag("\xa9ART") or meta.artist
+            meta.album = _mp4_tag("\xa9alb") or meta.album
+            meta.album_artist = _mp4_tag("aART")
+            meta.genre = _mp4_tag("\xa9gen") or meta.genre
+            meta.year = _mp4_tag("\xa9day") or meta.year
+
+            trkn = audio.tags.get("trkn") if audio.tags else None
+            if trkn:
+                try:
+                    meta.track_num = str(trkn[0][0])
+                except (IndexError, TypeError, ValueError):
+                    pass
+
+            if audio.tags and audio.tags.get("covr"):
+                meta.has_album_art = True
+
+            lyrics = _mp4_tag("\xa9lyr")
+            if lyrics:
+                meta.has_lyrics = True
+                meta.lyrics_text = lyrics
+
         elif audio.tags:
             # Try generic dict access
             try:
@@ -102,6 +133,26 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
                     uslts = audio.tags.getall("USLT")
                     if uslts:
                         meta.lyrics_text = uslts[0].text
+
+        # Album artist drives album grouping for artwork lookups. FLAC uses a
+        # Vorbis comment, ID3 uses TPE2, and MP4 was already handled above.
+        if not meta.album_artist:
+            from ..utils.tag_normalization import first_tag, tag_or_empty
+
+            if isinstance(audio, FLAC):
+                meta.album_artist = tag_or_empty(audio.get("albumartist", [""])[0])
+            elif audio.tags is not None and hasattr(audio.tags, "getall"):
+                try:
+                    tpe2 = audio.tags.getall("TPE2")
+                    if tpe2:
+                        meta.album_artist = tag_or_empty(str(tpe2[0]))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+
+            if not meta.album_artist:
+                meta.album_artist = first_tag(
+                    meta.all_tags, "albumartist", "album artist", "album_artist", "TPE2", "aART"
+                )
 
     # Run ffprobe compatibility check
     if not filepath.lower().endswith(".lrc"):

@@ -13,6 +13,8 @@ import mutagen
 from mutagen.flac import FLAC
 from mutagen.mp4 import MP4, MP4Cover
 
+from .tag_normalization import tag_or_empty
+
 logger = logging.getLogger(__name__)
 
 MAX_ART_DIMENSION = 1000
@@ -174,8 +176,10 @@ def _metadata_status(path: Path) -> str:
         return "-"
 
     try:
-        artist = (audio.get("artist", [""]) or [""])[0]
-        album = (audio.get("album", [""]) or [""])[0]
+        artist = tag_or_empty((audio.get("artist", [""]) or [""])[0])
+        album = tag_or_empty((audio.get("album", [""]) or [""])[0])
+        if not artist:
+            artist = tag_or_empty((audio.get("albumartist", [""]) or [""])[0])
     except Exception:
         return "Tag Read Error"
 

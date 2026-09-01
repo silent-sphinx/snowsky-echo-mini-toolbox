@@ -12,6 +12,7 @@ from PySide6.QtGui import QImage, QImageWriter
 
 from .album_art_validation import (
     MAX_ART_DIMENSION,
+    NON_ARTWORK_EXTENSIONS,
     image_size_from_bytes,
     is_progressive_jpeg,
     jpeg_scan_type,
@@ -28,6 +29,7 @@ __all__ = [
     "is_progressive_jpeg",
     "jpeg_scan_type",
     "read_embedded_album_art",
+    "supports_artwork_write",
     "to_non_progressive_jpeg",
     "write_embedded_album_art",
 ]
@@ -131,6 +133,30 @@ def to_non_progressive_jpeg(data: bytes, quality: int = 90) -> bytes | None:
     return out_data if isinstance(out_data, bytes) else bytes(out_data)
 
 
+def supports_artwork_write(path: Path) -> bool:
+    """Report whether embedded artwork can be written to this file."""
+    if Path(path).suffix.lower() in NON_ARTWORK_EXTENSIONS:
+        return False
+
+    try:
+        audio = mutagen.File(path)
+    except Exception:
+        return False
+
+    if audio is None:
+        return False
+
+    if isinstance(audio, (FLAC, MP4)):
+        return True
+
+    tags = getattr(audio, "tags", None)
+    if tags is not None and hasattr(tags, "add") and hasattr(tags, "delall"):
+        return True
+
+    # An empty ID3-capable container can still gain tags on write.
+    return callable(getattr(audio, "add_tags", None))
+
+
 def write_embedded_album_art(path: Path, jpeg_data: bytes) -> tuple[bool, str]:
     try:
         audio = mutagen.File(path)
@@ -165,6 +191,17 @@ def write_embedded_album_art(path: Path, jpeg_data: bytes) -> tuple[bool, str]:
             return False, f"Failed to write FLAC artwork: {exc}"
 
     tags = getattr(audio, "tags", None)
+    if tags is None and not isinstance(audio, MP4):
+        # Files that never had artwork often have no tag container yet.
+        try:
+            add_tags = getattr(audio, "add_tags", None)
+            if callable(add_tags):
+                add_tags()
+            tags = getattr(audio, "tags", None)
+        except (AttributeError, OSError, TypeError, ValueError) as exc:
+            logger.debug("Failed adding tags for %s: %s", path, exc)
+            tags = None
+
     if tags is not None and hasattr(tags, "add") and hasattr(tags, "delall"):
         try:
             apic_frames = tags.getall("APIC") if hasattr(tags, "getall") else []

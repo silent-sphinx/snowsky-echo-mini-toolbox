@@ -22,6 +22,7 @@ class TrackMetadata:
     title: str = "Unknown Title"
     artist: str = "Unknown Artist"
     album: str = "Unknown Album"
+    album_artist: str = ""
     genre: str = ""
     year: str = ""
     track_num: str = ""

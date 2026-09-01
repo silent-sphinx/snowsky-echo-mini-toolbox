@@ -27,8 +27,12 @@ from ..models.album_art_model import (
     ArtColumn,
 )
 from ..threads.album_art_fix import AlbumArtFixWorker
+from ..threads.album_art_download import AlbumArtApplyWorker, AlbumArtLookupWorker
+from ..utils.album_art_download import AlbumArtLookupClient
+from ..utils.album_art_download_planner import build_album_groups
 from ..utils.album_art_planner import apply_album_art_result
 from ..utils.album_art_validation import evaluate_album_art
+from .album_art_download_dialog import AlbumArtDownloadDialog
 from .album_art_fix_dialog import AlbumArtFixDialog
 from .stat_card import StatCard
 from .grouped_header_view import GroupedHeaderView
@@ -54,6 +58,12 @@ class AlbumArtWidget(QWidget):
         self._fix_thread: QThread | None = None
         self._fix_worker: AlbumArtFixWorker | None = None
         self._fix_progress: QProgressDialog | None = None
+        self._download_busy = False
+        self._download_thread: QThread | None = None
+        self._download_worker = None
+        self._download_progress: QProgressDialog | None = None
+        self._lookup_client: AlbumArtLookupClient | None = None
+        self._pending_skipped = []
         self._init_models()
         self._init_ui()
         self._connect_signals()
@@ -88,10 +98,25 @@ class AlbumArtWidget(QWidget):
         self._convert_btn.setEnabled(False)
         self._convert_btn.setMinimumHeight(34)
 
+        self._download_btn = QPushButton("Download Missing Artwork")
+        self._download_btn.setEnabled(False)
+        self._download_btn.setVisible(False)
+        self._download_btn.setMinimumHeight(34)
+        self._download_btn.setToolTip(
+            "Look up covers on MusicBrainz for the selected tracks that have no artwork."
+        )
+
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(8)
+        button_row.addWidget(self._convert_btn)
+        button_row.addWidget(self._download_btn)
+        button_row.addStretch(1)
+
         title_layout.addWidget(title)
         title_layout.addWidget(subtitle)
         title_layout.addSpacing(10)
-        title_layout.addWidget(self._convert_btn)
+        title_layout.addLayout(button_row)
         title_layout.addStretch()
 
         h_layout.addWidget(title_container)
@@ -222,19 +247,26 @@ class AlbumArtWidget(QWidget):
         self._status_combo.currentTextChanged.connect(self._on_status_filter_changed)
         self._table.clicked.connect(self._on_table_clicked)
         self._convert_btn.clicked.connect(self._open_fix_dialog)
+        self._download_btn.clicked.connect(self._start_lookup)
         self._source_model.dataChanged.connect(self._on_source_data_changed)
 
     def _checked_tracks(self) -> list[TrackMetadata]:
         return [track for track in self._source_model.tracks() if track.art_is_checked]
 
     def _update_convert_button_state(self) -> None:
-        has_checked = bool(self._checked_tracks())
-        self._convert_btn.setEnabled(
-            has_checked
-            and not self._fix_busy
-            and self._data_model is not None
+        checked = self._checked_tracks()
+        ready = (
+            self._data_model is not None
             and self._stack.currentIndex() == 1
+            and not self._fix_busy
+            and not self._download_busy
         )
+        has_checked = bool(checked)
+        has_missing_checked = any(track.art_status == "MISSING" for track in checked)
+
+        self._convert_btn.setEnabled(has_checked and ready)
+        self._download_btn.setVisible(has_checked)
+        self._download_btn.setEnabled(ready and has_missing_checked)
 
     def _on_source_data_changed(self, top_left: QModelIndex, bottom_right: QModelIndex, roles=None) -> None:
         if top_left.column() > ArtColumn.CHECK or bottom_right.column() < ArtColumn.CHECK:
@@ -459,6 +491,297 @@ class AlbumArtWidget(QWidget):
     def _on_fix_failed(self, error: str) -> None:
         self._finish_fix_ui()
         QMessageBox.warning(self, "Conversion Failed", error)
+
+    # ── download flow ───────────────────────────────────────────
+
+    def _start_lookup(self) -> None:
+        if self._data_model is None or self._download_busy:
+            return
+
+        checked = self._checked_tracks()
+        missing = [track for track in checked if track.art_status == "MISSING"]
+        if not missing:
+            QMessageBox.information(
+                self,
+                "Nothing To Download",
+                "Tick one or more rows with missing artwork first.",
+            )
+            return
+
+        groups, skipped = build_album_groups(missing, self._data_model.root_path)
+        if not groups:
+            detail = ""
+            if skipped:
+                reasons = sorted({item.reason for item in skipped})
+                detail = "\n\n" + "\n".join(f"- {reason}" for reason in reasons)
+            QMessageBox.information(
+                self,
+                "Nothing To Download",
+                "None of the selected tracks can be looked up." + detail,
+            )
+            return
+
+        self._pending_skipped = skipped
+        self._lookup_client = AlbumArtLookupClient()
+
+        progress = QProgressDialog(
+            f"Searching {len(groups)} album(s) on MusicBrainz...",
+            "Cancel",
+            0,
+            len(groups),
+            self,
+        )
+        progress.setWindowTitle("Download Missing Artwork")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+        QApplication.processEvents()
+
+        self._download_progress = progress
+        self._download_busy = True
+        self._update_convert_button_state()
+
+        thread = QThread(self)
+        worker = AlbumArtLookupWorker(groups, client=self._lookup_client)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_download_progress)
+        worker.finished.connect(self._on_lookup_finished)
+        worker.cancelled.connect(self._on_lookup_cancelled)
+        worker.failed.connect(self._on_download_failed)
+
+        worker.finished.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_download_refs)
+
+        progress.canceled.connect(self._cancel_download)
+        self._download_thread = thread
+        self._download_worker = worker
+        thread.start()
+
+    @Slot(object)
+    def _on_lookup_finished(self, payload_obj) -> None:
+        payload = payload_obj if isinstance(payload_obj, dict) else {}
+        groups = payload.get("groups") or []
+        found = int(payload.get("found") or 0)
+
+        self._finish_download_ui()
+
+        if not groups:
+            return
+
+        if not found:
+            QMessageBox.information(
+                self,
+                "No Covers Found",
+                "No cover art was found for the selected albums. "
+                "You can edit the search terms and retry from the review window.",
+            )
+
+        self._open_download_dialog(groups)
+
+    @Slot(object)
+    def _on_lookup_cancelled(self, payload_obj) -> None:
+        self._finish_download_ui()
+        QMessageBox.information(self, "Search Cancelled", "Album cover search was cancelled.")
+
+    def _open_download_dialog(self, groups) -> None:
+        if self._data_model is None or self._lookup_client is None:
+            return
+
+        # The lookup worker is being torn down; stop the client consulting its
+        # cancellation flag while the dialog reuses the client for previews.
+        self._lookup_client.set_cancel_check(None)
+
+        dialog = AlbumArtDownloadDialog(
+            groups,
+            self._pending_skipped,
+            self._data_model.root_path,
+            self._lookup_client,
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        candidates = dialog.candidates()
+        if not candidates:
+            QMessageBox.information(
+                self,
+                "Nothing To Apply",
+                "No albums with a selected cover were confirmed.",
+            )
+            return
+
+        self._start_download_apply(
+            candidates=candidates,
+            quality=dialog.quality,
+            dry_run=dialog.dry_run,
+            backup_root=dialog.backup_root,
+        )
+
+    def _start_download_apply(
+        self,
+        *,
+        candidates: list[dict[str, object]],
+        quality: int,
+        dry_run: bool,
+        backup_root: Path | None,
+    ) -> None:
+        target_path = Path(self._data_model.root_path).resolve()
+        total_files = sum(len(c.get("filepaths") or []) for c in candidates)
+        title = (
+            f"Previewing artwork for {len(candidates)} album(s)..." if dry_run
+            else f"Applying artwork to {total_files} file(s) across {len(candidates)} album(s)..."
+        )
+
+        progress = QProgressDialog(title, "Cancel", 0, len(candidates), self)
+        progress.setWindowTitle("Download Missing Artwork")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+        QApplication.processEvents()
+
+        self._download_progress = progress
+        self._download_busy = True
+        self._update_convert_button_state()
+
+        thread = QThread(self)
+        worker = AlbumArtApplyWorker(
+            target_path=target_path,
+            candidates=candidates,
+            quality=quality,
+            dry_run=dry_run,
+            backup_root=backup_root,
+            client=self._lookup_client,
+        )
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_download_progress)
+        worker.finished.connect(self._on_download_finished)
+        worker.cancelled.connect(self._on_download_cancelled)
+        worker.failed.connect(self._on_download_failed)
+
+        worker.finished.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_download_refs)
+
+        progress.canceled.connect(self._cancel_download)
+        self._download_thread = thread
+        self._download_worker = worker
+        thread.start()
+
+    def _cancel_download(self) -> None:
+        if self._download_worker is not None:
+            self._download_worker.request_cancel()
+        if self._download_progress is not None:
+            self._download_progress.setLabelText("Cancelling...")
+
+    def _clear_download_refs(self) -> None:
+        self._download_worker = None
+        self._download_thread = None
+
+    @Slot(int, int, str)
+    def _on_download_progress(self, processed: int, total: int, detail: str) -> None:
+        progress = self._download_progress
+        if progress is None:
+            return
+        try:
+            progress.setRange(0, max(total, 1))
+            progress.setValue(min(processed, max(total, 1)))
+            progress.setLabelText(detail)
+        except RuntimeError:
+            self._download_progress = None
+
+    def _finish_download_ui(self) -> None:
+        self._download_busy = False
+        worker = self._download_worker
+        if worker is not None:
+            try:
+                worker.progress.disconnect(self._on_download_progress)
+            except (RuntimeError, TypeError):
+                pass
+        progress = self._download_progress
+        self._download_progress = None
+        if progress is not None:
+            progress.blockSignals(True)
+            progress.close()
+        self._update_convert_button_state()
+
+    @Slot(object)
+    def _on_download_finished(self, payload_obj) -> None:
+        payload = payload_obj if isinstance(payload_obj, dict) else {}
+        written = int(payload.get("written") or 0)
+        failed = int(payload.get("failed") or 0)
+        planned = int(payload.get("planned") or 0)
+        albums = int(payload.get("total_albums") or 0)
+        dry_run = bool(payload.get("dry_run"))
+        backup_root = str(payload.get("backup_root") or "")
+        failures = payload.get("failures") or []
+        processed_paths = payload.get("processed_paths") or []
+
+        self._finish_download_ui()
+
+        if dry_run:
+            summary = (
+                f"Dry run complete. Files that would receive artwork: {planned} "
+                f"across {albums} album(s)."
+            )
+            if failed:
+                preview = "\n".join(str(item) for item in failures[:15])
+                QMessageBox.warning(self, "Dry Run Completed With Errors", f"{summary}\n\nFailures:\n{preview}")
+            else:
+                QMessageBox.information(self, "Dry Run Completed", summary)
+            return
+
+        self._refresh_processed_tracks(processed_paths)
+
+        summary = (
+            f"Artwork download complete. Files updated: {written} | Failed: {failed} "
+            f"(across {albums} album(s))"
+        )
+        if backup_root:
+            summary += f"\nBackups saved to: {backup_root}"
+
+        if failed:
+            preview = "\n".join(str(item) for item in failures[:15])
+            QMessageBox.warning(self, "Download Completed With Errors", f"{summary}\n\nFailures:\n{preview}")
+        else:
+            QMessageBox.information(self, "Download Completed", summary)
+
+    @Slot(object)
+    def _on_download_cancelled(self, payload_obj) -> None:
+        payload = payload_obj if isinstance(payload_obj, dict) else {}
+        written = int(payload.get("written") or 0)
+        failed = int(payload.get("failed") or 0)
+        failures = payload.get("failures") or []
+        processed_paths = payload.get("processed_paths") or []
+
+        self._finish_download_ui()
+        self._refresh_processed_tracks(processed_paths)
+
+        message = f"Artwork download cancelled. Files updated: {written} | Failed: {failed}"
+        if failures:
+            preview = "\n".join(str(item) for item in failures[:10])
+            QMessageBox.warning(self, "Download Cancelled", f"{message}\n\nFailures:\n{preview}")
+        else:
+            QMessageBox.information(self, "Download Cancelled", message)
+
+    @Slot(str)
+    def _on_download_failed(self, error: str) -> None:
+        self._finish_download_ui()
+        QMessageBox.warning(self, "Download Failed", error)
 
     def _on_table_clicked(self, index: QModelIndex) -> None:
         if index.column() == ArtColumn.CHECK:
