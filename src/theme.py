@@ -328,6 +328,12 @@ def global_stylesheet() -> str:
             background-color: {Colours.ACCENT};
         }}
 
+        QPushButton#accentButton:disabled {{
+            background-color: {Colours.BG_SURFACE};
+            border-color: {Colours.BORDER_SUBTLE};
+            color: {Colours.TEXT_DISABLED};
+        }}
+
         /* ── Combo Box ────────────────────────────────────── */
         QComboBox {{
             background-color: {Colours.BG_SURFACE};
