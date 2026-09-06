@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
@@ -30,6 +31,7 @@ from .widgets.music_compatibility_widget import MusicCompatibilityWidget
 from .threads.drive_scanner import DriveScannerThread
 from .theme import Colours
 from .constants import APP_VERSION
+from .utils.volume import eject_volume, removable_volume_for_path
 
 
 class MainWindow(QMainWindow):
@@ -132,6 +134,26 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_scanner_thread') and self._scanner_thread.isRunning():
             self._scanner_thread.cancel()
             self._scanner_thread.wait()
+
+        volume = removable_volume_for_path(self._current_drive)
+        if volume:
+            root, name, device = volume
+            reply = QMessageBox.question(
+                self,
+                "Eject Drive",
+                f'Would you like to eject “{name}” before quitting?',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                ok, error = eject_volume(root, device)
+                if not ok:
+                    QMessageBox.warning(
+                        self,
+                        "Eject Failed",
+                        error or "The drive could not be unmounted.",
+                    )
+
         super().closeEvent(event)
 
     def _build_top_bar(self) -> QWidget:

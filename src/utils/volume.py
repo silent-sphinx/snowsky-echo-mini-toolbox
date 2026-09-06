@@ -10,6 +10,7 @@ import time
 
 
 _SYSTEM_ROOTS = {"/", "C:\\", "C:/"}
+_SYSTEM_VOLUME_NAMES = frozenset({"Macintosh HD", "Recovery", "Preboot", "Update", "VM"})
 
 
 def _subprocess_no_window_kwargs() -> dict[str, object]:
@@ -134,6 +135,38 @@ def _eject_linux(path: str, device: str) -> tuple[bool, str]:
             return True, ""
         last_error = _command_error(result, last_error)
     return False, last_error
+
+
+def is_ejectable_volume(root: str, name: str = "") -> bool:
+    """True when *root* is a non-system volume that can be safely ejected."""
+    if not root or _is_system_root(root):
+        return False
+    if name in _SYSTEM_VOLUME_NAMES:
+        return False
+    if root.startswith("/System/Volumes"):
+        return False
+    return True
+
+
+def removable_volume_for_path(path: str) -> tuple[str, str, str] | None:
+    """Return (root, name, device) if *path* lives on a removable volume."""
+    if not path:
+        return None
+
+    from PySide6.QtCore import QStorageInfo
+
+    info = QStorageInfo(path)
+    if not info.isValid() or not info.isReady():
+        return None
+
+    root = info.rootPath()
+    name = info.name() or os.path.basename(root.rstrip("\\/")) or root
+    if not is_ejectable_volume(root, name):
+        return None
+
+    raw = info.device()
+    device = bytes(raw).decode("utf-8", errors="ignore") if raw else ""
+    return root, name, device
 
 
 def eject_volume(path: str, device: str = "") -> tuple[bool, str]:

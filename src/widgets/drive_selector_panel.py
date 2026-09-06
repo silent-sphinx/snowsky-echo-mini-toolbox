@@ -7,6 +7,7 @@ It locks perfectly on top of the parent window by living inside it.
 
 import os
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal, QStorageInfo
+from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -249,9 +250,10 @@ class DriveSelectorPanel(QFrame):
 
     def eventFilter(self, obj, event):
         """Forward clicks on the eject button so the first press reaches it."""
-        if obj is self._list_widget.viewport() and event.type() in (
-            QEvent.MouseButtonPress,
-            QEvent.MouseButtonDblClick,
+        if (
+            obj is self._list_widget.viewport()
+            and isinstance(event, QMouseEvent)
+            and event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick)
         ):
             pos = event.position().toPoint()
             item = self._list_widget.itemAt(pos)
