@@ -96,9 +96,9 @@ class MainWindow(QMainWindow):
         self._metadata_manager = MetadataManager()
         self._tabs.addTab(self._metadata_manager, "Metadata Browser")
         
-        # Index 4: Album Art
+        # Index 4: Album Art Manager
         self._album_art = AlbumArtWidget()
-        self._tabs.addTab(self._album_art, "Album Art")
+        self._tabs.addTab(self._album_art, "Album Art Manager")
         
         # Index 5: Lyrics Manager
         self._lyrics_manager = LyricsManagerWidget()

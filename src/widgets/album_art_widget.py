@@ -34,6 +34,7 @@ from ..utils.album_art_planner import apply_album_art_result
 from ..utils.album_art_validation import evaluate_album_art
 from .album_art_download_dialog import AlbumArtDownloadDialog
 from .album_art_fix_dialog import AlbumArtFixDialog
+from .page_chrome import filter_toolbar, loading_page, page_header
 from .stat_card import StatCard
 from .grouped_header_view import GroupedHeaderView
 
@@ -78,21 +79,6 @@ class AlbumArtWidget(QWidget):
         layout.setContentsMargins(12, 12, 12, 8)
         layout.setSpacing(12)
 
-        header = QWidget()
-        h_layout = QHBoxLayout(header)
-        h_layout.setContentsMargins(0, 0, 0, 0)
-        h_layout.setSpacing(20)
-
-        title_container = QWidget()
-        title_layout = QVBoxLayout(title_container)
-        title_layout.setContentsMargins(0, 0, 0, 0)
-        title_layout.setSpacing(6)
-
-        title = QLabel("Album Art")
-        title.setStyleSheet(f"color: {Colours.TEXT_PRIMARY}; font-size: 16px; font-weight: bold;")
-        subtitle = QLabel("Validate and convert embedded artwork")
-        subtitle.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 13px;")
-
         self._convert_btn = QPushButton("Convert Selected Artwork")
         self._convert_btn.setObjectName("accentButton")
         self._convert_btn.setEnabled(False)
@@ -106,67 +92,24 @@ class AlbumArtWidget(QWidget):
             "Look up covers on MusicBrainz for the selected tracks that have no artwork."
         )
 
-        button_row = QHBoxLayout()
-        button_row.setContentsMargins(0, 0, 0, 0)
-        button_row.setSpacing(8)
-        button_row.addWidget(self._convert_btn)
-        button_row.addWidget(self._download_btn)
-        button_row.addStretch(1)
-
-        title_layout.addWidget(title)
-        title_layout.addWidget(subtitle)
-        title_layout.addSpacing(10)
-        title_layout.addLayout(button_row)
-        title_layout.addStretch()
-
-        h_layout.addWidget(title_container)
-        h_layout.addStretch(1)
-
-        stats_layout = QHBoxLayout()
-        stats_layout.setSpacing(10)
-
-        self._stat_total = StatCard("Total Scanned", Colours.STAT_TOTAL, self)
-        self._stat_compatible = StatCard("Compatible", Colours.STATUS_COMPATIBLE, self)
-        self._stat_incompatible = StatCard("Incompatible", Colours.STATUS_INCOMPATIBLE, self)
-        self._stat_missing = StatCard("Missing Artwork", Colours.STATUS_MISSING, self)
-        self._stat_oversized = StatCard("Oversized", Colours.STATUS_LIMITED, self)
-
-        stats_layout.addWidget(self._stat_total)
-        stats_layout.addWidget(self._stat_compatible)
-        stats_layout.addWidget(self._stat_incompatible)
-        stats_layout.addWidget(self._stat_missing)
-        stats_layout.addWidget(self._stat_oversized)
-
-        h_layout.addLayout(stats_layout)
-        layout.addWidget(header)
+        layout.addWidget(page_header(
+            "Album Art Manager",
+            "Validate and convert embedded artwork",
+            [self._convert_btn, self._download_btn],
+        ))
 
         self._stack = QStackedWidget()
-
-        loading_page = QWidget()
-        loading_layout = QVBoxLayout(loading_page)
-        loading_layout.setAlignment(Qt.AlignCenter)
-
-        load_lbl = QLabel("Hardware scan in progress.")
-        load_lbl.setStyleSheet(f"color: {Colours.TEXT_PRIMARY}; font-size: 20px; font-weight: 700;")
-        load_lbl.setAlignment(Qt.AlignCenter)
-
-        sub_lbl = QLabel("Artwork analysis running...")
-        sub_lbl.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 14px;")
-        sub_lbl.setAlignment(Qt.AlignCenter)
-
-        loading_layout.addWidget(load_lbl)
-        loading_layout.addWidget(sub_lbl)
-        self._stack.addWidget(loading_page)
+        self._stack.addWidget(loading_page(
+            "Hardware scan in progress.",
+            "Artwork analysis running...",
+        ))
 
         data_page = QWidget()
         data_layout = QVBoxLayout(data_page)
         data_layout.setContentsMargins(0, 0, 0, 0)
         data_layout.setSpacing(12)
 
-        toolbar_panel = QWidget()
-        toolbar = QHBoxLayout(toolbar_panel)
-        toolbar.setContentsMargins(0, 4, 0, 4)
-        toolbar.setSpacing(8)
+        toolbar_panel, toolbar = filter_toolbar()
 
         self._search_input = QLineEdit()
         self._search_input.setPlaceholderText("Search by status, artist, album, file name or artwork format…")
@@ -214,6 +157,22 @@ class AlbumArtWidget(QWidget):
         toolbar.addWidget(self._status_combo)
 
         data_layout.addWidget(toolbar_panel)
+
+        stats_layout = QHBoxLayout()
+        stats_layout.setSpacing(10)
+
+        self._stat_total = StatCard("Total Scanned", Colours.STAT_TOTAL, self)
+        self._stat_compatible = StatCard("Compatible", Colours.STATUS_COMPATIBLE, self)
+        self._stat_incompatible = StatCard("Incompatible", Colours.STATUS_INCOMPATIBLE, self)
+        self._stat_missing = StatCard("Missing Artwork", Colours.STATUS_MISSING, self)
+        self._stat_oversized = StatCard("Oversized", Colours.STATUS_LIMITED, self)
+
+        stats_layout.addWidget(self._stat_total)
+        stats_layout.addWidget(self._stat_compatible)
+        stats_layout.addWidget(self._stat_incompatible)
+        stats_layout.addWidget(self._stat_missing)
+        stats_layout.addWidget(self._stat_oversized)
+        data_layout.addLayout(stats_layout)
 
         self._table = QTableView()
         self._table.setModel(self._proxy_model)

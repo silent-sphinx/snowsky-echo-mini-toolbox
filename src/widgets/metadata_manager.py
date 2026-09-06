@@ -26,6 +26,7 @@ from ..models.metadata_table_model import Column, MetadataTableModel
 from ..theme import Colours
 from ..views.delegates import CodecBadgeDelegate, MissingFieldDelegate
 from ..views.metadata_table_view import MetadataTableView
+from .page_chrome import filter_toolbar, loading_page, page_header
 from .stat_card import StatCard
 
 
@@ -62,37 +63,17 @@ class MetadataManager(QWidget):
         layout.setContentsMargins(12, 12, 12, 8)
         layout.setSpacing(12)
 
-        # ── Header ──────────────────────────────────────────────
-        header = self._build_header()
-        layout.addWidget(header)
-
-        # ── Separator ───────────────────────────────────────────
-        sep = QFrame()
-        sep.setObjectName("separator")
-        sep.setFrameShape(QFrame.HLine)
-        sep.setFixedHeight(1)
-        layout.addWidget(sep)
+        layout.addWidget(page_header(
+            "Metadata Browser",
+            "Browse and manage audio file metadata across your library",
+        ))
 
         # ── Stacked Widget ──────────────────────────────────────
         self._stack = QStackedWidget()
-        
-        # Page 0: Loading State
-        loading_page = QWidget()
-        loading_layout = QVBoxLayout(loading_page)
-        loading_layout.setAlignment(Qt.AlignCenter)
-        
-        load_lbl = QLabel("Results will be ready soon.")
-        load_lbl.setStyleSheet(f"color: {Colours.TEXT_PRIMARY}; font-size: 20px; font-weight: 700;")
-        load_lbl.setAlignment(Qt.AlignCenter)
-        
-        sub_lbl = QLabel("Music is being processed...")
-        sub_lbl.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 14px;")
-        sub_lbl.setAlignment(Qt.AlignCenter)
-        
-        loading_layout.addWidget(load_lbl)
-        loading_layout.addWidget(sub_lbl)
-        
-        self._stack.addWidget(loading_page)
+        self._stack.addWidget(loading_page(
+            "Results will be ready soon.",
+            "Music is being processed...",
+        ))
         
         # Page 1: Data State
         data_page = QWidget()
@@ -133,30 +114,9 @@ class MetadataManager(QWidget):
         self._stack.addWidget(data_page)
         layout.addWidget(self._stack, 1)
 
-    def _build_header(self) -> QWidget:
-        """Build the section header with title and subtitle."""
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-
-        title = QLabel("Metadata Manager")
-        title.setObjectName("headerTitle")
-        layout.addWidget(title)
-
-        subtitle = QLabel("Browse and manage audio file metadata across your library")
-        subtitle.setObjectName("headerSubtitle")
-        layout.addWidget(subtitle)
-
-        return container
-
     def _build_toolbar(self) -> QWidget:
         """Build the search + filter toolbar panel."""
-        panel = QWidget()
-        panel.setObjectName("panelSection")
-        
-        toolbar = QHBoxLayout(panel)
-        toolbar.setContentsMargins(12, 8, 12, 8)
+        panel, toolbar = filter_toolbar()
         toolbar.setSpacing(12)
 
         # Search input
@@ -214,7 +174,6 @@ class MetadataManager(QWidget):
         stats_layout.addWidget(self._stat_title)
         stats_layout.addWidget(self._stat_artist)
         stats_layout.addWidget(self._stat_album)
-        stats_layout.addStretch(1)
 
         return stats_layout
 

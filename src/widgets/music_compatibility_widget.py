@@ -31,6 +31,7 @@ from ..threads.music_conversion import MusicConversionWorker
 from ..utils.music_compatibility import _resolve_ffmpeg_executable, evaluate_music_file
 from ..utils.music_conversion_planner import apply_compatibility_result
 from .music_conversion_dialog import MusicConversionDialog
+from .page_chrome import filter_toolbar, loading_page, page_header
 from .stat_card import StatCard
 from .grouped_header_view import GroupedHeaderView
 
@@ -69,80 +70,29 @@ class MusicCompatibilityWidget(QWidget):
         layout.setContentsMargins(12, 12, 12, 8)
         layout.setSpacing(12)
 
-        header = QWidget()
-        h_layout = QHBoxLayout(header)
-        h_layout.setContentsMargins(0, 0, 0, 0)
-        h_layout.setSpacing(20)
-
-        title_container = QWidget()
-        title_layout = QVBoxLayout(title_container)
-        title_layout.setContentsMargins(0, 0, 0, 0)
-        title_layout.setSpacing(6)
-
-        title = QLabel("Music Compatibility")
-        title.setStyleSheet(f"color: {Colours.TEXT_PRIMARY}; font-size: 16px; font-weight: bold;")
-        subtitle = QLabel("Check and convert unsupported media files")
-        subtitle.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 13px;")
-
         self._convert_btn = QPushButton("Convert Selected Incompatible Media")
         self._convert_btn.setObjectName("accentButton")
         self._convert_btn.setEnabled(False)
         self._convert_btn.setMinimumHeight(34)
 
-        title_layout.addWidget(title)
-        title_layout.addWidget(subtitle)
-        title_layout.addSpacing(10)
-        title_layout.addWidget(self._convert_btn)
-        title_layout.addStretch()
-
-        h_layout.addWidget(title_container)
-        h_layout.addStretch(1)
-
-        stats_layout = QHBoxLayout()
-        stats_layout.setSpacing(10)
-
-        self._stat_total = StatCard("Total Scanned", Colours.STAT_TOTAL, self)
-        self._stat_supported = StatCard("Supported", Colours.STATUS_SUPPORTED, self)
-        self._stat_limited = StatCard("Limited", Colours.STATUS_LIMITED, self)
-        self._stat_unsupported = StatCard("Unsupported", Colours.STATUS_UNSUPPORTED, self)
-        self._stat_no_eq = StatCard("No EQ Support", Colours.STATUS_INCOMPATIBLE, self)
-
-        stats_layout.addWidget(self._stat_total)
-        stats_layout.addWidget(self._stat_supported)
-        stats_layout.addWidget(self._stat_limited)
-        stats_layout.addWidget(self._stat_unsupported)
-        stats_layout.addWidget(self._stat_no_eq)
-
-        h_layout.addLayout(stats_layout)
-        layout.addWidget(header)
+        layout.addWidget(page_header(
+            "Music Compatibility",
+            "Check and convert unsupported media files",
+            [self._convert_btn],
+        ))
 
         self._stack = QStackedWidget()
-
-        loading_page = QWidget()
-        loading_layout = QVBoxLayout(loading_page)
-        loading_layout.setAlignment(Qt.AlignCenter)
-
-        load_lbl = QLabel("Hardware scan in progress.")
-        load_lbl.setStyleSheet(f"color: {Colours.TEXT_PRIMARY}; font-size: 20px; font-weight: 700;")
-        load_lbl.setAlignment(Qt.AlignCenter)
-
-        sub_lbl = QLabel("Deep ffprobe analysis running...")
-        sub_lbl.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 14px;")
-        sub_lbl.setAlignment(Qt.AlignCenter)
-
-        loading_layout.addWidget(load_lbl)
-        loading_layout.addWidget(sub_lbl)
-        self._stack.addWidget(loading_page)
+        self._stack.addWidget(loading_page(
+            "Hardware scan in progress.",
+            "Deep ffprobe analysis running...",
+        ))
 
         data_page = QWidget()
         data_layout = QVBoxLayout(data_page)
         data_layout.setContentsMargins(0, 0, 0, 0)
         data_layout.setSpacing(12)
 
-        toolbar_panel = QWidget()
-        toolbar = QHBoxLayout(toolbar_panel)
-        toolbar.setContentsMargins(0, 4, 0, 4)
-        toolbar.setSpacing(8)
+        toolbar_panel, toolbar = filter_toolbar()
 
         self._search_input = QLineEdit()
         self._search_input.setPlaceholderText("Search by status, artist, song name, file name or codec…")
@@ -188,6 +138,22 @@ class MusicCompatibilityWidget(QWidget):
         toolbar.addWidget(self._status_combo)
 
         data_layout.addWidget(toolbar_panel)
+
+        stats_layout = QHBoxLayout()
+        stats_layout.setSpacing(10)
+
+        self._stat_total = StatCard("Total Scanned", Colours.STAT_TOTAL, self)
+        self._stat_supported = StatCard("Supported", Colours.STATUS_SUPPORTED, self)
+        self._stat_limited = StatCard("Limited", Colours.STATUS_LIMITED, self)
+        self._stat_unsupported = StatCard("Unsupported", Colours.STATUS_UNSUPPORTED, self)
+        self._stat_no_eq = StatCard("No EQ Support", Colours.STATUS_INCOMPATIBLE, self)
+
+        stats_layout.addWidget(self._stat_total)
+        stats_layout.addWidget(self._stat_supported)
+        stats_layout.addWidget(self._stat_limited)
+        stats_layout.addWidget(self._stat_unsupported)
+        stats_layout.addWidget(self._stat_no_eq)
+        data_layout.addLayout(stats_layout)
 
         self._table = QTableView()
         self._table.setModel(self._proxy_model)
