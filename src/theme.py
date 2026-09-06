@@ -103,13 +103,56 @@ def colours_for_status(status: str | None) -> tuple[str, str] | tuple[None, None
 
 # ── Font Setup ──────────────────────────────────────────────────────────────
 
-FONT_FAMILY = "'Inter', 'SF Pro Display', 'Segoe UI', 'Helvetica Neue', 'Noto Sans', sans-serif"
-FONT_FAMILY_MONO = "'SF Mono', 'Cascadia Code', 'Fira Code', 'Consolas', monospace"
+_PREFERRED_UI_FONTS = (
+    "Inter",
+    "Segoe UI",          # Windows
+    "Helvetica Neue",    # macOS
+    "Helvetica",         # macOS
+    "Noto Sans",         # Fedora / many Linux desktops
+    "Ubuntu",            # Ubuntu
+    "Cantarell",         # GNOME
+    "DejaVu Sans",       # common Linux fallback
+    "Liberation Sans",   # common Linux fallback
+    "Arial",
+)
+_GENERIC_FONT_ALIASES = {
+    "sans-serif",
+    "sans serif",
+    "serif",
+    "monospace",
+    "cursive",
+    "fantasy",
+}
+
+
+def _is_real_font(name: str) -> bool:
+    return bool(name) and name.casefold() not in _GENERIC_FONT_ALIASES and QFontDatabase.hasFamily(name)
+
+
+def _first_installed_font(preferred: tuple[str, ...]) -> str:
+    """Return an installed UI font. Never use CSS generics such as sans-serif."""
+    for name in preferred:
+        if _is_real_font(name):
+            return name
+
+    system = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont).family()
+    if _is_real_font(system):
+        return system
+
+    for name in QFontDatabase.families():
+        if _is_real_font(name):
+            return name
+
+    return "Helvetica"
+
+
+def ui_font_family() -> str:
+    return f"'{_first_installed_font(_PREFERRED_UI_FONTS)}'"
 
 
 def setup_fonts() -> QFont:
     """Set up the application font. Returns the configured QFont."""
-    font = QFont("Inter")
+    font = QFont(_first_installed_font(_PREFERRED_UI_FONTS))
     font.setStyleStrategy(QFont.PreferAntialias)
     font.setHintingPreference(QFont.PreferNoHinting)
     font.setPointSize(13)
@@ -150,7 +193,7 @@ def global_stylesheet() -> str:
     return f"""
         /* ── Base ─────────────────────────────────────────── */
         * {{
-            font-family: {FONT_FAMILY};
+            font-family: {ui_font_family()};
         }}
 
         QMainWindow {{
