@@ -113,6 +113,7 @@ class MainWindow(QMainWindow):
         # ── In-App Modal Panel ──────────────────────────────────
         self._drive_panel = DriveSelectorPanel(central, current_path=self._current_drive)
         self._drive_panel.location_selected.connect(self._on_location_selected)
+        self._drive_panel.drive_ejected.connect(self._on_drive_ejected)
         self._drive_panel.hide()
 
     def resizeEvent(self, event) -> None:
@@ -255,6 +256,30 @@ class MainWindow(QMainWindow):
         
         self._drive_panel.show()
         self._drive_panel.raise_()
+
+    def _path_is_on_volume(self, path: str, volume_root: str) -> bool:
+        if not path or not volume_root:
+            return False
+        current = os.path.normcase(os.path.normpath(path))
+        root = os.path.normcase(os.path.normpath(volume_root))
+        if current == root:
+            return True
+        return current.startswith(root.rstrip(os.sep) + os.sep)
+
+    def _on_drive_ejected(self, path: str) -> None:
+        """Clear the active target if the ejected volume was in use."""
+        if not self._path_is_on_volume(self._current_drive, path):
+            return
+
+        if hasattr(self, '_scanner_thread') and self._scanner_thread.isRunning():
+            self._scanner_thread.cancel()
+            self._scanner_thread.wait()
+
+        self._current_drive = ""
+        self._drive_btn.setText("Select Target Drive...")
+        self._set_processing_state(False)
+        self._drive_panel._cancel_btn.setEnabled(False)
+        self._drive_panel._cancel_btn.setVisible(False)
 
     def _on_location_selected(self, path: str) -> None:
         """Handle a valid location selection from the in-app panel."""
