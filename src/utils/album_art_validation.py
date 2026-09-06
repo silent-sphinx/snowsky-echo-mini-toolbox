@@ -1,7 +1,7 @@
 """Embedded album art inspection and compatibility rules.
 
 This module must stay free of Qt imports: it runs inside the drive scanner's
-ProcessPoolExecutor workers.
+thread-pool workers.
 """
 
 from __future__ import annotations

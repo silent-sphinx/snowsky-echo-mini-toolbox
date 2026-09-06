@@ -138,29 +138,34 @@ class DriveDataModel:
         
     def update_metadata(self, filepath: str, new_tags: dict) -> None:
         """Update the in-memory metadata for a specific track after it's saved."""
+        from ..utils.metadata_writer import aliases_for_tag_key
+
         track = self.get_track(filepath)
         if not track:
             return
-            
-        # Update raw tags
+
         for k, v in new_tags.items():
-            track.all_tags[k] = str(v)
-            
-        # Re-sync primary attributes if they were updated
+            if v is None:
+                aliases = {alias.lower() for alias in aliases_for_tag_key(k)}
+                for existing in [key for key in track.all_tags if key.lower() in aliases]:
+                    del track.all_tags[existing]
+            else:
+                track.all_tags[k] = str(v)
+
         def _get_case_insensitive(tags_dict: dict, keys: list) -> str:
             for k in tags_dict:
                 if k.lower() in keys:
                     return tags_dict[k]
             return ""
 
-        track.title = _get_case_insensitive(track.all_tags, ["title", "tit2"]) or track.title
-        track.artist = _get_case_insensitive(track.all_tags, ["artist", "tpe1"]) or track.artist
-        track.album = _get_case_insensitive(track.all_tags, ["album", "talb"]) or track.album
-        track.genre = _get_case_insensitive(track.all_tags, ["genre", "tcon"]) or track.genre
-        
-        # Track number and Year require string manipulation
-        year = _get_case_insensitive(track.all_tags, ["year", "date", "tdrc"])
-        if year: track.year = year
-        
+        track.title = _get_case_insensitive(track.all_tags, ["title", "tit2"]) or "Unknown Title"
+        track.artist = _get_case_insensitive(track.all_tags, ["artist", "tpe1"]) or "Unknown Artist"
+        track.album = _get_case_insensitive(track.all_tags, ["album", "talb"]) or "Unknown Album"
+        track.album_artist = _get_case_insensitive(
+            track.all_tags, ["albumartist", "album artist", "album_artist", "tpe2"]
+        )
+        track.genre = _get_case_insensitive(track.all_tags, ["genre", "tcon"])
+        track.year = _get_case_insensitive(track.all_tags, ["year", "date", "tdrc"])
         track_num = _get_case_insensitive(track.all_tags, ["tracknumber", "track", "trck"])
-        if track_num: track.track_num = track_num
+        if track_num:
+            track.track_num = track_num

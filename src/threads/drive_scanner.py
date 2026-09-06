@@ -4,7 +4,6 @@ from mutagen.flac import FLAC
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, SYLT, USLT, TXXX
 from mutagen.mp4 import MP4
-import multiprocessing
 import concurrent.futures
 from PySide6.QtCore import QThread, Signal
 from typing import Optional
@@ -225,56 +224,73 @@ class DriveScannerThread(QThread):
 
     def run(self):
         data_model = DriveDataModel(self.path)
-        
-        # Phase 1: Fast walk to count files and collect paths
-        supported_files = []
-        for root, dirs, files in os.walk(self.path):
+
+        try:
+            # Phase 1: Collect supported media paths.
+            supported_files = []
+            last_emit_count = 0
+            self.progress_updated.emit(0, 0, "Discovering files...")
+            for root, dirs, files in os.walk(self.path):
+                if self._is_cancelled:
+                    return
+
+                # Exclude hidden directories from being traversed
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+
+                for file in files:
+                    if file.startswith('.'):
+                        continue
+                    ext = os.path.splitext(file)[1].lower()
+                    if ext in SUPPORTED_MEDIA_EXTENSIONS or ext == ".lrc":
+                        supported_files.append(os.path.join(root, file))
+
+                found = len(supported_files)
+                if found - last_emit_count >= 50:
+                    last_emit_count = found
+                    self.progress_updated.emit(0, 0, f"Discovering files: {found}")
+
             if self._is_cancelled:
                 return
-                
-            # Exclude hidden directories from being traversed
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-            
-            for file in files:
-                if file.startswith('.'):
-                    continue
-                ext = os.path.splitext(file)[1].lower()
-                if ext in SUPPORTED_MEDIA_EXTENSIONS or ext == ".lrc":
-                    supported_files.append(os.path.join(root, file))
-                    
-        total_files = len(supported_files)
-        
-        # Phase 2: Deep metadata extraction using multiprocessing
-        max_workers = max(1, multiprocessing.cpu_count() - 1)
-        
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_path = {executor.submit(extract_metadata_worker, path, self.path): path for path in supported_files}
-            
-            # Process as they complete
-            for i, future in enumerate(concurrent.futures.as_completed(future_to_path)):
-                if self._is_cancelled:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    return
-                    
-                filepath = future_to_path[future]
-                self.progress_updated.emit(i + 1, total_files, filepath)
-                
-                try:
-                    meta = future.result()
-                    data_model.add_track(meta)
-                except Exception as e:
-                    # Fallback to basic metadata if mutagen fails
-                    print(f"Error parsing {filepath}: {e}")
-                    filename = os.path.basename(filepath)
-                    _, ext = os.path.splitext(filename)
-                    size = os.path.getsize(filepath)
-                    meta = TrackMetadata(
-                        filepath=filepath,
-                        filename=filename,
-                        extension=ext.lower(),
-                        size_bytes=size
-                    )
-                    data_model.add_track(meta)
 
-        self.scan_finished.emit(data_model)
+            total_files = len(supported_files)
+            self.progress_updated.emit(0, total_files, "Starting analysis...")
+
+            # Threads, not processes: ProcessPoolExecutor deadlocks from QThread on macOS.
+            max_workers = max(1, (os.cpu_count() or 2) - 1)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_path = {
+                    executor.submit(extract_metadata_worker, path, self.path): path
+                    for path in supported_files
+                }
+
+                for i, future in enumerate(concurrent.futures.as_completed(future_to_path)):
+                    if self._is_cancelled:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        return
+
+                    filepath = future_to_path[future]
+                    self.progress_updated.emit(i + 1, total_files, filepath)
+
+                    try:
+                        meta = future.result()
+                        data_model.add_track(meta)
+                    except Exception as e:
+                        print(f"Error parsing {filepath}: {e}")
+                        filename = os.path.basename(filepath)
+                        _, ext = os.path.splitext(filename)
+                        size = os.path.getsize(filepath)
+                        meta = TrackMetadata(
+                            filepath=filepath,
+                            filename=filename,
+                            extension=ext.lower(),
+                            size_bytes=size
+                        )
+                        data_model.add_track(meta)
+
+            if not self._is_cancelled:
+                self.scan_finished.emit(data_model)
+        except Exception as e:
+            print(f"Drive scan failed: {e}")
+            if not self._is_cancelled:
+                self.scan_finished.emit(data_model)

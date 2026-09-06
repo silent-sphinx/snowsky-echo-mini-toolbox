@@ -1,7 +1,7 @@
 import os
 import subprocess
 import json
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Slot
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush, QPixmap, QImage
 from PySide6.QtWidgets import (
     QWidget,
@@ -24,7 +24,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QDialog,
-    QInputDialog
+    QInputDialog,
+    QProgressDialog
 )
 from PySide6.QtGui import QBrush
 
@@ -32,6 +33,10 @@ from ..theme import Colours
 from ..models.drive_data import DriveDataModel, TrackMetadata
 from ..utils.metadata_writer import save_metadata
 from ..utils.album_art import extract_album_art
+from ..threads.bulk_metadata import BulkMetadataWorker
+from .bulk_metadata_dialog import BulkMetadataDialog
+
+_NON_MUSIC_EXTENSIONS = {".lrc", ".cue"}
 
 
 class HighlightDelegate(QStyledItemDelegate):
@@ -149,6 +154,11 @@ class MusicBrowserWidget(QWidget):
         super().__init__(parent)
         self._data_model: DriveDataModel = None
         self._is_updating_checks = False
+        self._multi_tracks: list[TrackMetadata] = []
+        self._bulk_thread: QThread | None = None
+        self._bulk_worker: BulkMetadataWorker | None = None
+        self._bulk_progress: QProgressDialog | None = None
+        self._bulk_tags: dict[str, str | None] = {}
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -193,6 +203,7 @@ class MusicBrowserWidget(QWidget):
         self._tree.setAnimated(True)
         self._tree.setSortingEnabled(True)
         self._tree.setSelectionMode(QTreeView.ExtendedSelection)
+        self._tree.setSelectionBehavior(QTreeView.SelectItems)
         
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
@@ -335,8 +346,49 @@ class MusicBrowserWidget(QWidget):
         self._tabs.addTab(self._meta_tab, "Music Metadata")
         self._tabs.addTab(self._art_tab, "Album Art")
         self._tabs.addTab(self._lyrics_tab, "Lyrics")
-        
-        details_layout.addWidget(self._tabs)
+
+        multi_page = QWidget()
+        multi_outer = QVBoxLayout(multi_page)
+        multi_outer.setContentsMargins(24, 24, 24, 24)
+        multi_outer.addStretch(1)
+
+        multi_column = QWidget()
+        multi_column.setMaximumWidth(360)
+        multi_lyt = QVBoxLayout(multi_column)
+        multi_lyt.setContentsMargins(0, 0, 0, 0)
+        multi_lyt.setSpacing(12)
+
+        self._multi_count_lbl = QLabel()
+        self._multi_count_lbl.setAlignment(Qt.AlignCenter)
+        self._multi_count_lbl.setStyleSheet(
+            f"color: {Colours.TEXT_PRIMARY}; font-size: 20px; font-weight: 700;"
+        )
+        self._multi_prompt_lbl = QLabel("What would you like to do?")
+        self._multi_prompt_lbl.setAlignment(Qt.AlignCenter)
+        self._multi_prompt_lbl.setStyleSheet(
+            f"color: {Colours.TEXT_SECONDARY}; font-size: 14px;"
+        )
+
+        self._bulk_edit_btn = QPushButton("Bulk Edit Metadata")
+        self._bulk_edit_btn.setObjectName("accentButton")
+        self._bulk_edit_btn.setMinimumHeight(34)
+        self._bulk_edit_btn.clicked.connect(self._on_bulk_edit_metadata)
+
+        multi_lyt.addWidget(self._multi_count_lbl)
+        multi_lyt.addWidget(self._multi_prompt_lbl)
+        multi_lyt.addSpacing(8)
+        multi_lyt.addWidget(self._bulk_edit_btn)
+
+        multi_outer.addWidget(multi_column, 0, Qt.AlignHCenter)
+        multi_outer.addStretch(1)
+
+        self._details_stack = QStackedWidget()
+        blank_page = QWidget()
+        self._details_stack.addWidget(blank_page)
+        self._details_stack.addWidget(self._tabs)
+        self._details_stack.addWidget(multi_page)
+        self._details_stack.setCurrentIndex(0)
+        details_layout.addWidget(self._details_stack)
         
         splitter.addWidget(tree_container)
         splitter.addWidget(details_container)
@@ -402,8 +454,7 @@ class MusicBrowserWidget(QWidget):
                         track.filepath = new_filepath
                         track.filename = new_name
                         self._data_model.tracks[new_filepath] = track
-                    if self._tree.selectionModel().isSelected(index):
-                        self._populate_details(self._data_model.get_track(new_filepath))
+                    self._refresh_details_pane()
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Failed to rename file:\n{e}")
         elif action == delete_action:
@@ -423,7 +474,7 @@ class MusicBrowserWidget(QWidget):
                         
                     if self._data_model and filepath in self._data_model.tracks:
                         del self._data_model.tracks[filepath]
-                    self._clear_details()
+                    self._refresh_details_pane()
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Failed to delete file:\n{e}")
         
@@ -441,6 +492,7 @@ class MusicBrowserWidget(QWidget):
         
         root_item = self._tree_model.invisibleRootItem()
         self._build_tree(data_model.tree, root_item, data_model.root_path)
+        self._show_blank_details()
         
     def _build_tree(self, tree_dict: dict, parent_item: QStandardItem, current_path: str) -> None:
         # Sort items: folders first (sub_dict is not None), then A-Z
@@ -470,24 +522,251 @@ class MusicBrowserWidget(QWidget):
             item.setData(full_path, Qt.UserRole)
             parent_item.appendRow(item)
 
-    def _on_selection_changed(self, selected, deselected) -> None:
-        if not selected.indexes():
-            self._clear_details()
-            return
-            
-        index = selected.indexes()[0]
-        item = self._tree_model.itemFromIndex(index)
+    def _music_tracks(self, tracks: list[TrackMetadata]) -> list[TrackMetadata]:
+        return [
+            track for track in tracks
+            if track.extension.lower() not in _NON_MUSIC_EXTENSIONS
+        ]
+
+    def _tracks_from_item(self, item: QStandardItem, seen: set[str]) -> list[TrackMetadata]:
+        if not item or not self._data_model:
+            return []
         filepath = item.data(Qt.UserRole)
-        
-        if not self._data_model:
-            return
-            
+        if not filepath or filepath in seen:
+            return []
         meta = self._data_model.get_track(filepath)
-        if meta:
-            self._populate_details(meta)
+        if not meta:
+            return []
+        seen.add(filepath)
+        return [meta]
+
+    def _highlighted_file_tracks(self) -> list[TrackMetadata]:
+        """Files in the tree highlight selection (click / Shift / Cmd)."""
+        if not self._data_model or not self._tree.selectionModel():
+            return []
+        tracks: list[TrackMetadata] = []
+        seen: set[str] = set()
+        for index in self._tree.selectionModel().selectedIndexes():
+            if index.column() != 0:
+                continue
+            filepath = index.data(Qt.UserRole)
+            if not filepath or filepath in seen:
+                continue
+            meta = self._data_model.get_track(filepath)
+            if meta:
+                seen.add(filepath)
+                tracks.append(meta)
+        return tracks
+
+    def _checked_file_tracks(self) -> list[TrackMetadata]:
+        """Files whose checkboxes are ticked, including those under a ticked folder."""
+        if not self._data_model:
+            return []
+        tracks: list[TrackMetadata] = []
+        seen: set[str] = set()
+
+        def walk(parent: QStandardItem) -> None:
+            for row in range(parent.rowCount()):
+                item = parent.child(row)
+                if not item:
+                    continue
+                if item.checkState() == Qt.Checked:
+                    tracks.extend(self._tracks_from_item(item, seen))
+                walk(item)
+
+        walk(self._tree_model.invisibleRootItem())
+        return tracks
+
+    def _refresh_details_pane(self) -> None:
+        checked = self._checked_file_tracks()
+        highlighted = self._highlighted_file_tracks()
+        if len(checked) > 1:
+            self._show_multi_select(checked)
+            return
+        if len(highlighted) > 1:
+            self._show_multi_select(highlighted)
+            return
+        if len(highlighted) == 1:
+            self._details_stack.setCurrentIndex(1)
+            self._populate_details(highlighted[0])
+            return
+        self._show_blank_details()
+
+    def _on_selection_changed(self, selected, deselected) -> None:
+        self._refresh_details_pane()
+
+    def _show_blank_details(self) -> None:
+        self._multi_tracks = []
+        self._clear_details()
+        self._details_stack.setCurrentIndex(0)
+
+    def _show_multi_select(self, tracks: list[TrackMetadata]) -> None:
+        songs = self._music_tracks(tracks)
+        self._multi_tracks = songs
+        file_count = len(tracks)
+        song_count = len(songs)
+        self._multi_count_lbl.setText(f"{file_count} files selected.")
+        song_label = "Song" if song_count == 1 else "Songs"
+        self._bulk_edit_btn.setText(f"Bulk Edit Metadata ({song_count} {song_label})")
+        self._bulk_edit_btn.setEnabled(song_count >= 2)
+        self._details_stack.setCurrentIndex(2)
+
+    def _on_bulk_edit_metadata(self) -> None:
+        if self._bulk_thread is not None:
+            return
+
+        tracks = self._music_tracks(
+            self._multi_tracks or self._checked_file_tracks() or self._highlighted_file_tracks()
+        )
+        if len(tracks) < 2:
+            return
+
+        dialog = BulkMetadataDialog(tracks, self)
+        if not dialog.eligible_tracks():
+            QMessageBox.information(
+                self,
+                "Bulk Edit Metadata",
+                "None of the selected files can store audio metadata.",
+            )
+            return
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        tags = dialog.tags_to_apply()
+        if not tags:
+            return
+
+        self._start_bulk_edit(dialog.eligible_tracks(), tags)
+
+    def _start_bulk_edit(
+        self, tracks: list[TrackMetadata], tags: dict[str, str | None]
+    ) -> None:
+        self._bulk_tags = tags
+
+        progress = QProgressDialog(
+            f"Updating {len(tracks)} songs...",
+            "Cancel",
+            0,
+            len(tracks),
+            self,
+        )
+        progress.setWindowTitle("Bulk Edit Metadata")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+
+        self._bulk_progress = progress
+        self._bulk_edit_btn.setEnabled(False)
+
+        self._bulk_thread = QThread(self)
+        self._bulk_worker = BulkMetadataWorker(tracks, tags)
+        self._bulk_worker.moveToThread(self._bulk_thread)
+
+        self._bulk_thread.started.connect(self._bulk_worker.run)
+        self._bulk_worker.progress.connect(self._on_bulk_progress)
+        self._bulk_worker.finished.connect(self._on_bulk_finished)
+        self._bulk_worker.cancelled.connect(self._on_bulk_cancelled)
+        self._bulk_worker.failed.connect(self._on_bulk_failed)
+
+        self._bulk_worker.finished.connect(self._bulk_thread.quit)
+        self._bulk_worker.cancelled.connect(self._bulk_thread.quit)
+        self._bulk_worker.failed.connect(self._bulk_thread.quit)
+        self._bulk_thread.finished.connect(self._bulk_worker.deleteLater)
+        self._bulk_thread.finished.connect(self._bulk_thread.deleteLater)
+        self._bulk_thread.finished.connect(self._clear_bulk_refs)
+
+        progress.canceled.connect(self._cancel_bulk_edit)
+        self._bulk_thread.start()
+
+    def _cancel_bulk_edit(self) -> None:
+        if self._bulk_worker is not None:
+            self._bulk_worker.request_cancel()
+        if self._bulk_progress is not None:
+            self._bulk_progress.setLabelText("Finishing current file...")
+
+    def _clear_bulk_refs(self) -> None:
+        self._bulk_worker = None
+        self._bulk_thread = None
+
+    @Slot(int, int, str)
+    def _on_bulk_progress(self, processed: int, total: int, detail: str) -> None:
+        progress = self._bulk_progress
+        if progress is None:
+            return
+        try:
+            progress.setRange(0, max(total, 1))
+            progress.setValue(min(processed, max(total, 1)))
+            progress.setLabelText(detail)
+        except RuntimeError:
+            # Dialog was closed while a queued progress update was pending.
+            self._bulk_progress = None
+
+    def _close_bulk_progress(self) -> None:
+        worker = self._bulk_worker
+        if worker is not None:
+            try:
+                worker.progress.disconnect(self._on_bulk_progress)
+            except (RuntimeError, TypeError):
+                pass
+
+        progress = self._bulk_progress
+        self._bulk_progress = None
+        if progress is not None:
+            progress.blockSignals(True)
+            progress.close()
+
+        self._bulk_edit_btn.setEnabled(True)
+
+    def _apply_bulk_results(self, payload: dict) -> tuple[int, list[str]]:
+        updated_paths = payload.get("updated_paths", [])
+        if self._data_model:
+            for filepath in updated_paths:
+                self._data_model.update_metadata(filepath, self._bulk_tags)
+        self._refresh_details_pane()
+        return len(updated_paths), payload.get("errors", [])
+
+    @Slot(object)
+    def _on_bulk_finished(self, payload: dict) -> None:
+        self._close_bulk_progress()
+        updated, errors = self._apply_bulk_results(payload)
+        total = payload.get("total", updated)
+
+        if errors:
+            preview = "\n".join(errors[:8])
+            extra = f"\n…and {len(errors) - 8} more." if len(errors) > 8 else ""
+            QMessageBox.warning(
+                self,
+                "Bulk edit finished with errors",
+                f"Updated {updated} of {total} songs.\n\n{preview}{extra}",
+            )
         else:
-            self._clear_details()
-            
+            QMessageBox.information(
+                self,
+                "Bulk edit complete",
+                f"Updated metadata on {updated} song{'s' if updated != 1 else ''}.",
+            )
+
+    @Slot(object)
+    def _on_bulk_cancelled(self, payload: dict) -> None:
+        self._close_bulk_progress()
+        updated, _ = self._apply_bulk_results(payload)
+        QMessageBox.information(
+            self,
+            "Bulk edit cancelled",
+            f"Cancelled after updating {updated} of {payload.get('total', 0)} songs.",
+        )
+
+    @Slot(str)
+    def _on_bulk_failed(self, message: str) -> None:
+        self._close_bulk_progress()
+        self._refresh_details_pane()
+        QMessageBox.critical(self, "Bulk edit failed", message)
+
+    
     def _on_item_changed(self, item: QStandardItem) -> None:
         if self._is_updating_checks or not item.isCheckable():
             return
@@ -498,6 +777,7 @@ class MusicBrowserWidget(QWidget):
             self._set_check_state_recursive(item, state)
         finally:
             self._is_updating_checks = False
+        self._refresh_details_pane()
             
     def _set_check_state_recursive(self, item: QStandardItem, state: Qt.CheckState) -> None:
         for row in range(item.rowCount()):
@@ -529,8 +809,7 @@ class MusicBrowserWidget(QWidget):
             
         self._lyrics_warning_block.show()
         
-        # Properties
-        self._props_table.setRowCount(0)
+        # Properties — sorting must be off while inserting or values attach to the wrong labels
         props = [
             ("File", meta.filename),
             ("Format", meta.format_name),
@@ -540,11 +819,7 @@ class MusicBrowserWidget(QWidget):
             ("Sample Rate", f"{meta.sample_rate_hz} Hz" if meta.sample_rate_hz else "Unknown"),
             ("Channels", str(meta.channels) if meta.channels else "Unknown"),
         ]
-        
-        for i, (k, v) in enumerate(props):
-            self._props_table.insertRow(i)
-            self._props_table.setItem(i, 0, QTableWidgetItem(k))
-            self._props_table.setItem(i, 1, QTableWidgetItem(str(v)))
+        self._fill_kv_table(self._props_table, props)
             
         # Metadata
         self._meta_table.setRowCount(0)
@@ -628,10 +903,7 @@ class MusicBrowserWidget(QWidget):
                     ("JPEG Scan", scan_type),
                 ]
                 
-                for i, (k, v) in enumerate(art_props):
-                    self._art_table.insertRow(i)
-                    self._art_table.setItem(i, 0, QTableWidgetItem(k))
-                    self._art_table.setItem(i, 1, QTableWidgetItem(v))
+                self._fill_kv_table(self._art_table, art_props)
             else:
                 self._art_image_lbl.setText("[Failed to extract album art]")
         else:
@@ -644,6 +916,15 @@ class MusicBrowserWidget(QWidget):
         else:
             self._lyrics_text.setPlainText("No embedded lyrics found.")
             
+    def _fill_kv_table(self, table: QTableWidget, rows: list[tuple[str, str]]) -> None:
+        """Fill a two-column property table without scrambling rows under an active sort."""
+        table.setSortingEnabled(False)
+        table.setRowCount(len(rows))
+        for i, (key, value) in enumerate(rows):
+            table.setItem(i, 0, QTableWidgetItem(key))
+            table.setItem(i, 1, QTableWidgetItem(str(value)))
+        table.setSortingEnabled(True)
+
     def _clear_details(self) -> None:
         self._props_table.setRowCount(0)
         self._meta_table.setRowCount(0)

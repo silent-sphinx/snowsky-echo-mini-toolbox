@@ -290,8 +290,10 @@ class MainWindow(QMainWindow):
         if total > 0:
             self._global_progress.setMaximum(total)
             self._global_progress.setValue(current)
-            
             self._prog_status_lbl.setText(f"Scanning media: {current} / {total}")
+        elif filepath:
+            self._global_progress.setRange(0, 0)
+            self._prog_status_lbl.setText(filepath)
             
     def _on_scan_finished(self, data_model) -> None:
         """Handle completion of the global drive scan."""
