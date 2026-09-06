@@ -1,6 +1,7 @@
 import os
 import subprocess
 import json
+from pathlib import Path
 from PySide6.QtCore import Qt, QThread, Slot
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush, QPixmap, QImage
 from PySide6.QtWidgets import (
@@ -31,6 +32,7 @@ from PySide6.QtGui import QBrush
 
 from ..theme import Colours
 from ..models.drive_data import DriveDataModel, TrackMetadata
+from ..utils.lyrics import decode_text_file_bytes
 from ..utils.metadata_writer import save_metadata
 from ..utils.album_art import extract_album_art
 from ..threads.bulk_metadata import BulkMetadataWorker
@@ -159,6 +161,7 @@ class MusicBrowserWidget(QWidget):
         self._bulk_worker: BulkMetadataWorker | None = None
         self._bulk_progress: QProgressDialog | None = None
         self._bulk_tags: dict[str, str | None] = {}
+        self._editing_lrc_path: str | None = None
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -340,7 +343,23 @@ class MusicBrowserWidget(QWidget):
                 line-height: 1.5;
             }}
         """)
+        self._lyrics_text.modificationChanged.connect(self._on_lyrics_modified)
         lyrics_lyt.addWidget(self._lyrics_text)
+
+        lyrics_btns_lyt = QHBoxLayout()
+        self._lyrics_discard_btn = QPushButton("Discard Changes")
+        self._lyrics_discard_btn.clicked.connect(self._on_discard_lrc_clicked)
+        lyrics_btns_lyt.addWidget(self._lyrics_discard_btn)
+
+        self._lyrics_save_btn = QPushButton("Save Changes")
+        self._lyrics_save_btn.setObjectName("accentButton")
+        self._lyrics_save_btn.clicked.connect(self._on_save_lrc_clicked)
+        lyrics_btns_lyt.addWidget(self._lyrics_save_btn)
+
+        self._lyrics_buttons = QWidget()
+        self._lyrics_buttons.setLayout(lyrics_btns_lyt)
+        self._lyrics_buttons.hide()
+        lyrics_lyt.addWidget(self._lyrics_buttons)
         
         self._tabs.addTab(self._props_tab, "Properties")
         self._tabs.addTab(self._meta_tab, "Music Metadata")
@@ -822,11 +841,7 @@ class MusicBrowserWidget(QWidget):
         if is_lrc:
             self._tabs.setCurrentIndex(3)
             self._lyrics_warning_block.hide()
-            try:
-                with open(meta.filepath, 'r', encoding='utf-8') as f:
-                    self._lyrics_text.setPlainText(f.read())
-            except Exception as e:
-                self._lyrics_text.setPlainText(f"Failed to read LRC file: {str(e)}")
+            self._load_lrc_editor(meta.filepath)
             return
             
         self._lyrics_warning_block.show()
@@ -932,11 +947,13 @@ class MusicBrowserWidget(QWidget):
             self._art_image_lbl.setPixmap(QPixmap())
             self._art_image_lbl.setText("No Album Art embedded in this file.")
             
-        # Lyrics
+        # Lyrics (embedded tags are read-only; edit sidecars via the .lrc file)
+        self._set_lyrics_editable(False)
         if meta.has_lyrics and meta.lyrics_text:
             self._lyrics_text.setPlainText(meta.lyrics_text)
         else:
             self._lyrics_text.setPlainText("No embedded lyrics found.")
+        self._lyrics_text.document().setModified(False)
             
     def _fill_kv_table(self, table: QTableWidget, rows: list[tuple[str, str]]) -> None:
         """Fill a two-column property table without scrambling rows under an active sort."""
@@ -954,11 +971,71 @@ class MusicBrowserWidget(QWidget):
         self._art_image_lbl.setPixmap(QPixmap())
         self._art_image_lbl.setText("No Album Art")
         self._lyrics_text.setPlainText("")
+        self._set_lyrics_editable(False)
         
         # Hide all tabs when a folder or nothing is selected
         for i in range(self._tabs.count()):
             self._tabs.setTabVisible(i, False)
         
+    def _set_lyrics_editable(self, enabled: bool) -> None:
+        self._editing_lrc_path = None
+        self._lyrics_text.setReadOnly(not enabled)
+        self._lyrics_buttons.setVisible(enabled)
+        self._lyrics_save_btn.setEnabled(False)
+        self._lyrics_discard_btn.setEnabled(False)
+
+    def _on_lyrics_modified(self, changed: bool) -> None:
+        dirty = bool(changed and self._editing_lrc_path)
+        self._lyrics_save_btn.setEnabled(dirty)
+        self._lyrics_discard_btn.setEnabled(dirty)
+
+    def _load_lrc_editor(self, filepath: str) -> None:
+        try:
+            content = decode_text_file_bytes(Path(filepath).read_bytes())
+        except Exception as exc:
+            self._set_lyrics_editable(False)
+            self._lyrics_text.setPlainText(f"Failed to read LRC file: {exc}")
+            self._lyrics_text.document().setModified(False)
+            return
+
+        self._lyrics_text.setPlainText(content)
+        self._set_lyrics_editable(True)
+        self._editing_lrc_path = filepath
+        self._lyrics_text.document().setModified(False)
+
+    def _on_discard_lrc_clicked(self) -> None:
+        if self._editing_lrc_path:
+            self._load_lrc_editor(self._editing_lrc_path)
+
+    def _on_save_lrc_clicked(self) -> None:
+        filepath = self._editing_lrc_path
+        if not filepath:
+            return
+
+        text = self._lyrics_text.toPlainText().replace("\r\n", "\n").replace("\r", "\n")
+        if text and not text.endswith("\n"):
+            text += "\n"
+
+        self._lyrics_save_btn.setText("Saving...")
+        QApplication.processEvents()
+        try:
+            Path(filepath).write_text(text, encoding="utf-8")
+        except Exception as exc:
+            self._lyrics_save_btn.setText("Save Changes")
+            QMessageBox.critical(self, "Error", f"Failed to save LRC file:\n{exc}")
+            return
+
+        self._lyrics_save_btn.setText("Save Changes")
+        self._lyrics_text.document().setModified(False)
+        if self._data_model:
+            track = self._data_model.get_track(filepath)
+            if track is not None:
+                try:
+                    track.size_bytes = os.path.getsize(filepath)
+                except OSError:
+                    pass
+        QMessageBox.information(self, "Success", "LRC file saved successfully.")
+
     def _on_discard_metadata_clicked(self) -> None:
         # Reload the metadata for the current selection from the cache
         indexes = self._tree.selectionModel().selectedIndexes()
