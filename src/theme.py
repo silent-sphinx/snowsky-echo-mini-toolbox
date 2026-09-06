@@ -39,7 +39,7 @@ class Colours:
     ACCENT_MUTED = "#4A4A4A"
     ACCENT_BG = "#333333"
 
-    # Status
+    # Status — one pair per semantic, reused for badges, cells, and stats
     STATUS_SUPPORTED = "#2E7D32"
     STATUS_SUPPORTED_TEXT = "#C8F7C8"
     STATUS_UNSUPPORTED = "#C62828"
@@ -50,6 +50,14 @@ class Colours:
     STATUS_UNKNOWN_TEXT = "#C5CAE9"
     STATUS_MISSING = "#E53935"
     STATUS_MISSING_TEXT = "#FFCDD2"
+    STATUS_SKIPPED = BORDER_SUBTLE
+    STATUS_SKIPPED_TEXT = TEXT_PRIMARY
+
+    # Compatibility aliases — same palette, universal names
+    STATUS_COMPATIBLE = STATUS_SUPPORTED
+    STATUS_COMPATIBLE_TEXT = STATUS_SUPPORTED_TEXT
+    STATUS_INCOMPATIBLE = STATUS_UNSUPPORTED
+    STATUS_INCOMPATIBLE_TEXT = STATUS_UNSUPPORTED_TEXT
 
     # Stat card colours
     STAT_TOTAL = "#757575"
@@ -70,6 +78,27 @@ class Colours:
     SCROLLBAR_BG = "#1F1F1F"
     SCROLLBAR_HANDLE = "#404040"
     SCROLLBAR_HANDLE_HOVER = "#5C5C5C"
+
+
+_STATUS_COLOURS: dict[str, tuple[str, str]] = {
+    "COMPATIBLE": (Colours.STATUS_COMPATIBLE, Colours.STATUS_COMPATIBLE_TEXT),
+    "SUPPORTED": (Colours.STATUS_SUPPORTED, Colours.STATUS_SUPPORTED_TEXT),
+    "EQ COMPATIBLE": (Colours.STATUS_COMPATIBLE, Colours.STATUS_COMPATIBLE_TEXT),
+    "LIMITED": (Colours.STATUS_LIMITED, Colours.STATUS_LIMITED_TEXT),
+    "INCOMPATIBLE": (Colours.STATUS_INCOMPATIBLE, Colours.STATUS_INCOMPATIBLE_TEXT),
+    "UNSUPPORTED": (Colours.STATUS_UNSUPPORTED, Colours.STATUS_UNSUPPORTED_TEXT),
+    "NOT EQ COMPATIBLE": (Colours.STATUS_INCOMPATIBLE, Colours.STATUS_INCOMPATIBLE_TEXT),
+    "UNKNOWN": (Colours.STATUS_UNKNOWN, Colours.STATUS_UNKNOWN_TEXT),
+    "MISSING": (Colours.STATUS_MISSING, Colours.STATUS_MISSING_TEXT),
+    "SKIPPED": (Colours.STATUS_SKIPPED, Colours.STATUS_SKIPPED_TEXT),
+}
+
+
+def colours_for_status(status: str | None) -> tuple[str, str] | tuple[None, None]:
+    """Return (background, foreground) hex colours for a status token."""
+    if not status:
+        return None, None
+    return _STATUS_COLOURS.get(status.strip().upper(), (None, None))
 
 
 # ── Font Setup ──────────────────────────────────────────────────────────────

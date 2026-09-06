@@ -23,6 +23,15 @@ class MetadataFilterProxyModel(QSortFilterProxyModel):
         self.setSortCaseSensitivity(Qt.CaseInsensitive)
         self.setDynamicSortFilter(True)
 
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
+        from .metadata_table_model import Column
+
+        if left.column() == Column.CHECKBOX:
+            return int(left.data(Qt.CheckStateRole) or 0) < int(right.data(Qt.CheckStateRole) or 0)
+        left_val = left.data(Qt.DisplayRole)
+        right_val = right.data(Qt.DisplayRole)
+        return str(left_val or "").casefold() < str(right_val or "").casefold()
+
     # ── Filter setters ──────────────────────────────────────────────
 
     def set_search_query(self, query: str) -> None:

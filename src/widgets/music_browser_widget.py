@@ -87,7 +87,10 @@ class StreamsDialog(QDialog):
         self.table = QTableWidget()
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
+        self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionsClickable(True)
+        self.table.horizontalHeader().setSortIndicatorShown(True)
         layout.addWidget(self.table)
         
         try:
@@ -120,6 +123,7 @@ class StreamsDialog(QDialog):
             
             self.table.setColumnCount(len(ordered_cols))
             self.table.setHorizontalHeaderLabels(ordered_cols)
+            self.table.setSortingEnabled(False)
             self.table.setRowCount(len(audio_streams))
             
             for row_idx, stream in enumerate(audio_streams):
@@ -127,6 +131,7 @@ class StreamsDialog(QDialog):
                     val = str(stream.get(col_name, ""))
                     self.table.setItem(row_idx, col_idx, QTableWidgetItem(val))
                     
+            self.table.setSortingEnabled(True)
             self.table.resizeColumnsToContents()
             
         except Exception as e:
@@ -216,7 +221,10 @@ class MusicBrowserWidget(QWidget):
         self._props_table.verticalHeader().setVisible(False)
         self._props_table.setAlternatingRowColors(True)
         self._props_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._props_table.setSortingEnabled(True)
         self._props_table.horizontalHeader().setStretchLastSection(True)
+        self._props_table.horizontalHeader().setSectionsClickable(True)
+        self._props_table.horizontalHeader().setSortIndicatorShown(True)
         self._props_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
         
         # Prevent squeezing smaller than the title text
@@ -275,7 +283,10 @@ class MusicBrowserWidget(QWidget):
         self._art_table.verticalHeader().setVisible(False)
         self._art_table.setAlternatingRowColors(True)
         self._art_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._art_table.setSortingEnabled(True)
         self._art_table.horizontalHeader().setStretchLastSection(True)
+        self._art_table.horizontalHeader().setSectionsClickable(True)
+        self._art_table.horizontalHeader().setSortIndicatorShown(True)
         self._art_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
         
         art_lyt.addWidget(self._art_image_lbl, stretch=1)

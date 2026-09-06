@@ -26,6 +26,7 @@ class MetadataTableView(QTableView):
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setSortingEnabled(True)
+        self.sortByColumn(-1, Qt.AscendingOrder)
         self.setWordWrap(False)
 
         # Vertical header (row numbers) — hidden for cleaner look
@@ -37,6 +38,7 @@ class MetadataTableView(QTableView):
         header.setHighlightSections(False)
         header.setStretchLastSection(True)
         header.setSectionsMovable(True)
+        header.setSectionsClickable(True)
         header.setSortIndicatorShown(True)
         header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         header.setMinimumSectionSize(30)

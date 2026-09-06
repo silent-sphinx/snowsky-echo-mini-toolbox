@@ -109,7 +109,10 @@ class MusicConversionDialog(QDialog):
         self._preview_table.setAlternatingRowColors(True)
         self._preview_table.verticalHeader().setVisible(False)
         self._preview_table.setMinimumHeight(220)
+        self._preview_table.setSortingEnabled(True)
         header = self._preview_table.horizontalHeader()
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.Stretch)
@@ -204,6 +207,7 @@ class MusicConversionDialog(QDialog):
             f"{actionable_count} with planned action{'s' if actionable_count != 1 else ''}."
         )
 
+        self._preview_table.setSortingEnabled(False)
         self._preview_table.setRowCount(len(self._plans))
         for row, plan in enumerate(self._plans):
             file_item = QTableWidgetItem(plan.title)
@@ -222,6 +226,7 @@ class MusicConversionDialog(QDialog):
             self._preview_table.setItem(row, 2, issues_item)
             self._preview_table.setItem(row, 3, action_item)
 
+        self._preview_table.setSortingEnabled(True)
         self._confirm_btn.setEnabled(actionable_count > 0)
 
     def _on_confirm(self) -> None:

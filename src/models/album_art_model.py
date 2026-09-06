@@ -7,7 +7,7 @@ from PySide6.QtCore import QAbstractTableModel, QSortFilterProxyModel, QModelInd
 from PySide6.QtGui import QColor
 
 from ..models.drive_data import TrackMetadata
-from ..theme import Colours
+from ..theme import Colours, colours_for_status
 from ..utils.album_art_validation import MAX_ART_DIMENSION
 
 
@@ -83,6 +83,13 @@ class AlbumArtTableModel(QAbstractTableModel):
             return track.art_resolution_compat
         return None
 
+    def _status_token_for_cell(self, track: TrackMetadata, col: int) -> str | None:
+        if col == ArtColumn.STATUS:
+            return track.art_status
+        if col in ArtColumn.COMPAT_STATUS_COLUMNS:
+            return self._get_compat_status_for_column(track, col)
+        return None
+
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:
         if not index.isValid():
             return Qt.NoItemFlags
@@ -133,21 +140,9 @@ class AlbumArtTableModel(QAbstractTableModel):
             elif col == ArtColumn.FILE: return os.path.relpath(track.filepath, self._root_path)
 
         elif role == Qt.BackgroundRole:
-            c_green = QColor("#2E7D32")
-            c_red = QColor("#7A2C2C")
-            c_yellow = QColor("#998A00")
-            c_gray = QColor("#3C3C3C")
-
-            if col == ArtColumn.STATUS:
-                if track.art_status == "COMPATIBLE": return c_green
-                elif track.art_status == "INCOMPATIBLE": return c_red
-                elif track.art_status in ("MISSING", "UNKNOWN"): return c_yellow
-                elif track.art_status == "SKIPPED": return c_gray
-            elif col in ArtColumn.COMPAT_STATUS_COLUMNS:
-                status = self._get_compat_status_for_column(track, col)
-                if status == "COMPATIBLE": return c_green
-                elif status == "INCOMPATIBLE": return c_red
-                elif status == "UNKNOWN": return c_yellow
+            bg, _ = colours_for_status(self._status_token_for_cell(track, col))
+            if bg:
+                return QColor(bg)
 
         elif role == Qt.TextAlignmentRole:
             center_cols = (
@@ -160,14 +155,8 @@ class AlbumArtTableModel(QAbstractTableModel):
             return int(Qt.AlignLeft | Qt.AlignVCenter)
 
         elif role == Qt.ForegroundRole:
-            # Dark text on yellow backgrounds for readability
-            if col == ArtColumn.STATUS and track.art_status in ("MISSING", "UNKNOWN"):
-                return QColor(Colours.BG_DARKEST)
-            if col in ArtColumn.COMPAT_STATUS_COLUMNS:
-                status = self._get_compat_status_for_column(track, col)
-                if status == "UNKNOWN":
-                    return QColor(Colours.BG_DARKEST)
-            return QColor(Colours.TEXT_PRIMARY)
+            _, fg = colours_for_status(self._status_token_for_cell(track, col))
+            return QColor(fg or Colours.TEXT_PRIMARY)
 
         elif role == Qt.ToolTipRole:
             # Show full reason text as tooltip
@@ -214,6 +203,15 @@ class AlbumArtFilterProxyModel(QSortFilterProxyModel):
         super().__init__(parent)
         self._search_query = ""
         self._status_filter = ""
+        self.setSortCaseSensitivity(Qt.CaseInsensitive)
+        self.setDynamicSortFilter(True)
+
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
+        if left.column() == ArtColumn.CHECK:
+            return int(left.data(Qt.CheckStateRole) or 0) < int(right.data(Qt.CheckStateRole) or 0)
+        left_val = left.data(Qt.DisplayRole)
+        right_val = right.data(Qt.DisplayRole)
+        return str(left_val or "").casefold() < str(right_val or "").casefold()
 
     def set_search_query(self, query: str):
         self._search_query = query.lower()
