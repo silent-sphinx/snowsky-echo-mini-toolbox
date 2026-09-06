@@ -24,6 +24,7 @@ from .widgets.metadata_manager import MetadataManager
 from .widgets.album_art_widget import AlbumArtWidget
 from .widgets.drive_info_widget import DriveInfoWidget
 from .widgets.drive_selector_panel import DriveSelectorPanel
+from .widgets.lyrics_manager import LyricsManagerWidget
 from .widgets.music_browser_widget import MusicBrowserWidget
 from .widgets.music_compatibility_widget import MusicCompatibilityWidget
 from .threads.drive_scanner import DriveScannerThread
@@ -48,7 +49,12 @@ class MainWindow(QMainWindow):
         super().showEvent(event)
         if not self._initial_dialog_shown:
             self._initial_dialog_shown = True
-            # Ensure the window is fully visible and positioned before spawning modal
+            handle = self.windowHandle()
+            if handle is not None:
+                # Read the live DPR after the native window exists so Qt's
+                # cached value matches the first expose (QTBUG-118794).
+                handle.devicePixelRatio()
+            # Wait until the first expose has finished before showing the overlay.
             QTimer.singleShot(100, self._show_drive_selector)
 
     def _init_ui(self) -> None:
@@ -92,8 +98,9 @@ class MainWindow(QMainWindow):
         self._album_art = AlbumArtWidget()
         self._tabs.addTab(self._album_art, "Album Art")
         
-        # Index 5: Lyrics Manager (placeholder)
-        self._tabs.addTab(QWidget(), "Lyrics Manager")
+        # Index 5: Lyrics Manager
+        self._lyrics_manager = LyricsManagerWidget()
+        self._tabs.addTab(self._lyrics_manager, "Lyrics Manager")
         
         tab_layout.addWidget(self._tabs)
         main_layout.addWidget(tab_container)
@@ -110,9 +117,11 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if hasattr(self, '_overlay'):
+        # Hidden overlay/panel geometry updates during the first expose race
+        # Qt's cached devicePixelRatio on Retina displays (QTBUG-118794).
+        if hasattr(self, '_overlay') and self._overlay.isVisible():
             self._overlay.resize(self.centralWidget().size())
-        if hasattr(self, '_drive_panel'):
+        if hasattr(self, '_drive_panel') and self._drive_panel.isVisible():
             self._drive_panel.move(
                 self.centralWidget().width() // 2 - self._drive_panel.width() // 2,
                 self.centralWidget().height() // 2 - self._drive_panel.height() // 2
@@ -303,6 +312,7 @@ class MainWindow(QMainWindow):
         self._music_browser.populate_data(data_model)
         self._music_compatibility.populate_data(data_model)
         self._album_art.populate_data(data_model)
+        self._lyrics_manager.populate_data(data_model)
         
         # Update the DriveInfoWidget track count and charts
         if self._tabs.isTabVisible(0):
@@ -323,4 +333,5 @@ class MainWindow(QMainWindow):
         self._music_browser.set_processing_state(is_processing)
         self._music_compatibility.set_processing_state(is_processing)
         self._album_art.set_processing_state(is_processing)
+        self._lyrics_manager.set_processing_state(is_processing)
 

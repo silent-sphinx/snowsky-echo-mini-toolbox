@@ -374,10 +374,15 @@ class MusicBrowserWidget(QWidget):
         self._bulk_edit_btn.setMinimumHeight(34)
         self._bulk_edit_btn.clicked.connect(self._on_bulk_edit_metadata)
 
+        self._unselect_all_btn = QPushButton("Unselect All")
+        self._unselect_all_btn.setMinimumHeight(34)
+        self._unselect_all_btn.clicked.connect(self._on_unselect_all)
+
         multi_lyt.addWidget(self._multi_count_lbl)
         multi_lyt.addWidget(self._multi_prompt_lbl)
         multi_lyt.addSpacing(8)
         multi_lyt.addWidget(self._bulk_edit_btn)
+        multi_lyt.addWidget(self._unselect_all_btn)
 
         multi_outer.addWidget(multi_column, 0, Qt.AlignHCenter)
         multi_outer.addStretch(1)
@@ -610,6 +615,23 @@ class MusicBrowserWidget(QWidget):
         self._bulk_edit_btn.setText(f"Bulk Edit Metadata ({song_count} {song_label})")
         self._bulk_edit_btn.setEnabled(song_count >= 2)
         self._details_stack.setCurrentIndex(2)
+
+    def _on_unselect_all(self) -> None:
+        if self._tree.selectionModel():
+            self._tree.selectionModel().clearSelection()
+
+        self._is_updating_checks = True
+        try:
+            root = self._tree_model.invisibleRootItem()
+            for row in range(root.rowCount()):
+                child = root.child(row)
+                if child and child.isCheckable():
+                    child.setCheckState(Qt.Unchecked)
+                    self._set_check_state_recursive(child, Qt.Unchecked)
+        finally:
+            self._is_updating_checks = False
+
+        self._refresh_details_pane()
 
     def _on_bulk_edit_metadata(self) -> None:
         if self._bulk_thread is not None:

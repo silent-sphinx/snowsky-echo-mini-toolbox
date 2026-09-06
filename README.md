@@ -77,7 +77,7 @@ The `v2` rewrite is being rebuilt tab by tab. Everything below already ships in 
 | File browser | Implemented |
 | Metadata browser | Implemented |
 | Album art (fix & download) | Implemented |
-| Lyrics manager | Placeholder tab, not yet ported |
+| Lyrics manager | Implemented |
 | File rename, cleanup, backup & restore | Not yet ported |
 
 ## Device compatibility

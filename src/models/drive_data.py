@@ -86,6 +86,17 @@ class TrackMetadata:
     # Album Art UI State (separate from is_checked used by Music Compatibility)
     art_is_checked: bool = False
 
+    # Lyrics Metrics
+    lyrics_status: str = "UNKNOWN"
+    lyrics_reason: str = ""
+    lyrics_embedded: str = "-"
+    lyrics_lrc: str = "-"
+    lyrics_source: str = "-"
+    lyrics_preview: str = ""
+
+    # Lyrics UI State (separate from is_checked / art_is_checked)
+    lyrics_is_checked: bool = False
+
     @property
     def display_size(self) -> str:
         if self.size_bytes < 1024 * 1024:

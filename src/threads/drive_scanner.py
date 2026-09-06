@@ -29,11 +29,14 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
         meta.format_name = "LRC Lyrics File"
         return meta
         
+    audio = None
     try:
         audio = mutagen.File(filepath, easy=False)
-        if audio is None:
-            return meta
-    except:
+    except Exception:
+        audio = None
+
+    if audio is None:
+        _apply_lyrics_scan(meta, filepath, None)
         return meta
         
     meta.format_name = type(audio).__name__
@@ -70,11 +73,6 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
             meta.year = audio.get("date", [""])[0]
             meta.track_num = audio.get("tracknumber", [""])[0]
             
-            # Check for lyrics
-            if "lyrics" in audio or "unsyncedlyrics" in audio:
-                meta.has_lyrics = True
-                meta.lyrics_text = audio.get("lyrics", audio.get("unsyncedlyrics", [None]))[0]
-                
             # Check for pictures
             if audio.pictures:
                 meta.has_album_art = True
@@ -104,11 +102,6 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
             if audio.tags and audio.tags.get("covr"):
                 meta.has_album_art = True
 
-            lyrics = _mp4_tag("\xa9lyr")
-            if lyrics:
-                meta.has_lyrics = True
-                meta.lyrics_text = lyrics
-
         elif audio.tags:
             # Try generic dict access
             try:
@@ -123,15 +116,10 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
                 meta.album = str(audio.tags.get("TALB", audio.get("album", [meta.album])[0]))
             except: pass
             
-            # ID3 checks for art and lyrics
+            # ID3 checks for art (lyrics are evaluated separately)
             if hasattr(audio.tags, "getall"):
                 if audio.tags.getall("APIC"):
                     meta.has_album_art = True
-                if audio.tags.getall("USLT") or audio.tags.getall("SYLT"):
-                    meta.has_lyrics = True
-                    uslts = audio.tags.getall("USLT")
-                    if uslts:
-                        meta.lyrics_text = uslts[0].text
 
         # Album artist drives album grouping for artwork lookups. FLAC uses a
         # Vorbis comment, ID3 uses TPE2, and MP4 was already handled above.
@@ -199,7 +187,20 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
         except Exception as e:
             print(f"Album art scan failed for {filepath}: {e}")
 
+        _apply_lyrics_scan(meta, filepath, audio)
+
     return meta
+
+
+def _apply_lyrics_scan(meta: TrackMetadata, filepath: str, audio) -> None:
+    """Evaluate embedded lyrics and matching .lrc sidecars."""
+    try:
+        from pathlib import Path
+        from ..utils.lyrics import apply_lyrics_result, evaluate_lyrics_from_audio
+
+        apply_lyrics_result(meta, evaluate_lyrics_from_audio(Path(filepath), audio))
+    except Exception as e:
+        print(f"Lyrics scan failed for {filepath}: {e}")
 
 
 class DriveScannerThread(QThread):
