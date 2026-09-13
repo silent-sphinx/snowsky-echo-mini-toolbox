@@ -79,7 +79,8 @@ The `v2` rewrite is being rebuilt tab by tab. Everything below already ships in 
 | Album art (fix & download) | Implemented |
 | Lyrics manager | Implemented |
 | File rename | Implemented |
-| File cleanup, backup & restore | Not yet ported |
+| Backup & restore | Implemented |
+| File cleanup | Not yet ported |
 
 ## Device compatibility
 

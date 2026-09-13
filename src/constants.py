@@ -12,6 +12,15 @@ SUPPORTED_MEDIA_EXTENSIONS = {
 # Maximum track limit supported by the Snowsky Echo Mini firmware hardware
 MAX_TRACK_LIMIT = 8192
 
+# OS/volume folders skipped when walking a target for backup or copy/move.
+SYSTEM_FOLDERS = {
+    ".trashes",
+    ".spotlight-v100",
+    ".fseventsd",
+    "system volume information",
+    "$recycle.bin",
+}
+
 try:
     from .generated_version import APP_VERSION
 except ImportError:

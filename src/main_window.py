@@ -26,6 +26,7 @@ from .widgets.album_art_widget import AlbumArtWidget
 from .widgets.drive_info_widget import DriveInfoWidget
 from .widgets.drive_selector_panel import DriveSelectorPanel
 from .widgets.lyrics_manager import LyricsManagerWidget
+from .widgets.backup_restore_widget import BackupRestoreWidget
 from .widgets.file_rename_widget import FileRenameWidget
 from .widgets.music_browser_widget import MusicBrowserWidget
 from .widgets.music_compatibility_widget import MusicCompatibilityWidget
@@ -109,6 +110,11 @@ class MainWindow(QMainWindow):
         self._file_rename = FileRenameWidget()
         self._file_rename.library_changed.connect(self._on_library_changed)
         self._tabs.addTab(self._file_rename, "File Rename")
+
+        # Index 7: Backup / Restore
+        self._backup_restore = BackupRestoreWidget()
+        self._backup_restore.target_relocated.connect(self._on_location_selected)
+        self._tabs.addTab(self._backup_restore, "Backup / Restore")
         
         tab_layout.addWidget(self._tabs)
         main_layout.addWidget(tab_container)
@@ -306,6 +312,7 @@ class MainWindow(QMainWindow):
         self._current_drive = ""
         self._drive_btn.setText("Select Target Drive...")
         self._set_processing_state(False)
+        self._backup_restore.set_target("")
         self._drive_panel._cancel_btn.setEnabled(False)
         self._drive_panel._cancel_btn.setVisible(False)
 
@@ -314,6 +321,7 @@ class MainWindow(QMainWindow):
         self._tabs.show()
         self._current_drive = path
         self._drive_btn.setText(self._current_drive)
+        self._backup_restore.set_target(path)
         self._drive_panel.hide()
         if hasattr(self, '_overlay'):
             self._overlay.hide()
@@ -381,6 +389,7 @@ class MainWindow(QMainWindow):
         self._album_art.populate_data(data_model)
         self._lyrics_manager.populate_data(data_model)
         self._file_rename.populate_data(data_model)
+        self._backup_restore.populate_data(data_model)
 
     def _set_processing_state(self, is_processing: bool, status_text: str = "Processing data...") -> None:
         """Toggle the global loading state and UI indicators."""
@@ -399,4 +408,5 @@ class MainWindow(QMainWindow):
         self._album_art.set_processing_state(is_processing)
         self._lyrics_manager.set_processing_state(is_processing)
         self._file_rename.set_processing_state(is_processing)
+        self._backup_restore.set_processing_state(is_processing)
 
