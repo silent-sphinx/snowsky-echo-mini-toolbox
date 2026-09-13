@@ -158,13 +158,24 @@ class DriveDataModel:
         if not track:
             return
 
+        written_aliases: set[str] = set()
         for k, v in new_tags.items():
             if v is None:
-                aliases = {alias.lower() for alias in aliases_for_tag_key(k)}
-                for existing in [key for key in track.all_tags if key.lower() in aliases]:
-                    del track.all_tags[existing]
-            else:
-                track.all_tags[k] = str(v)
+                continue
+            aliases = {alias.lower() for alias in aliases_for_tag_key(k)}
+            for existing in [key for key in track.all_tags if key.lower() in aliases]:
+                del track.all_tags[existing]
+            track.all_tags[k] = str(v)
+            written_aliases.update(aliases)
+
+        for k, v in new_tags.items():
+            if v is not None:
+                continue
+            aliases = {alias.lower() for alias in aliases_for_tag_key(k)}
+            if aliases & written_aliases:
+                continue
+            for existing in [key for key in track.all_tags if key.lower() in aliases]:
+                del track.all_tags[existing]
 
         def _get_case_insensitive(tags_dict: dict, keys: list) -> str:
             for k in tags_dict:

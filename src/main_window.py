@@ -84,13 +84,13 @@ class MainWindow(QMainWindow):
         self._drive_info = DriveInfoWidget()
         self._tabs.addTab(self._drive_info, "Drive Information")
         
-        # Index 1: Music Compatibility
-        self._music_compatibility = MusicCompatibilityWidget()
-        self._tabs.addTab(self._music_compatibility, "Music Compatibility")
-        
-        # Index 2: File Browser (formerly Music Browser)
+        # Index 1: File Browser
         self._music_browser = MusicBrowserWidget()
         self._tabs.addTab(self._music_browser, "File Browser")
+
+        # Index 2: Music Compatibility
+        self._music_compatibility = MusicCompatibilityWidget()
+        self._tabs.addTab(self._music_compatibility, "Music Compatibility")
         
         # Index 3: Metadata Browser
         self._metadata_manager = MetadataManager()

@@ -40,6 +40,30 @@ from .bulk_metadata_dialog import BulkMetadataDialog
 
 _NON_MUSIC_EXTENSIONS = {".lrc", ".cue"}
 
+# Tags known to be parsed by the Snowsky Echo Mini firmware.
+_RECOGNIZED_TAGS = {
+    "title", "artist", "album", "albumartist", "album artist",
+    "tracknumber", "track", "discnumber", "genre", "tit2", "tpe1", "talb",
+    "tpe2", "trck", "tpos", "tcon",
+}
+
+_META_LINE_EDIT_STYLE = "QLineEdit { border: none; background: transparent; padding: 4px 8px; }"
+_META_DELETE_BTN_STYLE = f"""
+    QPushButton {{
+        padding: 2px 8px;
+        font-size: 11px;
+        font-weight: 600;
+        min-height: 0px;
+        background-color: transparent;
+        border: 1px solid {Colours.BORDER_SUBTLE};
+    }}
+    QPushButton:hover {{
+        background-color: {Colours.STATUS_UNSUPPORTED};
+        border-color: {Colours.STATUS_UNSUPPORTED};
+        color: {Colours.STATUS_UNSUPPORTED_TEXT};
+    }}
+"""
+
 
 class HighlightDelegate(QStyledItemDelegate):
     """Custom delegate to enforce background colors over QSS/Alternating rows."""
@@ -162,6 +186,7 @@ class MusicBrowserWidget(QWidget):
         self._bulk_progress: QProgressDialog | None = None
         self._bulk_tags: dict[str, str | None] = {}
         self._editing_lrc_path: str | None = None
+        self._original_meta_keys: list[str] = []
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -253,13 +278,19 @@ class MusicBrowserWidget(QWidget):
         meta_lyt = QVBoxLayout(self._meta_tab)
         meta_lyt.setContentsMargins(8, 8, 8, 8)
         
-        self._meta_table = QTableWidget(0, 2)
-        self._meta_table.setHorizontalHeaderLabels(["Tag", "Value"])
+        self._meta_table = QTableWidget(0, 3)
+        self._meta_table.setHorizontalHeaderLabels(["Tag", "Value", ""])
         self._meta_table.verticalHeader().setVisible(False)
         self._meta_table.setAlternatingRowColors(True)
-        # Edit triggers are enabled by default, we'll restrict column 0 in code
-        self._meta_table.horizontalHeader().setStretchLastSection(True)
-        self._meta_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        self._meta_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._meta_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._meta_table.setSelectionMode(QTableWidget.SingleSelection)
+        meta_header = self._meta_table.horizontalHeader()
+        meta_header.setStretchLastSection(False)
+        meta_header.setSectionResizeMode(0, QHeaderView.Interactive)
+        meta_header.setSectionResizeMode(1, QHeaderView.Stretch)
+        meta_header.setSectionResizeMode(2, QHeaderView.Fixed)
+        self._meta_table.setColumnWidth(2, 88)
         
         fm_meta = self._meta_table.horizontalHeader().fontMetrics()
         min_width_meta = fm_meta.horizontalAdvance("VALUE") + 40
@@ -271,6 +302,12 @@ class MusicBrowserWidget(QWidget):
         meta_lyt.addWidget(self._meta_table)
         
         meta_btns_lyt = QHBoxLayout()
+        self._meta_add_btn = QPushButton("Add Tag")
+        self._meta_add_btn.setToolTip("Add a tag that is not already on this file.")
+        self._meta_add_btn.clicked.connect(self._on_add_tag_clicked)
+        meta_btns_lyt.addWidget(self._meta_add_btn)
+        meta_btns_lyt.addStretch(1)
+
         self._meta_discard_btn = QPushButton("Discard Changes")
         self._meta_discard_btn.clicked.connect(self._on_discard_metadata_clicked)
         meta_btns_lyt.addWidget(self._meta_discard_btn)
@@ -860,6 +897,7 @@ class MusicBrowserWidget(QWidget):
             
         # Metadata
         self._meta_table.setRowCount(0)
+        self._original_meta_keys = list(meta.all_tags.keys()) if meta.all_tags else []
         
         if meta.all_tags:
             tags = list(meta.all_tags.items())
@@ -875,42 +913,9 @@ class MusicBrowserWidget(QWidget):
                 ("Track", str(meta.track_num)),
                 ("Year", str(meta.year)),
             ]
-        
-        # Tags known to be parsed by the Snowsky Echo Mini firmware
-        recognized_tags = {
-            "title", "artist", "album", "albumartist", "album artist",
-            "tracknumber", "track", "discnumber", "genre", "tit2", "tpe1", "talb", "tpe2", "trck", "tpos", "tcon"
-        }
             
-        for i, (k, v) in enumerate(tags):
-            self._meta_table.insertRow(i)
-            
-            # Key column: Persistent textbox
-            key_edit = QLineEdit(k)
-            key_edit.setStyleSheet("QLineEdit { border: none; background: transparent; padding: 4px 8px; }")
-            self._meta_table.setCellWidget(i, 0, key_edit)
-            
-            # Dummy items for background painting
-            key_bg_item = QTableWidgetItem()
-            val_bg_item = QTableWidgetItem()
-            
-            # Value column: Persistent textbox
-            val_edit = QLineEdit(str(v))
-            val_edit.setStyleSheet("QLineEdit { border: none; background: transparent; padding: 4px 8px; }")
-            self._meta_table.setCellWidget(i, 1, val_edit)
-            
-            # Highlight recognized tags
-            if k.lower() in recognized_tags:
-                green_brush = QBrush(QColor(40, 80, 40)) # Subtle dark green
-                key_bg_item.setBackground(green_brush)
-                val_bg_item.setBackground(green_brush)
-                
-                tooltip = "Tag Recognised by Snowsky"
-                key_edit.setToolTip(tooltip)
-                val_edit.setToolTip(tooltip)
-                
-            self._meta_table.setItem(i, 0, key_bg_item)
-            self._meta_table.setItem(i, 1, val_bg_item)
+        for k, v in tags:
+            self._insert_meta_row(k, str(v))
             
         # Ensure rows are tall enough to display the QLineEdits
         self._meta_table.resizeRowsToContents()
@@ -964,7 +969,99 @@ class MusicBrowserWidget(QWidget):
             table.setItem(i, 1, QTableWidgetItem(str(value)))
         table.setSortingEnabled(True)
 
+    def _insert_meta_row(self, key: str, value: str) -> int:
+        row = self._meta_table.rowCount()
+        self._meta_table.insertRow(row)
+
+        key_edit = QLineEdit(key)
+        key_edit.setStyleSheet(_META_LINE_EDIT_STYLE)
+        key_edit.setPlaceholderText("Tag name")
+        key_edit.textChanged.connect(self._on_meta_key_changed)
+        self._meta_table.setCellWidget(row, 0, key_edit)
+
+        val_edit = QLineEdit(value)
+        val_edit.setStyleSheet(_META_LINE_EDIT_STYLE)
+        val_edit.setPlaceholderText("Value")
+        self._meta_table.setCellWidget(row, 1, val_edit)
+
+        delete_btn = QPushButton("Delete")
+        delete_btn.setToolTip("Remove this tag from the file when you save.")
+        delete_btn.setFocusPolicy(Qt.NoFocus)
+        delete_btn.setStyleSheet(_META_DELETE_BTN_STYLE)
+        delete_btn.clicked.connect(self._on_delete_tag_clicked)
+        self._meta_table.setCellWidget(row, 2, delete_btn)
+
+        for col in range(3):
+            item = QTableWidgetItem()
+            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self._meta_table.setItem(row, col, item)
+
+        self._refresh_meta_row_highlight(row)
+        return row
+
+    def _on_meta_key_changed(self, _text: str = "") -> None:
+        edit = self.sender()
+        for row in range(self._meta_table.rowCount()):
+            if self._meta_table.cellWidget(row, 0) is edit:
+                self._refresh_meta_row_highlight(row)
+                return
+
+    def _refresh_meta_row_highlight(self, row: int) -> None:
+        if row < 0 or row >= self._meta_table.rowCount():
+            return
+        key_edit = self._meta_table.cellWidget(row, 0)
+        val_edit = self._meta_table.cellWidget(row, 1)
+        key = key_edit.text().strip() if isinstance(key_edit, QLineEdit) else ""
+        recognized = key.lower() in _RECOGNIZED_TAGS
+        brush = QBrush(QColor(40, 80, 40)) if recognized else QBrush()
+        tooltip = "Tag Recognised by Snowsky" if recognized else ""
+        for col in range(3):
+            item = self._meta_table.item(row, col)
+            if item is not None:
+                item.setBackground(brush)
+        if isinstance(key_edit, QLineEdit):
+            key_edit.setToolTip(tooltip)
+        if isinstance(val_edit, QLineEdit):
+            val_edit.setToolTip(tooltip)
+
+    def _on_add_tag_clicked(self) -> None:
+        row = self._insert_meta_row("", "")
+        self._meta_table.resizeRowToContents(row)
+        item = self._meta_table.item(row, 0)
+        if item is not None:
+            self._meta_table.scrollToItem(item)
+        key_edit = self._meta_table.cellWidget(row, 0)
+        if isinstance(key_edit, QLineEdit):
+            key_edit.setFocus()
+
+    def _on_delete_tag_clicked(self, _checked: bool = False) -> None:
+        button = self.sender()
+        for row in range(self._meta_table.rowCount()):
+            if self._meta_table.cellWidget(row, 2) is button:
+                self._meta_table.removeRow(row)
+                return
+
+    def _tags_from_meta_table(self) -> dict[str, str | None]:
+        current: dict[str, str] = {}
+        for row in range(self._meta_table.rowCount()):
+            key_widget = self._meta_table.cellWidget(row, 0)
+            val_widget = self._meta_table.cellWidget(row, 1)
+            if not isinstance(key_widget, QLineEdit) or not isinstance(val_widget, QLineEdit):
+                continue
+            key = key_widget.text().strip()
+            if key:
+                current[key] = val_widget.text()
+
+        current_lower = {key.lower() for key in current}
+        result: dict[str, str | None] = {}
+        for original in self._original_meta_keys:
+            if original.lower() not in current_lower:
+                result[original] = None
+        result.update(current)
+        return result
+
     def _clear_details(self) -> None:
+        self._original_meta_keys = []
         self._props_table.setRowCount(0)
         self._meta_table.setRowCount(0)
         self._art_table.setRowCount(0)
@@ -1055,17 +1152,15 @@ class MusicBrowserWidget(QWidget):
         item = self._tree_model.itemFromIndex(index)
         filepath = item.data(Qt.UserRole)
         
-        # Gather tags from table
-        new_tags = {}
-        for row in range(self._meta_table.rowCount()):
-            key_widget = self._meta_table.cellWidget(row, 0)
-            val_widget = self._meta_table.cellWidget(row, 1)
-            
-            if key_widget and val_widget:
-                k = key_widget.text().strip()
-                if k:
-                    new_tags[k] = val_widget.text()
-                
+        new_tags = self._tags_from_meta_table()
+        if not new_tags:
+            QMessageBox.information(
+                self,
+                "No metadata changes",
+                "Add a tag or keep at least one existing tag before saving.",
+            )
+            return
+
         self._meta_save_btn.setText("Saving...")
         QApplication.processEvents()
         
@@ -1074,6 +1169,9 @@ class MusicBrowserWidget(QWidget):
         
         if success:
             self._data_model.update_metadata(filepath, new_tags)
+            self._original_meta_keys = [
+                key for key, value in new_tags.items() if value is not None
+            ]
             QMessageBox.information(self, "Success", "Metadata saved successfully.")
         else:
             QMessageBox.critical(self, "Error", f"Failed to save metadata:\n{msg}")
