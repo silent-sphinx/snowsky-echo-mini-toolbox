@@ -358,6 +358,7 @@ class MainWindow(QMainWindow):
         # Pass the unified data model to the child tabs
         self._music_browser.populate_data(data_model)
         self._music_compatibility.populate_data(data_model)
+        self._metadata_manager.populate_data(data_model)
         self._album_art.populate_data(data_model)
         self._lyrics_manager.populate_data(data_model)
         

@@ -1,170 +1,176 @@
-"""
-Metadata Manager — main composite widget.
-
-Combines the search/filter toolbar, stat cards, and the styled table view
-into a complete metadata browsing interface.
-"""
-
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QThread, QTimer, QModelIndex, Slot
 from PySide6.QtWidgets import (
-    QCheckBox,
-    QComboBox,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QPushButton,
-    QStackedWidget,
-    QVBoxLayout,
     QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QTableView,
+    QStackedWidget,
+    QLineEdit,
+    QComboBox,
+    QPushButton,
+    QProgressDialog,
+    QMessageBox,
+    QApplication,
+    QStyledItemDelegate,
+    QDialog,
 )
+from PySide6.QtGui import QBrush
 
-from ..demo_data import generate_demo_tracks
-from ..models.metadata_filter_proxy import MetadataFilterProxyModel
-from ..models.metadata_table_model import Column, MetadataTableModel
 from ..theme import Colours
-from ..views.delegates import CodecBadgeDelegate, MissingFieldDelegate
-from ..views.metadata_table_view import MetadataTableView
+from ..models.drive_data import DriveDataModel, TrackMetadata
+from ..models.metadata_table_model import (
+    MetadataTableModel,
+    MetadataFilterProxyModel,
+    MetaColumn,
+)
+from ..threads.bulk_metadata import BulkMetadataWorker
+from .bulk_metadata_dialog import BulkMetadataDialog
 from .page_chrome import filter_toolbar, loading_page, page_header
 from .stat_card import StatCard
+from .grouped_header_view import GroupedHeaderView
+
+
+class HighlightDelegate(QStyledItemDelegate):
+    """Custom delegate to enforce background colors over QSS/Alternating rows."""
+
+    def paint(self, painter, option, index):
+        bg = index.data(Qt.BackgroundRole)
+        if bg:
+            painter.fillRect(option.rect, bg)
+            option.backgroundBrush = QBrush(Qt.NoBrush)
+        super().paint(painter, option, index)
+
+    def createEditor(self, parent, option, index):
+        editor = super().createEditor(parent, option, index)
+        if isinstance(editor, QLineEdit):
+            # Global QLineEdit padding (7px) is taller than the 28px table row
+            # and clips the glyphs. Keep the editor flush with the cell.
+            editor.setFrame(False)
+            editor.setContentsMargins(0, 0, 0, 0)
+            editor.setTextMargins(6, 0, 6, 0)
+            editor.setStyleSheet(f"""
+                QLineEdit {{
+                    background-color: {Colours.BG_ELEVATED};
+                    color: {Colours.TEXT_PRIMARY};
+                    border: 1px solid {Colours.ACCENT};
+                    padding: 0px 6px;
+                    font-size: 12px;
+                    min-height: 0px;
+                }}
+            """)
+        return editor
+
+    def updateEditorGeometry(self, editor, option, index):
+        editor.setGeometry(option.rect)
 
 
 class MetadataManager(QWidget):
-    """
-    Complete metadata management interface.
-
-    Contains:
-    - Header with title
-    - Search bar + filter controls toolbar
-    - Stat cards row
-    - Full-width metadata table
-    - Status bar with row counts
-    """
-
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._data_model = None
+        self._last_checked_row = None
+        self._bulk_busy = False
+        self._bulk_thread: QThread | None = None
+        self._bulk_worker: BulkMetadataWorker | None = None
+        self._bulk_progress: QProgressDialog | None = None
+        self._bulk_tags: dict[str, str | None] = {}
         self._init_models()
         self._init_ui()
         self._connect_signals()
-        self._load_demo_data()
-
-    # ── Model setup ─────────────────────────────────────────────────
 
     def _init_models(self) -> None:
         self._source_model = MetadataTableModel(self)
         self._proxy_model = MetadataFilterProxyModel(self)
         self._proxy_model.setSourceModel(self._source_model)
 
-    # ── UI construction ─────────────────────────────────────────────
-
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 8)
         layout.setSpacing(12)
 
+        self._edit_btn = QPushButton("Bulk Edit Selected")
+        self._edit_btn.setObjectName("accentButton")
+        self._edit_btn.setEnabled(False)
+        self._edit_btn.setMinimumHeight(34)
+
         layout.addWidget(page_header(
             "Metadata Browser",
-            "Browse and manage audio file metadata across your library",
+            "Browse and edit audio tags, including tracks missing Title, Artist, or Album",
+            [self._edit_btn],
         ))
 
-        # ── Stacked Widget ──────────────────────────────────────
         self._stack = QStackedWidget()
         self._stack.addWidget(loading_page(
-            "Results will be ready soon.",
-            "Music is being processed...",
+            "Hardware scan in progress.",
+            "Metadata analysis running...",
         ))
-        
-        # Page 1: Data State
+
         data_page = QWidget()
         data_layout = QVBoxLayout(data_page)
         data_layout.setContentsMargins(0, 0, 0, 0)
         data_layout.setSpacing(12)
 
-        # ── Toolbar (search + filters) ──────────────────────────
-        toolbar = self._build_toolbar()
-        data_layout.addWidget(toolbar)
+        toolbar_panel, toolbar = filter_toolbar()
 
-        # ── Stat cards ──────────────────────────────────────────
-        stats = self._build_stat_cards()
-        data_layout.addLayout(stats)
-
-        # ── Table ───────────────────────────────────────────────
-        self._table_view = MetadataTableView(self)
-        self._table_view.setModel(self._proxy_model)
-
-        # Apply delegates
-        self._codec_delegate = CodecBadgeDelegate(self)
-        self._table_view.setItemDelegateForColumn(Column.CODEC, self._codec_delegate)
-
-        self._missing_title_delegate = MissingFieldDelegate(self)
-        self._missing_artist_delegate = MissingFieldDelegate(self)
-        self._missing_album_delegate = MissingFieldDelegate(self)
-        self._table_view.setItemDelegateForColumn(Column.TITLE, self._missing_title_delegate)
-        self._table_view.setItemDelegateForColumn(Column.ARTIST, self._missing_artist_delegate)
-        self._table_view.setItemDelegateForColumn(Column.ALBUM, self._missing_album_delegate)
-
-        self._table_view.apply_column_widths()
-        data_layout.addWidget(self._table_view, 1)  # stretch factor 1 — fills remaining space
-
-        # ── Status bar ──────────────────────────────────────────
-        status = self._build_status_bar()
-        data_layout.addLayout(status)
-        
-        self._stack.addWidget(data_page)
-        layout.addWidget(self._stack, 1)
-
-    def _build_toolbar(self) -> QWidget:
-        """Build the search + filter toolbar panel."""
-        panel, toolbar = filter_toolbar()
-        toolbar.setSpacing(12)
-
-        # Search input
         self._search_input = QLineEdit()
-        self._search_input.setPlaceholderText("🔍  Search by title, artist, album, file path…")
+        self._search_input.setPlaceholderText(
+            "Search by title, artist, album, genre or file path…"
+        )
         self._search_input.setClearButtonEnabled(True)
         self._search_input.setMinimumHeight(34)
         toolbar.addWidget(self._search_input, 1)
 
-        # Codec filter
-        self._codec_combo = QComboBox()
-        self._codec_combo.addItems(["All Codecs", "FLAC", "MP3", "AAC", "OGG", "WAV", "OPUS"])
-        self._codec_combo.setMinimumHeight(34)
-        toolbar.addWidget(self._codec_combo)
+        self._status_combo = QComboBox()
+        self._status_combo.addItems([
+            "All Statuses",
+            "Complete",
+            "Missing Metadata",
+            "Missing Title",
+            "Missing Artist",
+            "Missing Album",
+        ])
+        self._status_combo.setMinimumHeight(34)
+        self._status_combo.setMinimumWidth(170)
+        self._status_combo.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {Colours.BG_SURFACE};
+                border: 1px solid {Colours.BORDER_DEFAULT};
+                border-radius: 0px;
+                padding: 4px 12px;
+                color: {Colours.TEXT_PRIMARY};
+                font-weight: 500;
+            }}
+            QComboBox:hover {{
+                border-color: {Colours.ACCENT};
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 24px;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid {Colours.TEXT_SECONDARY};
+                margin-right: 8px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {Colours.BG_ELEVATED};
+                border: 1px solid {Colours.BORDER_DEFAULT};
+                selection-background-color: {Colours.ACCENT_MUTED};
+                color: {Colours.TEXT_PRIMARY};
+                outline: none;
+            }}
+        """)
+        toolbar.addWidget(self._status_combo)
 
-        # Separator
-        sep = QFrame()
-        sep.setFrameShape(QFrame.VLine)
-        sep.setStyleSheet(f"color: {Colours.BORDER_SUBTLE};")
-        sep.setFixedWidth(1)
-        toolbar.addWidget(sep)
+        data_layout.addWidget(toolbar_panel)
 
-        # Missing metadata filter checkboxes
-        self._chk_missing_title = QCheckBox("Missing Title")
-        self._chk_missing_artist = QCheckBox("Missing Artist")
-        self._chk_missing_album = QCheckBox("Missing Album")
-
-        toolbar.addWidget(self._chk_missing_title)
-        toolbar.addWidget(self._chk_missing_artist)
-        toolbar.addWidget(self._chk_missing_album)
-
-        # Spacer + action button
-        toolbar.addStretch()
-
-        self._scan_btn = QPushButton("⟳  Refresh")
-        self._scan_btn.setObjectName("accentButton")
-        self._scan_btn.setMinimumHeight(34)
-        toolbar.addWidget(self._scan_btn)
-
-        return panel
-
-    def _build_stat_cards(self) -> QHBoxLayout:
-        """Build the row of stat summary cards."""
         stats_layout = QHBoxLayout()
         stats_layout.setSpacing(10)
 
-        self._stat_total = StatCard("Total Tracks", Colours.STAT_TOTAL, self)
-        self._stat_missing = StatCard("Missing Metadata", Colours.STAT_MISSING, self)
+        self._stat_total = StatCard("Total Scanned", Colours.STAT_TOTAL, self)
+        self._stat_missing = StatCard("Missing Metadata", Colours.STATUS_MISSING, self)
         self._stat_title = StatCard("Missing Title", Colours.STAT_TITLE, self)
         self._stat_artist = StatCard("Missing Artist", Colours.STAT_ARTIST, self)
         self._stat_album = StatCard("Missing Album", Colours.STAT_ALBUM, self)
@@ -174,124 +180,304 @@ class MetadataManager(QWidget):
         stats_layout.addWidget(self._stat_title)
         stats_layout.addWidget(self._stat_artist)
         stats_layout.addWidget(self._stat_album)
+        data_layout.addLayout(stats_layout)
 
-        return stats_layout
+        self._table = QTableView()
+        self._table.setModel(self._proxy_model)
+        self._table.setAlternatingRowColors(True)
+        self._table.setShowGrid(False)
+        self._table.setSelectionBehavior(QTableView.SelectRows)
+        self._table.setSelectionMode(QTableView.ExtendedSelection)
+        self._table.setEditTriggers(QTableView.DoubleClicked | QTableView.EditKeyPressed)
+        self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(28)
 
-    def _build_status_bar(self) -> QHBoxLayout:
-        """Build the bottom status row with row count info."""
-        status_layout = QHBoxLayout()
-        status_layout.setSpacing(16)
+        header_view = GroupedHeaderView(self._table)
+        self._table.setHorizontalHeader(header_view)
+        header_view.setStretchLastSection(True)
+        self._table.setSortingEnabled(True)
+        self._table.sortByColumn(-1, Qt.AscendingOrder)
+        header_view.add_group("Core Tags", 1, 4)
+        header_view.add_group("Release", 5, 7)
+        header_view.add_group("Status", 8, 9)
 
-        self._status_showing = QLabel("Showing 0 tracks")
-        self._status_showing.setObjectName("subtitleLabel")
-        status_layout.addWidget(self._status_showing)
+        self._delegate = HighlightDelegate(self._table)
+        for col in range(1, MetaColumn.COUNT):
+            self._table.setItemDelegateForColumn(col, self._delegate)
 
-        self._status_selected = QLabel("")
-        self._status_selected.setObjectName("subtitleLabel")
-        status_layout.addWidget(self._status_selected)
+        data_layout.addWidget(self._table, 1)
 
-        status_layout.addStretch()
-
-        self._status_total = QLabel("")
-        self._status_total.setObjectName("subtitleLabel")
-        status_layout.addWidget(self._status_total)
-
-        return status_layout
-
-    # ── Signal connections ──────────────────────────────────────────
+        self._stack.addWidget(data_page)
+        layout.addWidget(self._stack, 1)
 
     def _connect_signals(self) -> None:
-        # Search
         self._search_input.textChanged.connect(self._on_search_changed)
+        self._status_combo.currentTextChanged.connect(self._on_status_filter_changed)
+        self._table.clicked.connect(self._on_table_clicked)
+        self._edit_btn.clicked.connect(self._open_bulk_edit_dialog)
+        self._source_model.dataChanged.connect(self._on_source_data_changed)
+        self._source_model.save_failed.connect(self._on_save_failed)
 
-        # Codec filter
-        self._codec_combo.currentTextChanged.connect(self._on_codec_filter_changed)
+    def _checked_tracks(self) -> list[TrackMetadata]:
+        return [track for track in self._source_model.tracks() if track.meta_is_checked]
 
-        # Missing field checkboxes
-        self._chk_missing_title.stateChanged.connect(
-            lambda state: self._proxy_model.set_show_missing_title(state == Qt.Checked)
+    def _is_ready(self) -> bool:
+        return (
+            self._data_model is not None
+            and self._stack.currentIndex() == 1
+            and not self._bulk_busy
         )
-        self._chk_missing_artist.stateChanged.connect(
-            lambda state: self._proxy_model.set_show_missing_artist(state == Qt.Checked)
+
+    def _update_action_button_state(self) -> None:
+        self._edit_btn.setEnabled(bool(self._checked_tracks()) and self._is_ready())
+
+    def _on_source_data_changed(self, top_left: QModelIndex, bottom_right: QModelIndex, roles=None) -> None:
+        if top_left.column() <= MetaColumn.CHECK <= bottom_right.column():
+            if roles is None or not roles or Qt.CheckStateRole in roles:
+                self._update_action_button_state()
+        if bottom_right.column() > MetaColumn.CHECK:
+            self._update_stats()
+
+    @Slot(str, str)
+    def _on_save_failed(self, filename: str, message: str) -> None:
+        QMessageBox.critical(
+            self,
+            "Save Failed",
+            f"Failed to save metadata for {filename}:\n{message}",
         )
-        self._chk_missing_album.stateChanged.connect(
-            lambda state: self._proxy_model.set_show_missing_album(state == Qt.Checked)
+
+    def _open_bulk_edit_dialog(self) -> None:
+        if self._data_model is None or self._bulk_thread is not None:
+            return
+
+        checked = self._checked_tracks()
+        if not checked:
+            QMessageBox.information(self, "Nothing Selected", "Tick one or more files in the table first.")
+            return
+
+        dialog = BulkMetadataDialog(checked, self)
+        if not dialog.eligible_tracks():
+            QMessageBox.information(
+                self,
+                "Bulk Edit Metadata",
+                "None of the selected files can store audio metadata.",
+            )
+            return
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        tags = dialog.tags_to_apply()
+        if not tags:
+            return
+
+        self._start_bulk_edit(dialog.eligible_tracks(), tags)
+
+    def _start_bulk_edit(
+        self, tracks: list[TrackMetadata], tags: dict[str, str | None]
+    ) -> None:
+        self._bulk_tags = tags
+
+        progress = QProgressDialog(
+            f"Updating {len(tracks)} songs...",
+            "Cancel",
+            0,
+            len(tracks),
+            self,
+        )
+        progress.setWindowTitle("Bulk Edit Metadata")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+
+        self._bulk_progress = progress
+        self._bulk_busy = True
+        self._update_action_button_state()
+
+        self._bulk_thread = QThread(self)
+        self._bulk_worker = BulkMetadataWorker(tracks, tags)
+        self._bulk_worker.moveToThread(self._bulk_thread)
+
+        self._bulk_thread.started.connect(self._bulk_worker.run)
+        self._bulk_worker.progress.connect(self._on_bulk_progress)
+        self._bulk_worker.finished.connect(self._on_bulk_finished)
+        self._bulk_worker.cancelled.connect(self._on_bulk_cancelled)
+        self._bulk_worker.failed.connect(self._on_bulk_failed)
+
+        self._bulk_worker.finished.connect(self._bulk_thread.quit)
+        self._bulk_worker.cancelled.connect(self._bulk_thread.quit)
+        self._bulk_worker.failed.connect(self._bulk_thread.quit)
+        self._bulk_thread.finished.connect(self._bulk_worker.deleteLater)
+        self._bulk_thread.finished.connect(self._bulk_thread.deleteLater)
+        self._bulk_thread.finished.connect(self._clear_bulk_refs)
+
+        progress.canceled.connect(self._cancel_bulk_edit)
+        self._bulk_thread.start()
+
+    def _cancel_bulk_edit(self) -> None:
+        if self._bulk_worker is not None:
+            self._bulk_worker.request_cancel()
+        if self._bulk_progress is not None:
+            self._bulk_progress.setLabelText("Finishing current file...")
+
+    def _clear_bulk_refs(self) -> None:
+        self._bulk_worker = None
+        self._bulk_thread = None
+
+    @Slot(int, int, str)
+    def _on_bulk_progress(self, processed: int, total: int, detail: str) -> None:
+        progress = self._bulk_progress
+        if progress is None:
+            return
+        try:
+            progress.setRange(0, max(total, 1))
+            progress.setValue(min(processed, max(total, 1)))
+            progress.setLabelText(detail)
+        except RuntimeError:
+            self._bulk_progress = None
+
+    def _close_bulk_progress(self) -> None:
+        worker = self._bulk_worker
+        if worker is not None:
+            try:
+                worker.progress.disconnect(self._on_bulk_progress)
+            except (RuntimeError, TypeError):
+                pass
+
+        progress = self._bulk_progress
+        self._bulk_progress = None
+        if progress is not None:
+            progress.blockSignals(True)
+            progress.close()
+
+        self._bulk_busy = False
+        self._update_action_button_state()
+
+    def _apply_bulk_results(self, payload: dict) -> tuple[int, list[str]]:
+        updated_paths = payload.get("updated_paths", [])
+        if self._data_model:
+            for filepath in updated_paths:
+                self._data_model.update_metadata(filepath, self._bulk_tags)
+        self._source_model.notify_paths_changed(updated_paths)
+        self._update_stats()
+        return len(updated_paths), payload.get("errors", [])
+
+    @Slot(object)
+    def _on_bulk_finished(self, payload: dict) -> None:
+        self._close_bulk_progress()
+        updated, errors = self._apply_bulk_results(payload)
+        total = payload.get("total", updated)
+
+        if errors:
+            preview = "\n".join(errors[:8])
+            extra = f"\n…and {len(errors) - 8} more." if len(errors) > 8 else ""
+            QMessageBox.warning(
+                self,
+                "Bulk edit finished with errors",
+                f"Updated {updated} of {total} songs.\n\n{preview}{extra}",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Bulk edit complete",
+                f"Updated metadata on {updated} song{'s' if updated != 1 else ''}.",
+            )
+
+    @Slot(object)
+    def _on_bulk_cancelled(self, payload: dict) -> None:
+        self._close_bulk_progress()
+        updated, _ = self._apply_bulk_results(payload)
+        QMessageBox.information(
+            self,
+            "Bulk edit cancelled",
+            f"Cancelled after updating {updated} of {payload.get('total', 0)} songs.",
         )
 
-        # All filter changes update the status bar
-        self._chk_missing_title.stateChanged.connect(self._update_status_bar)
-        self._chk_missing_artist.stateChanged.connect(self._update_status_bar)
-        self._chk_missing_album.stateChanged.connect(self._update_status_bar)
+    @Slot(str)
+    def _on_bulk_failed(self, message: str) -> None:
+        self._close_bulk_progress()
+        QMessageBox.critical(self, "Bulk edit failed", message)
 
-        # Scan button (reloads demo data for now)
-        self._scan_btn.clicked.connect(self._load_demo_data)
+    def _on_table_clicked(self, index: QModelIndex) -> None:
+        if index.column() == MetaColumn.CHECK:
+            modifiers = QApplication.keyboardModifiers()
+            is_shift = bool(modifiers & Qt.ShiftModifier)
 
-        # Selection changes
-        self._table_view.selectionModel()
+            state = self._proxy_model.data(index, Qt.CheckStateRole)
+            is_checked = state in (Qt.Checked, Qt.CheckState.Checked, 2)
+            new_val = Qt.Checked if is_checked else Qt.Unchecked
+            current_row = index.row()
 
-    # ── Filter handlers ─────────────────────────────────────────────
+            if is_shift and getattr(self, "_last_checked_row", None) is not None:
+                start = min(self._last_checked_row, current_row)
+                end = max(self._last_checked_row, current_row)
+                for r in range(start, end + 1):
+                    if r != current_row:
+                        idx = self._proxy_model.index(r, MetaColumn.CHECK)
+                        self._proxy_model.setData(idx, new_val, Qt.CheckStateRole)
+            else:
+                selection = self._table.selectionModel()
+                if selection.isSelected(index):
+                    for selected_index in selection.selectedRows(MetaColumn.CHECK):
+                        if selected_index.row() != current_row:
+                            self._proxy_model.setData(selected_index, new_val, Qt.CheckStateRole)
+
+            self._last_checked_row = current_row
+            self._update_action_button_state()
 
     def _on_search_changed(self, text: str) -> None:
         self._proxy_model.set_search_query(text)
-        self._update_status_bar()
 
-    def _on_codec_filter_changed(self, text: str) -> None:
-        codec = "" if text == "All Codecs" else text.lower()
-        self._proxy_model.set_codec_filter(codec)
-        self._update_status_bar()
+    def _on_status_filter_changed(self, text: str) -> None:
+        self._proxy_model.set_status_filter(text)
 
-    # ── Data loading ────────────────────────────────────────────────
+    def populate_data(self, data_model: DriveDataModel) -> None:
+        self._data_model = data_model
+        tracks = list(data_model.tracks.values())
 
-    def _load_demo_data(self) -> None:
-        """Load demo tracks into the model."""
-        tracks = generate_demo_tracks(200)
-        self._source_model.update_data(tracks)
+        for track in tracks:
+            track.meta_is_checked = False
 
-        # Re-apply column widths after data load
-        self._table_view.apply_column_widths()
+        self._source_model.update_data(tracks, data_model.root_path, data_model)
 
-        # Reconnect selection model (reset by model update)
-        sel_model = self._table_view.selectionModel()
-        if sel_model:
-            sel_model.selectionChanged.connect(self._on_selection_changed)
+        header = self._table.horizontalHeader()
+        font_metrics = header.fontMetrics()
 
-        # Update stats with animation (slight delay for visual effect)
+        baselines = {
+            MetaColumn.CHECK: 30,
+            MetaColumn.TITLE: 200,
+            MetaColumn.ARTIST: 150,
+            MetaColumn.ALBUM: 150,
+            MetaColumn.ALBUM_ARTIST: 150,
+            MetaColumn.TRACK: 70,
+            MetaColumn.GENRE: 110,
+            MetaColumn.YEAR: 70,
+            MetaColumn.STATUS: 110,
+            MetaColumn.REASON: 240,
+        }
+
+        for col in range(MetaColumn.COUNT):
+            if col in baselines:
+                text_width = font_metrics.horizontalAdvance(MetaColumn.HEADERS[col].upper()) + 45
+                header.resizeSection(col, max(baselines[col], text_width))
+
+        self._table.resizeColumnToContents(MetaColumn.FILE)
+        self._update_action_button_state()
         QTimer.singleShot(100, self._update_stats)
-        self._update_status_bar()
 
     def _update_stats(self) -> None:
-        """Update stat cards with current model data."""
         self._stat_total.set_value(self._source_model.total_tracks())
-        self._stat_missing.set_value(self._source_model.missing_any_count())
+        self._stat_missing.set_value(self._source_model.count_by_status("MISSING"))
         self._stat_title.set_value(self._source_model.missing_title_count())
         self._stat_artist.set_value(self._source_model.missing_artist_count())
         self._stat_album.set_value(self._source_model.missing_album_count())
 
-    def _update_status_bar(self) -> None:
-        """Update the bottom status bar text."""
-        visible = self._proxy_model.visible_row_count()
-        total = self._source_model.total_tracks()
-
-        if visible == total:
-            self._status_showing.setText(f"Showing all {total:,} tracks")
-        else:
-            self._status_showing.setText(f"Showing {visible:,} of {total:,} tracks")
-
-        self._status_total.setText(f"Total: {total:,}")
-
-    def _on_selection_changed(self) -> None:
-        """Update selection count in status bar."""
-        sel = self._table_view.selectionModel()
-        if sel:
-            count = len(sel.selectedRows())
-            if count > 0:
-                self._status_selected.setText(f"{count} selected")
-            else:
-                self._status_selected.setText("")
-                
     def set_processing_state(self, is_processing: bool) -> None:
-        """Toggle between loading view and data view."""
         if is_processing:
             self._stack.setCurrentIndex(0)
         else:
             self._stack.setCurrentIndex(1)
+        self._update_action_button_state()

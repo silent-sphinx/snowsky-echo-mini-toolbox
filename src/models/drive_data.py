@@ -97,6 +97,9 @@ class TrackMetadata:
     # Lyrics UI State (separate from is_checked / art_is_checked)
     lyrics_is_checked: bool = False
 
+    # Metadata Browser UI State (separate from other tab checkboxes)
+    meta_is_checked: bool = False
+
     @property
     def display_size(self) -> str:
         if self.size_bytes < 1024 * 1024:
@@ -177,6 +180,4 @@ class DriveDataModel:
         )
         track.genre = _get_case_insensitive(track.all_tags, ["genre", "tcon"])
         track.year = _get_case_insensitive(track.all_tags, ["year", "date", "tdrc"])
-        track_num = _get_case_insensitive(track.all_tags, ["tracknumber", "track", "trck"])
-        if track_num:
-            track.track_num = track_num
+        track.track_num = _get_case_insensitive(track.all_tags, ["tracknumber", "track", "trck"])

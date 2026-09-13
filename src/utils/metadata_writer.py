@@ -18,6 +18,7 @@ TAG_KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "albumartist": ("albumartist", "album artist", "album_artist", "tpe2"),
     "genre": ("genre", "tcon"),
     "date": ("date", "year", "tdrc", "tyer"),
+    "tracknumber": ("tracknumber", "track", "trck"),
 }
 
 
