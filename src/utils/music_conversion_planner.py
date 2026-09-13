@@ -77,7 +77,23 @@ def plan_conversion_for_track(
         actions.append("Downmix to stereo")
 
     if needs_sanitize:
-        actions.append("Sanitize metadata (strip non-core tags)")
+        reason = (
+            f"{track.comp_metadata_reason or ''} {track.comp_reason or ''} "
+            f"{track.comp_tag_encoding_reason or ''}"
+        )
+        if "UTF-8" in reason:
+            actions.append("Re-encode ID3 tags as UTF-16")
+        if "oversized" in reason.lower() or "before ALBUM" in reason:
+            actions.append("Reorder Vorbis comments (ALBUM before oversized tags)")
+        if "unknown tags" in reason.lower() or "non-standard ID3" in reason:
+            actions.append("Sanitize metadata (strip non-core tags)")
+        if not any(
+            action.startswith("Reorder")
+            or action.startswith("Sanitize")
+            or action.startswith("Re-encode")
+            for action in actions
+        ):
+            actions.append("Sanitize metadata (strip non-core tags)")
 
     if not actions:
         actions = ["No change — already compatible"]

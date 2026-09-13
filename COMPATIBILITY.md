@@ -27,6 +27,7 @@ This document describes exactly how the media compatibility checker evaluates au
 ## Tag Encoding
 
 * This device does not often work well with unusual encodings for tags, best to stick to UTF-16.
+* ID3v2 UTF-8 text frames (`encoding 0x03`) render as garbage because the firmware has no UTF-8 decoder. The checker marks those MP3/WAV/DSF files LIMITED; Convert rewrites the frames as UTF-16 (`0x01`) and saves ID3v2.3, without re-encoding audio.
 
 ## Album Art Requirements
 
@@ -61,3 +62,9 @@ The device has a very simplistic internal metadata parser that can be easily con
 - TRACKNUMBER (also matches Track)
 - DISCNUMBER (also matches Discnumber)
 - GENRE (also matches Genre)
+
+**Vorbis comment order (FLAC / OGG):**
+
+The firmware walks Vorbis comments in file order and copies values into a 128-character SRAM buffer. An oversized comment (commonly embedded `LYRICS`, thousands of characters) that appears *before* `ALBUM` overflows that buffer and hard-reboots the player.
+
+Safe lucida-style order (`ALBUM` / `ARTIST` first, `LYRICS` later, even if `TITLE` follows lyrics) plays. The same file with `LYRICS` before `ALBUM` is rejected or crashes. The checker flags that order as metadata-incompatible; Convert reorders core tags ahead of oversized values without re-encoding.

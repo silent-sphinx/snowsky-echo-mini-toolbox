@@ -122,7 +122,9 @@ class MusicConversionDialog(QDialog):
         warning = QLabel(
             "WARNING: To prevent the hardware abort bug, all metadata tags other than "
             "TITLE, ARTIST, ALBUM, ALBUMARTIST, TRACKNUMBER, DISCNUMBER, GENRE, and LYRICS "
-            "will be permanently removed from sanitized files."
+            "will be permanently removed from sanitized files. Oversized comments such as "
+            "LYRICS are kept but moved after ALBUM so they cannot crash the player. "
+            "MP3 files with UTF-8 ID3 tags are rewritten as UTF-16 (audio is not re-encoded)."
         )
         warning.setWordWrap(True)
         warning.setStyleSheet("color: #FF6E6E; font-weight: bold;")
