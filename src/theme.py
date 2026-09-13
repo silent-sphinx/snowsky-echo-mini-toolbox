@@ -274,6 +274,25 @@ def global_stylesheet() -> str:
         QTableView::item:hover {{
             background-color: {Colours.BG_HOVER};
         }}
+
+        /* ── List Widget ──────────────────────────────────── */
+        QListWidget {{
+            background-color: {Colours.BG_DARK};
+            color: {Colours.TEXT_PRIMARY};
+            border: 1px solid {Colours.BORDER_SUBTLE};
+            outline: none;
+            font-size: 12px;
+        }}
+
+        /* Do not pad ::item globally — custom item widgets (drive picker) get clipped. */
+        QListWidget::item:selected {{
+            background-color: {Colours.ACCENT_BG};
+            color: {Colours.TEXT_PRIMARY};
+        }}
+
+        QListWidget::item:hover {{
+            background-color: {Colours.BG_HOVER};
+        }}
         
         /* ── Tree View ────────────────────────────────────── */
         QTreeView {{

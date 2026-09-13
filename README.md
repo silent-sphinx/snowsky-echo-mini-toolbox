@@ -61,6 +61,7 @@ From there, work through the tabs that flag problems. Each one shows you what it
 - **Album art**: find artwork the device cannot display (wrong format, progressive JPEG, oversized), auto-fix it, or download replacements from MusicBrainz and the Cover Art Archive.
 - **Lyrics manager**: convert embedded lyrics into device-readable `.lrc` files and fetch missing ones from LRCLIB.
 - **File rename**: propose cleaner filenames from metadata, with a preview before anything is applied.
+- **Workflows**: chain backup, conversion, artwork, lyrics, metadata, rename, and cleanup into one saved run.
 - **File cleanup**: group files by type so unwanted categories can be removed safely.
 - **Backup & restore**: create ZIP backups, or copy and move your library elsewhere.
 
@@ -80,6 +81,7 @@ The `v2` rewrite is being rebuilt tab by tab. Everything below already ships in 
 | Lyrics manager | Implemented |
 | File rename | Implemented |
 | Backup & restore | Implemented |
+| Workflows | Implemented |
 | File cleanup | Not yet ported |
 
 ## Device compatibility

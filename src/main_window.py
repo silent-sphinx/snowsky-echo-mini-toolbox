@@ -28,6 +28,7 @@ from .widgets.drive_selector_panel import DriveSelectorPanel
 from .widgets.lyrics_manager import LyricsManagerWidget
 from .widgets.backup_restore_widget import BackupRestoreWidget
 from .widgets.file_rename_widget import FileRenameWidget
+from .widgets.workflow_widget import WorkflowWidget
 from .widgets.music_browser_widget import MusicBrowserWidget
 from .widgets.music_compatibility_widget import MusicCompatibilityWidget
 from .threads.drive_scanner import DriveScannerThread
@@ -115,6 +116,11 @@ class MainWindow(QMainWindow):
         self._backup_restore = BackupRestoreWidget()
         self._backup_restore.target_relocated.connect(self._on_location_selected)
         self._tabs.addTab(self._backup_restore, "Backup / Restore")
+
+        # Index 8: Workflows
+        self._workflows = WorkflowWidget()
+        self._workflows.needs_rescan.connect(self._rescan_current_target)
+        self._tabs.addTab(self._workflows, "Workflows")
         
         tab_layout.addWidget(self._tabs)
         main_layout.addWidget(tab_container)
@@ -143,6 +149,8 @@ class MainWindow(QMainWindow):
             )
             
     def closeEvent(self, event) -> None:
+        if hasattr(self, "_workflows"):
+            self._workflows.cancel_running_job()
         if hasattr(self, '_scanner_thread') and self._scanner_thread.isRunning():
             self._scanner_thread.cancel()
             self._scanner_thread.wait()
@@ -313,6 +321,7 @@ class MainWindow(QMainWindow):
         self._drive_btn.setText("Select Target Drive...")
         self._set_processing_state(False)
         self._backup_restore.set_target("")
+        self._workflows.set_target("")
         self._drive_panel._cancel_btn.setEnabled(False)
         self._drive_panel._cancel_btn.setVisible(False)
 
@@ -322,6 +331,7 @@ class MainWindow(QMainWindow):
         self._current_drive = path
         self._drive_btn.setText(self._current_drive)
         self._backup_restore.set_target(path)
+        self._workflows.set_target(path)
         self._drive_panel.hide()
         if hasattr(self, '_overlay'):
             self._overlay.hide()
@@ -340,16 +350,20 @@ class MainWindow(QMainWindow):
         else:
             self._tabs.setTabVisible(0, False)
             self._tabs.setCurrentIndex(1)
-            
-        # Set global processing state
+
+        self._start_library_scan(path)
+
+    def _rescan_current_target(self) -> None:
+        """Rescan the current target without changing the active tab."""
+        if not self._current_drive:
+            return
+        self._start_library_scan(self._current_drive)
+
+    def _start_library_scan(self, path: str) -> None:
         self._set_processing_state(True, "Initializing scan...")
-        
-        # Cancel any existing scan
-        if hasattr(self, '_scanner_thread') and self._scanner_thread.isRunning():
+        if hasattr(self, "_scanner_thread") and self._scanner_thread.isRunning():
             self._scanner_thread.cancel()
             self._scanner_thread.wait()
-            
-        # Start the global data scanner
         self._scanner_thread = DriveScannerThread(path, self)
         self._scanner_thread.progress_updated.connect(self._on_scan_progress)
         self._scanner_thread.scan_finished.connect(self._on_scan_finished)
@@ -390,6 +404,7 @@ class MainWindow(QMainWindow):
         self._lyrics_manager.populate_data(data_model)
         self._file_rename.populate_data(data_model)
         self._backup_restore.populate_data(data_model)
+        self._workflows.populate_data(data_model)
 
     def _set_processing_state(self, is_processing: bool, status_text: str = "Processing data...") -> None:
         """Toggle the global loading state and UI indicators."""
@@ -409,4 +424,5 @@ class MainWindow(QMainWindow):
         self._lyrics_manager.set_processing_state(is_processing)
         self._file_rename.set_processing_state(is_processing)
         self._backup_restore.set_processing_state(is_processing)
+        self._workflows.set_processing_state(is_processing)
 

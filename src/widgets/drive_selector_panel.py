@@ -174,6 +174,7 @@ class DriveSelectorPanel(QFrame):
                 outline: none;
             }}
             QListWidget::item {{
+                padding: 0px;
                 border-bottom: 1px solid {Colours.BORDER_SUBTLE};
             }}
             QListWidget::item:hover {{

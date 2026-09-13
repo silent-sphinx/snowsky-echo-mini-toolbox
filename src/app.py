@@ -3,7 +3,7 @@ Application entry point for the rewrite.
 """
 
 import sys
-from PySide6.QtCore import Qt, QtMsgType, qInstallMessageHandler
+from PySide6.QtCore import QCoreApplication, Qt, QtMsgType, qInstallMessageHandler
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
@@ -35,6 +35,9 @@ def main() -> int:
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
     qInstallMessageHandler(_qt_message_handler)
+
+    QCoreApplication.setOrganizationName("Snowsky Echo Mini Toolbox")
+    QCoreApplication.setApplicationName("Snowsky Echo Mini Toolbox")
 
     app = QApplication(sys.argv)
 
