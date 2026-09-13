@@ -65,6 +65,9 @@ The device has a very simplistic internal metadata parser that can be easily con
 
 **Vorbis comment order (FLAC / OGG):**
 
-The firmware walks Vorbis comments in file order and copies values into a 128-character SRAM buffer. An oversized comment (commonly embedded `LYRICS`, thousands of characters) that appears *before* `ALBUM` overflows that buffer and hard-reboots the player.
+The firmware walks Vorbis comments in file order and copies values into a 128-character SRAM buffer. An oversized comment (commonly embedded `LYRICS` or `TIDAL_DATA`, thousands of characters) that appears *before* a core tag overflows that buffer.
 
-Safe lucida-style order (`ALBUM` / `ARTIST` first, `LYRICS` later, even if `TITLE` follows lyrics) plays. The same file with `LYRICS` before `ALBUM` is rejected or crashes. The checker flags that order as metadata-incompatible; Convert reorders core tags ahead of oversized values without re-encoding.
+- Before `ALBUM`: the player often hard-reboots.
+- After `ALBUM` but before `ARTIST` / `ALBUMARTIST` / `TITLE` / `TRACKNUMBER`: the file may still play, but those later tags never land in the library, so albums fail to group.
+
+Safe order is every firmware-parsed tag first (`TITLE`, `ARTIST`, `ALBUM`, `ALBUMARTIST`, `TRACKNUMBER`, `DISCNUMBER`, `GENRE`), with oversized values such as `LYRICS` last. The checker flags any oversized comment that appears before a core tag still waiting in the file. Convert reorders core tags to the front and, by default, deletes every tag the device does not read.

@@ -83,10 +83,10 @@ def plan_conversion_for_track(
         )
         if "UTF-8" in reason:
             actions.append("Re-encode ID3 tags as UTF-16")
-        if "oversized" in reason.lower() or "before ALBUM" in reason:
-            actions.append("Reorder Vorbis comments (ALBUM before oversized tags)")
+        if "oversized" in reason.lower():
+            actions.append("Reorder Vorbis comments (core tags before oversized tags)")
         if "unknown tags" in reason.lower() or "non-standard ID3" in reason:
-            actions.append("Sanitize metadata (strip non-core tags)")
+            actions.append("Sanitize metadata (strip tags the device does not read)")
         if not any(
             action.startswith("Reorder")
             or action.startswith("Sanitize")

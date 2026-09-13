@@ -9,8 +9,9 @@ logger = logging.getLogger(__name__)
 # Firmware copies Vorbis comment values into fixed 128-char SRAM arrays.
 MAX_TAG_VALUE_LENGTH = 128
 
-# Core tags the firmware extracts. ALBUM must appear before any oversized
-# comment (e.g. LYRICS); otherwise the parser overflows and the device reboots.
+# Core tags the firmware extracts. These must appear before any oversized
+# comment (e.g. LYRICS, TIDAL_DATA); otherwise the parser overflows SRAM and
+# later tags never make it into the on-device library (albums fail to group).
 CORE_TAG_WRITE_ORDER = (
     "title",
     "artist",
@@ -20,6 +21,11 @@ CORE_TAG_WRITE_ORDER = (
     "discnumber",
     "genre",
 )
+CORE_TAG_SET = set(CORE_TAG_WRITE_ORDER)
+
+# Kept on sanitize so Lyrics Manager can still export a sidecar. Moved after
+# core tags so it cannot abort ARTIST/ALBUM parsing.
+VORBIS_KEEP_ON_SANITIZE = CORE_TAG_SET | {"lyrics"}
 
 # ID3v2 frames the firmware actually reads. Extra frames can push these
 # outside the ~2-4KB SRAM window. USLT is kept on sanitize (same as Vorbis LYRICS).
@@ -50,36 +56,56 @@ def _vorbis_comment_pairs(tags) -> list[tuple[str, str]]:
     return pairs
 
 
+def oversized_comment_before_core_tags(
+    pairs: list[tuple[str, str]],
+    max_length: int = MAX_TAG_VALUE_LENGTH,
+) -> tuple[str, int, tuple[str, ...]] | None:
+    """Return (key, length, pending_core_tags) if an oversized comment
+    appears before a firmware-parsed tag that exists later in the file.
+
+    Device testing: lucida FLACs with ALBUM/ARTIST first and LYRICS later play
+    and group. The same file with LYRICS before ALBUM hard-reboots. Files with
+    ALBUM first but ARTIST/TITLE after LYRICS play, yet fail to group into
+    albums because those tags never get copied out of the smashed SRAM buffer.
+    """
+    present: list[str] = []
+    seen: set[str] = set()
+    for key, _ in pairs:
+        lowered = key.lower()
+        if lowered in CORE_TAG_SET and lowered not in seen:
+            present.append(lowered)
+            seen.add(lowered)
+    if not present:
+        return None
+
+    pending = set(present)
+    for key, value in pairs:
+        lowered = key.lower()
+        if lowered in pending:
+            pending.discard(lowered)
+            if not pending:
+                return None
+            continue
+        if pending and len(value) > max_length:
+            still = tuple(name for name in CORE_TAG_WRITE_ORDER if name in pending)
+            return key, len(value), still
+    return None
+
+
 def oversized_comment_before_album(
     pairs: list[tuple[str, str]],
     max_length: int = MAX_TAG_VALUE_LENGTH,
 ) -> tuple[str, int] | None:
-    """Return (key, length) if an oversized comment appears before ALBUM.
-
-    Device testing: lucida FLACs with ALBUM first and LYRICS later play.
-    The same file with LYRICS before ALBUM hard-reboots the player.
-    TITLE after LYRICS is safe, so only ALBUM is required to precede
-    oversized comments.
-    """
-    has_album = any(key.lower() == "album" for key, _ in pairs)
-    if not has_album:
+    """Back-compat wrapper around oversized_comment_before_core_tags."""
+    result = oversized_comment_before_core_tags(pairs, max_length)
+    if result is None:
         return None
-
-    seen_album = False
-    for key, value in pairs:
-        if key.lower() == "album":
-            seen_album = True
-            continue
-        if seen_album:
-            continue
-        if len(value) > max_length:
-            return key, len(value)
-    return None
+    return result[0], result[1]
 
 
 class MetadataSanitizer:
     def __init__(self):
-        self.known_tags = set(CORE_TAG_WRITE_ORDER)
+        self.known_tags = CORE_TAG_SET
         self.bloat_prefixes = ("musicbrainz_", "tidal_")
         self.limit = 20
 
@@ -131,7 +157,8 @@ class MetadataSanitizer:
         that overflows the firmware's 128-char SRAM copy buffer.
 
         For FLAC/OGG: checks Vorbis Comments against the 20-tag unknown limit
-        and requires ALBUM to appear before any comment longer than 128 chars.
+        and requires every firmware-parsed tag (TITLE, ARTIST, ALBUM, …) to
+        appear before any comment longer than 128 chars.
         For ID3v2 formats (MP3, WAV, DSF): checks for excessive non-standard
         frames that push core tags outside the firmware's ~2-4KB read window.
 
@@ -157,15 +184,16 @@ class MetadataSanitizer:
                         f"tags and safely reduce the count."
                     )
 
-                offending = oversized_comment_before_album(_vorbis_comment_pairs(audio.tags))
+                offending = oversized_comment_before_core_tags(_vorbis_comment_pairs(audio.tags))
                 if offending is not None:
-                    key, length = offending
+                    key, length, pending = offending
+                    pending_label = ", ".join(name.upper() for name in pending)
                     return False, (
-                        f"Oversized '{key}' tag ({length} chars) appears before ALBUM. "
+                        f"Oversized '{key}' tag ({length} chars) appears before {pending_label}. "
                         f"The firmware copies Vorbis comments into a {MAX_TAG_VALUE_LENGTH}-char "
-                        f"SRAM buffer and will crash or reject the file. Click "
-                        f"'Convert Selected Incompatible Media' to move ALBUM/TITLE ahead "
-                        f"of oversized comments."
+                        f"SRAM buffer; tags after an oversized comment are often missing on the "
+                        f"device (albums fail to group). Click 'Convert Selected Incompatible "
+                        f"Media' to move core tags first and strip unsupported tags."
                     )
 
                 return True, ""
@@ -229,9 +257,13 @@ class MetadataSanitizer:
 
     def sanitize(self, file_path: str | Path, preserve_third_party_tags: bool = False) -> bool:
         """
-        Strip bloat tags until the unknown tag count is below the limit,
-        reorder Vorbis comments so ALBUM/TITLE precede oversized values, and
-        rewrite ID3 UTF-8 text frames to UTF-16.
+        Strip tags the firmware does not parse, reorder Vorbis comments so
+        core tags precede oversized values, and rewrite ID3 UTF-8 text frames
+        to UTF-16.
+
+        By default every unsupported tag is removed (LYRICS is kept and moved
+        after the core tags). Pass preserve_third_party_tags=True to keep
+        extras, trimming only when they exceed the 20-tag crash limit.
         """
         try:
             audio = mutagen.File(file_path)
@@ -243,35 +275,37 @@ class MetadataSanitizer:
             if self._is_vorbis_tagged(audio):
                 unknown_tags = []
                 for key in audio.tags.keys():
-                    if key.lower() not in self.known_tags:
+                    if key.lower() not in VORBIS_KEEP_ON_SANITIZE:
                         unknown_tags.append(key)
 
-                if len(unknown_tags) > self.limit:
+                if unknown_tags:
                     if preserve_third_party_tags:
-                        # Keep as many custom tags as possible by targeting known bloat first.
-                        tags_to_delete = []
-                        for key in unknown_tags:
-                            key_lower = key.lower()
-                            if key_lower.startswith(self.bloat_prefixes):
-                                tags_to_delete.append(key)
-
-                        needed_deletions = len(unknown_tags) - self.limit
-                        if needed_deletions > len(tags_to_delete):
+                        extra_count = sum(
+                            1 for key in audio.tags.keys()
+                            if key.lower() not in self.known_tags
+                        )
+                        if extra_count > self.limit:
+                            tags_to_delete = []
                             for key in unknown_tags:
-                                if key not in tags_to_delete and key.lower() != "lyrics":
+                                key_lower = key.lower()
+                                if key_lower.startswith(self.bloat_prefixes):
                                     tags_to_delete.append(key)
-                                    if len(tags_to_delete) >= needed_deletions:
-                                        break
 
-                        for key in tags_to_delete:
-                            del audio[key]
-                    else:
-                        # Delete all unknown tags except 'lyrics'. Lyrics stay but are
-                        # moved after core tags on save so they cannot abort ALBUM parsing.
-                        for key in unknown_tags:
-                            if key.lower() != "lyrics":
+                            needed_deletions = extra_count - self.limit
+                            if needed_deletions > len(tags_to_delete):
+                                for key in unknown_tags:
+                                    if key not in tags_to_delete:
+                                        tags_to_delete.append(key)
+                                        if len(tags_to_delete) >= needed_deletions:
+                                            break
+
+                            for key in tags_to_delete:
                                 del audio[key]
-                    changed = True
+                            changed = True
+                    else:
+                        for key in unknown_tags:
+                            del audio[key]
+                        changed = True
 
                 if self._reorder_vorbis_comments(audio):
                     changed = True
@@ -285,15 +319,17 @@ class MetadataSanitizer:
                     if base_id not in ID3_PRESERVE_FRAMES:
                         unknown_tags.append(key)
 
-                if len(unknown_tags) > self.limit:
+                if unknown_tags:
                     if preserve_third_party_tags:
-                        needed_deletions = len(unknown_tags) - self.limit
-                        for key in unknown_tags[:needed_deletions]:
-                            del audio[key]
+                        if len(unknown_tags) > self.limit:
+                            needed_deletions = len(unknown_tags) - self.limit
+                            for key in unknown_tags[:needed_deletions]:
+                                del audio[key]
+                            changed = True
                     else:
                         for key in unknown_tags:
                             del audio[key]
-                    changed = True
+                        changed = True
 
             if changed:
                 self._save(audio, file_path)

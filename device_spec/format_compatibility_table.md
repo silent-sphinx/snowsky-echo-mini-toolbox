@@ -29,7 +29,7 @@ Based on reverse-engineering the RTOS firmware (`HIFIEC38.IMG`), the following t
 | **CUE Sheets** | `.cue` | **Buffer Overflow:** The parser increments tracks and writes 196 bytes per track into a fixed struct without bounds checking. Massive CUE sheets (> 99 tracks) will crash the OS. |
 | **Other Formats** | APEv2, MP4 Atoms, Vorbis | Supported MP4 atoms: `ilst`, `udta`, `covr`, `aART`, `esds`. Supported WAV RIFF chunks: `LIST`, `IART`, `INAM`, `IPRD`, `IGNR`. |
 | **Parsed Fields** | Title, Artist, Album, etc. | The firmware explicitly extracts strings for: **TITLE**, **ARTIST**, **ALBUM**, **ALBUMARTIST**, **GENRE**, **TRACKNUMBER**, and **Cover Art**. Other tags are ignored. |
-| **Vorbis Comment Order** | FLAC / OGG | **Crash:** Comments are walked in file order. A value longer than 128 characters (typically `LYRICS`) that appears **before `ALBUM`** overflows SRAM and reboots the device. `ALBUM`/`ARTIST` first with `LYRICS` later is safe, even if `TITLE` follows the lyrics block. |
+| **Vorbis Comment Order** | FLAC / OGG | **Crash / missing library tags:** Comments are walked in file order. A value longer than 128 characters (typically `LYRICS` or `TIDAL_DATA`) that appears **before a core tag** overflows SRAM. Before `ALBUM` this reboots the device. After `ALBUM` but before `ARTIST`/`TITLE`/`TRACKNUMBER` the file may play while albums fail to group. Core tags must come first. |
 | **Text Length** | Max 128 characters | **Safety Limit:** Extracted strings (like Title/Artist) are copied into fixed-size SRAM arrays. To prevent buffer overflows and UI corruption, text tags should be strictly capped at **128 characters**. |
 
 ## Totally Unsupported Formats
