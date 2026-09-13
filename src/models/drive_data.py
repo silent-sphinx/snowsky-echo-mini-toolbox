@@ -100,6 +100,15 @@ class TrackMetadata:
     # Metadata Browser UI State (separate from other tab checkboxes)
     meta_is_checked: bool = False
 
+    # File Rename
+    rename_status: str = "UNKNOWN"
+    rename_reason: str = ""
+    rename_current: str = ""
+    rename_suggested: str = ""
+    rename_track_no: str = ""
+    rename_title: str = ""
+    rename_is_checked: bool = False
+
     @property
     def display_size(self) -> str:
         if self.size_bytes < 1024 * 1024:
@@ -149,6 +158,28 @@ class DriveDataModel:
 
     def get_track(self, filepath: str) -> Optional[TrackMetadata]:
         return self.tracks.get(filepath)
+
+    def move_track(self, old_path: str, new_path: str) -> Optional[TrackMetadata]:
+        """Re-key a track after it was renamed on disk."""
+        track = self.tracks.pop(old_path, None)
+        if track is None:
+            return None
+        track.filepath = new_path
+        track.filename = os.path.basename(new_path)
+        _, ext = os.path.splitext(track.filename)
+        track.extension = ext.lower()
+        try:
+            track.size_bytes = os.path.getsize(new_path)
+        except OSError:
+            pass
+        self.tracks[new_path] = track
+        return track
+
+    def rebuild_tree(self) -> None:
+        """Rebuild the folder tree from the current track map."""
+        self.tree = {}
+        for filepath in self.tracks:
+            self._add_to_tree(filepath)
         
     def update_metadata(self, filepath: str, new_tags: dict) -> None:
         """Update the in-memory metadata for a specific track after it's saved."""

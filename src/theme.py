@@ -92,6 +92,9 @@ _STATUS_COLOURS: dict[str, tuple[str, str]] = {
     "UNKNOWN": (Colours.STATUS_UNKNOWN, Colours.STATUS_UNKNOWN_TEXT),
     "MISSING": (Colours.STATUS_MISSING, Colours.STATUS_MISSING_TEXT),
     "SKIPPED": (Colours.STATUS_SKIPPED, Colours.STATUS_SKIPPED_TEXT),
+    "RENAME": (Colours.STATUS_INCOMPATIBLE, Colours.STATUS_INCOMPATIBLE_TEXT),
+    "MATCHING": (Colours.STATUS_COMPATIBLE, Colours.STATUS_COMPATIBLE_TEXT),
+    "CONFLICT": (Colours.STATUS_LIMITED, Colours.STATUS_LIMITED_TEXT),
 }
 
 
@@ -653,6 +656,31 @@ def global_stylesheet() -> str:
         QLabel#headerSubtitle {{
             color: {Colours.TEXT_TERTIARY};
             font-size: 12px;
+        }}
+
+        QLabel#flowStepNumber {{
+            color: {Colours.TEXT_PRIMARY};
+            font-size: 18px;
+            font-weight: 800;
+        }}
+
+        QLabel#flowStepTitle {{
+            color: {Colours.TEXT_PRIMARY};
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+        }}
+
+        QLabel#flowStepBody {{
+            color: {Colours.TEXT_TERTIARY};
+            font-size: 12px;
+        }}
+
+        QLabel#toolbarLabel {{
+            color: {Colours.TEXT_SECONDARY};
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
         }}
 
         /* ── Panels ───────────────────────────────────────── */

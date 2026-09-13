@@ -26,6 +26,7 @@ from .widgets.album_art_widget import AlbumArtWidget
 from .widgets.drive_info_widget import DriveInfoWidget
 from .widgets.drive_selector_panel import DriveSelectorPanel
 from .widgets.lyrics_manager import LyricsManagerWidget
+from .widgets.file_rename_widget import FileRenameWidget
 from .widgets.music_browser_widget import MusicBrowserWidget
 from .widgets.music_compatibility_widget import MusicCompatibilityWidget
 from .threads.drive_scanner import DriveScannerThread
@@ -103,6 +104,11 @@ class MainWindow(QMainWindow):
         # Index 5: Lyrics Manager
         self._lyrics_manager = LyricsManagerWidget()
         self._tabs.addTab(self._lyrics_manager, "Lyrics Manager")
+
+        # Index 6: File Rename
+        self._file_rename = FileRenameWidget()
+        self._file_rename.library_changed.connect(self._on_library_changed)
+        self._tabs.addTab(self._file_rename, "File Rename")
         
         tab_layout.addWidget(self._tabs)
         main_layout.addWidget(tab_container)
@@ -356,15 +362,25 @@ class MainWindow(QMainWindow):
         self._set_processing_state(False)
         
         # Pass the unified data model to the child tabs
+        self._populate_library_tabs(data_model)
+        
+        # Update the DriveInfoWidget track count and charts
+        if self._tabs.isTabVisible(0):
+            self._drive_info.populate_data(data_model)
+
+    def _on_library_changed(self, data_model) -> None:
+        """Refresh tabs after an in-place library mutation such as a rename."""
+        self._populate_library_tabs(data_model)
+        if self._tabs.isTabVisible(0):
+            self._drive_info.populate_data(data_model)
+
+    def _populate_library_tabs(self, data_model) -> None:
         self._music_browser.populate_data(data_model)
         self._music_compatibility.populate_data(data_model)
         self._metadata_manager.populate_data(data_model)
         self._album_art.populate_data(data_model)
         self._lyrics_manager.populate_data(data_model)
-        
-        # Update the DriveInfoWidget track count and charts
-        if self._tabs.isTabVisible(0):
-            self._drive_info.populate_data(data_model)
+        self._file_rename.populate_data(data_model)
 
     def _set_processing_state(self, is_processing: bool, status_text: str = "Processing data...") -> None:
         """Toggle the global loading state and UI indicators."""
@@ -382,4 +398,5 @@ class MainWindow(QMainWindow):
         self._music_compatibility.set_processing_state(is_processing)
         self._album_art.set_processing_state(is_processing)
         self._lyrics_manager.set_processing_state(is_processing)
+        self._file_rename.set_processing_state(is_processing)
 
