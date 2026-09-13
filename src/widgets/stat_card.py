@@ -95,3 +95,9 @@ class StatCard(QWidget):
         else:
             self._display_value = value
             self._value_label.setText(f"{value:,}")
+
+    def set_text(self, text: str) -> None:
+        """Set a non-numeric label such as a formatted file size."""
+        self._target_value = 0
+        self._display_value = 0
+        self._value_label.setText(text)

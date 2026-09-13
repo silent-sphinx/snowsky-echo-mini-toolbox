@@ -175,6 +175,14 @@ class DriveDataModel:
         self.tracks[new_path] = track
         return track
 
+    def remove_track(self, filepath: str) -> Optional[TrackMetadata]:
+        """Drop a track after it was deleted on disk."""
+        track = self.tracks.pop(filepath, None)
+        if track is None:
+            return None
+        self.total_size_bytes = max(0, self.total_size_bytes - track.size_bytes)
+        return track
+
     def rebuild_tree(self) -> None:
         """Rebuild the folder tree from the current track map."""
         self.tree = {}

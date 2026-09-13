@@ -80,9 +80,9 @@ The `v2` rewrite is being rebuilt tab by tab. Everything below already ships in 
 | Album art (fix & download) | Implemented |
 | Lyrics manager | Implemented |
 | File rename | Implemented |
+| File cleanup | Implemented |
 | Backup & restore | Implemented |
 | Workflows | Implemented |
-| File cleanup | Not yet ported |
 
 ## Device compatibility
 

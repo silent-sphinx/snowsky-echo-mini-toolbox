@@ -28,6 +28,7 @@ from .widgets.drive_selector_panel import DriveSelectorPanel
 from .widgets.lyrics_manager import LyricsManagerWidget
 from .widgets.backup_restore_widget import BackupRestoreWidget
 from .widgets.file_rename_widget import FileRenameWidget
+from .widgets.file_cleanup_widget import FileCleanupWidget
 from .widgets.workflow_widget import WorkflowWidget
 from .widgets.music_browser_widget import MusicBrowserWidget
 from .widgets.music_compatibility_widget import MusicCompatibilityWidget
@@ -112,12 +113,17 @@ class MainWindow(QMainWindow):
         self._file_rename.library_changed.connect(self._on_library_changed)
         self._tabs.addTab(self._file_rename, "File Rename")
 
-        # Index 7: Backup / Restore
+        # Index 7: File Cleanup
+        self._file_cleanup = FileCleanupWidget()
+        self._file_cleanup.library_changed.connect(self._on_library_changed)
+        self._tabs.addTab(self._file_cleanup, "File Cleanup")
+
+        # Index 8: Backup / Restore
         self._backup_restore = BackupRestoreWidget()
         self._backup_restore.target_relocated.connect(self._on_location_selected)
         self._tabs.addTab(self._backup_restore, "Backup / Restore")
 
-        # Index 8: Workflows
+        # Index 9: Workflows
         self._workflows = WorkflowWidget()
         self._workflows.needs_rescan.connect(self._rescan_current_target)
         self._tabs.addTab(self._workflows, "Workflows")
@@ -151,6 +157,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         if hasattr(self, "_workflows"):
             self._workflows.cancel_running_job()
+        if hasattr(self, "_file_cleanup"):
+            self._file_cleanup.cancel_running_job()
         if hasattr(self, '_scanner_thread') and self._scanner_thread.isRunning():
             self._scanner_thread.cancel()
             self._scanner_thread.wait()
@@ -403,6 +411,7 @@ class MainWindow(QMainWindow):
         self._album_art.populate_data(data_model)
         self._lyrics_manager.populate_data(data_model)
         self._file_rename.populate_data(data_model)
+        self._file_cleanup.populate_data(data_model)
         self._backup_restore.populate_data(data_model)
         self._workflows.populate_data(data_model)
 
@@ -423,6 +432,7 @@ class MainWindow(QMainWindow):
         self._album_art.set_processing_state(is_processing)
         self._lyrics_manager.set_processing_state(is_processing)
         self._file_rename.set_processing_state(is_processing)
+        self._file_cleanup.set_processing_state(is_processing)
         self._backup_restore.set_processing_state(is_processing)
         self._workflows.set_processing_state(is_processing)
 
