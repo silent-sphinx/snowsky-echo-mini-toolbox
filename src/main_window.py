@@ -255,13 +255,16 @@ class MainWindow(QMainWindow):
         # Spacer to center the progress container and push the drive selector to the right
         layout.addStretch()
 
-        # Mock Drive Selector
+        target_container = QWidget()
+        target_layout = QHBoxLayout(target_container)
+        target_layout.setContentsMargins(0, 0, 0, 0)
+        target_layout.setSpacing(8)
+
         drive_lbl = QLabel("Target:")
         drive_lbl.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 12px; font-weight: 600;")
-        layout.addWidget(drive_lbl)
-        
-        self._drive_btn = QPushButton("Select Target Drive...")
-        self._drive_btn.setStyleSheet(f"""
+        target_layout.addWidget(drive_lbl)
+
+        top_bar_btn_style = f"""
             QPushButton {{
                 background-color: {Colours.BG_SURFACE};
                 border: 1px solid {Colours.BORDER_DEFAULT};
@@ -274,9 +277,25 @@ class MainWindow(QMainWindow):
             QPushButton:hover {{
                 border-color: {Colours.ACCENT};
             }}
-        """)
+            QPushButton:disabled {{
+                color: {Colours.TEXT_DISABLED};
+                border-color: {Colours.BORDER_SUBTLE};
+            }}
+        """
+
+        self._drive_btn = QPushButton("Select Target Drive...")
+        self._drive_btn.setStyleSheet(top_bar_btn_style)
         self._drive_btn.clicked.connect(self._show_drive_selector)
-        layout.addWidget(self._drive_btn)
+        target_layout.addWidget(self._drive_btn)
+
+        self._refresh_btn = QPushButton("↻ Refresh")
+        self._refresh_btn.setToolTip("Rescan the current target library")
+        self._refresh_btn.setStyleSheet(top_bar_btn_style)
+        self._refresh_btn.setEnabled(False)
+        self._refresh_btn.clicked.connect(self._rescan_current_target)
+        target_layout.addWidget(self._refresh_btn)
+
+        layout.addWidget(target_container)
 
         return bar
 
@@ -424,7 +443,10 @@ class MainWindow(QMainWindow):
             self._prog_container.hide()
             # Reset progress bar for next time
             self._global_progress.setRange(0, 0)
-            
+
+        if hasattr(self, "_refresh_btn"):
+            self._refresh_btn.setEnabled(bool(self._current_drive) and not is_processing)
+
         # Notify child tabs that need to show empty/loading states
         self._metadata_manager.set_processing_state(is_processing)
         self._music_browser.set_processing_state(is_processing)
