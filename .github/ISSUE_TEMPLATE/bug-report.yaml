@@ -1,6 +1,6 @@
 ---
-name: Incompatible Music File Report
-description: Create a report to help us improve incompatible file detection
+name: Bug report
+description: Create a report to help us improve
 labels:
   - triage
 
@@ -13,6 +13,8 @@ body:
         Pleas ensure you have the latest version of Snowsky Echo Mini Toolbox installed.
         You can find the latest version in the [releases page](https://github.com/snowsky-echo/snowsky-echo-mini-toolbox/releases).
         If the issue still occurs, please report the issue.
+
+        If your bug report is about a incompatible file not marked as incompatible by the program, please submit a file incompatibility report.
 
   - type: input
     id: version
@@ -39,6 +41,25 @@ body:
     validations:
       required: true
 
+  - type: dropdown
+    id: feature-affected
+    attributes:
+      label: Feature Affected
+      description: Select the feature affected by the issue.
+      options:
+        - Device information
+        - Music Browser
+        - Music Compatibility
+        - File Rename
+        - Backup & Restore
+        - Lyrics Manager
+        - Album Art Manager
+        - File Cleanup
+        - Workflows
+        - Other
+    validations:
+      required: true
+
   - type: textarea
     id: description
     attributes:
@@ -49,25 +70,41 @@ body:
       required: true
 
   - type: textarea
-    id: screenshots
+    id: reproduction-steps
     attributes:
-      label: Screenshots or screen recordings
-      description: Drag and drop any relevant screenshots or recordings here.
+      label: Steps to reproduce
+      description: Provide the sequence of steps that consistently reproduces the issue.
+      placeholder: |
+        1. Go to ...
+        2. Click on ...
+        3. Enter ...
+        4. Observe ...
+    validations:
+      required: true
 
   - type: textarea
-    id: debug-message
+    id: expected-behavior
     attributes:
-      label: Audio File Debug Message
-      description: Locate your music file using the 'File Browser' tab, right-click on the file and select 'debug', paste the output of the launched window here.
-
-  - type: textarea
-      id: music-file
-      attributes:
-        label: Incompatible Music File
-        description: Drag and drop any incompatible audio files, or provide a link to a cloud-storage service like Google Drive.
+      label: Expected behavior
+      description: Describe what you expected to happen.
+    validations:
+      required: true
 
   - type: textarea
     id: additional-context
     attributes:
       label: Additional context
       description: Include any other details that may help diagnose the issue.
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or screen recordings
+      description: Drag and drop any relevant screenshots or recordings here.
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Paste relevant, redacted log output. Remove any sensitive information.
+      render: shell
