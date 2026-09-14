@@ -24,9 +24,6 @@ The Snowsky Echo Mini is a fantastic little player, but its affordable hardware 
 
 This toolbox points at a folder or USB drive, scans everything in it, and tells you exactly what the device will reject, then fixes it for you. Convert incompatible audio, repair or download album art, tidy metadata, and get lyrics in place, all without touching a command line.
 
-> [!NOTE]
-> This is the `v2` branch, a ground-up rewrite of the app. The version published on the [Releases page](https://github.com/silent-sphinx/snowsky-echo-mini-toolbox/releases/latest) is built from `main` and is what you should install today. See [Rewrite status](#rewrite-status) for what has landed in the rewrite so far.
-
 ## Get started
 
 ### 1. Back up your music first
