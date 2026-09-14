@@ -261,6 +261,7 @@ class MusicConversionWorker(QObject):
         planned = 0
         failures: list[str] = []
         total = len(self.candidates)
+        claimed_outputs: dict[Path, Path] = {}
 
         try:
             if self.backup_root is not None:
@@ -317,8 +318,27 @@ class MusicConversionWorker(QObject):
                         continue
 
                 should_convert = bool(candidate.get("should_convert", True))
-                needs_sanitize = bool(candidate.get("needs_sanitize", True))
+                needs_sanitize = bool(candidate.get("needs_sanitize", False))
                 will_modify = needs_sanitize or should_convert
+
+                output_path = source_path.with_suffix(".flac") if should_convert else source_path
+                if should_convert:
+                    previous_owner = claimed_outputs.get(output_path)
+                    if previous_owner is not None and previous_owner != source_path:
+                        failed += 1
+                        failures.append(
+                            f"{relative_file}: conversion target {output_path.name} collides with {previous_owner.name}"
+                        )
+                        self.progress.emit(index, total, detail_label)
+                        continue
+                    if output_path.exists() and output_path != source_path:
+                        failed += 1
+                        failures.append(
+                            f"{relative_file}: {output_path.name} already exists; refusing to overwrite"
+                        )
+                        self.progress.emit(index, total, detail_label)
+                        continue
+                    claimed_outputs[output_path] = source_path
 
                 if self.dry_run:
                     planned += 1
@@ -334,11 +354,21 @@ class MusicConversionWorker(QObject):
                         continue
 
                 if needs_sanitize:
+                    sanitized_ok = False
                     try:
                         sanitizer = MetadataSanitizer()
-                        sanitizer.sanitize(source_path, preserve_third_party_tags=self.preserve_tags)
-                    except Exception:
-                        pass
+                        sanitized_ok = bool(
+                            sanitizer.sanitize(
+                                source_path, preserve_third_party_tags=self.preserve_tags
+                            )
+                        )
+                    except Exception as exc:
+                        logger.debug("Sanitize failed for %s: %s", source_path, exc)
+                    if not sanitized_ok:
+                        failed += 1
+                        failures.append(f"{relative_file}: metadata sanitization failed")
+                        self.progress.emit(index, total, detail_label)
+                        continue
 
                 if not should_convert:
                     converted += 1
@@ -348,7 +378,6 @@ class MusicConversionWorker(QObject):
                     self.progress.emit(index, total, detail_label)
                     continue
 
-                output_path = source_path.with_suffix(".flac")
                 try:
                     fd, tmp_name = tempfile.mkstemp(
                         prefix=f".{output_path.stem}.tmp",
@@ -392,10 +421,7 @@ class MusicConversionWorker(QObject):
 
                 try:
                     art_bytes, _art_mime = read_embedded_album_art(source_path)
-
-                    if output_path.exists() and output_path != source_path:
-                        output_path.unlink()
-                    temp_output_path.replace(output_path)
+                    os.replace(str(temp_output_path), str(output_path))
 
                     if art_bytes:
                         try:

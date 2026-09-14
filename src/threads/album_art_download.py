@@ -17,6 +17,7 @@ from ..utils.album_art import (
 )
 from ..utils.album_art_download import AlbumArtLookupClient, LookupCancelled
 from ..utils.album_art_download_planner import AlbumGroup
+from ..utils.file_cleanup import path_is_within_target
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +44,12 @@ class AlbumArtLookupWorker(QObject):
     def run(self) -> None:
         total = len(self.groups)
         found = 0
+        updates: list[dict[str, object]] = []
 
         try:
             for index, group in enumerate(self.groups, start=1):
                 if self._cancel_requested:
-                    self.cancelled.emit(self._payload(index - 1, total, found))
+                    self.cancelled.emit(self._payload(index - 1, total, found, updates))
                     return
 
                 label = f"Searching {index}/{total}: {group.display_artist} — {group.album}"
@@ -58,33 +60,52 @@ class AlbumArtLookupWorker(QObject):
                         group.artist, group.album, year=group.year
                     )
                 except LookupCancelled:
-                    self.cancelled.emit(self._payload(index - 1, total, found))
+                    self.cancelled.emit(self._payload(index - 1, total, found, updates))
                     return
                 except Exception as exc:
                     logger.debug("Lookup failed for %s", group.key, exc_info=True)
-                    group.candidates = []
-                    group.error = f"Lookup failed: {exc}"
-                    group.is_selected = False
+                    updates.append(
+                        {
+                            "index": index - 1,
+                            "candidates": [],
+                            "error": f"Lookup failed: {exc}",
+                            "query": "",
+                            "selected_index": 0,
+                            "is_selected": False,
+                        }
+                    )
                     self.progress.emit(index, total, label)
                     continue
 
-                group.candidates = result.candidates
-                group.error = result.error
-                group.query = result.query
-                group.selected_index = 0
-                group.is_selected = result.has_candidates
                 if result.has_candidates:
                     found += 1
+                updates.append(
+                    {
+                        "index": index - 1,
+                        "candidates": result.candidates,
+                        "error": result.error,
+                        "query": result.query,
+                        "selected_index": 0,
+                        "is_selected": result.has_candidates,
+                    }
+                )
 
                 self.progress.emit(index, total, label)
 
-            self.finished.emit(self._payload(total, total, found))
+            self.finished.emit(self._payload(total, total, found, updates))
         except Exception as exc:
             self.failed.emit(str(exc))
 
-    def _payload(self, processed: int, total: int, found: int) -> dict[str, object]:
+    def _payload(
+        self,
+        processed: int,
+        total: int,
+        found: int,
+        updates: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
         return {
             "groups": self.groups,
+            "updates": list(updates or []),
             "processed": processed,
             "total": total,
             "found": found,
@@ -232,6 +253,11 @@ class AlbumArtApplyWorker(QObject):
                         if position < len(relative_files)
                         else source_path.name
                     )
+
+                    if source_path.is_symlink() or not path_is_within_target(source_path, self.target_path):
+                        failed += 1
+                        failures.append(f"{relative_file}: path is outside the scanned target")
+                        continue
 
                     if not source_path.exists():
                         failed += 1

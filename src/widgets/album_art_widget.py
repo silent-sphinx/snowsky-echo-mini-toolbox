@@ -529,7 +529,24 @@ class AlbumArtWidget(QWidget):
     def _on_lookup_finished(self, payload_obj) -> None:
         payload = payload_obj if isinstance(payload_obj, dict) else {}
         groups = payload.get("groups") or []
+        updates = payload.get("updates") or []
         found = int(payload.get("found") or 0)
+
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+            try:
+                index = int(update.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= index < len(groups)):
+                continue
+            group = groups[index]
+            group.candidates = list(update.get("candidates") or [])
+            group.error = str(update.get("error") or "")
+            group.query = str(update.get("query") or "")
+            group.selected_index = int(update.get("selected_index") or 0)
+            group.is_selected = bool(update.get("is_selected"))
 
         self._finish_download_ui()
 
@@ -651,6 +668,14 @@ class AlbumArtWidget(QWidget):
     def _clear_download_refs(self) -> None:
         self._download_worker = None
         self._download_thread = None
+
+    def cancel_running_job(self) -> None:
+        self._cancel_fix()
+        self._cancel_download()
+        if self._fix_thread is not None and self._fix_thread.isRunning():
+            self._fix_thread.wait(8000)
+        if self._download_thread is not None and self._download_thread.isRunning():
+            self._download_thread.wait(8000)
 
     @Slot(int, int, str)
     def _on_download_progress(self, processed: int, total: int, detail: str) -> None:

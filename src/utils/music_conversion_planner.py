@@ -59,6 +59,12 @@ def plan_conversion_for_track(
     if status == "LIMITED":
         needs_sanitize = True
 
+    metadata_incompatible = (track.comp_metadata or "").strip().upper() == "INCOMPATIBLE"
+    tag_encoding_incompatible = (track.comp_tag_encoding or "").strip().upper() == "INCOMPATIBLE"
+    tag_length_incompatible = (track.comp_tag_length or "").strip().upper() == "INCOMPATIBLE"
+    if metadata_incompatible or tag_encoding_incompatible or tag_length_incompatible:
+        needs_sanitize = True
+
     eq_actionable = {"not eq compatible"}
     if make_eq_compatible:
         eq_actionable.add("unknown")

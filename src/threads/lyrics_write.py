@@ -7,6 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Slot
 
+from ..utils.file_cleanup import path_is_within_target
 from ..utils.lyrics import write_lrc_sidecar
 
 logger = logging.getLogger(__name__)
@@ -87,13 +88,25 @@ class LyricsWriteWorker(QObject):
                 label = f"{'Previewing' if self.dry_run else 'Writing'} {index}/{total}: {source_path.name}"
                 self.progress.emit(index - 1, total, label)
 
+                if source_path.is_symlink() or not path_is_within_target(source_path, self.target_path):
+                    failed += 1
+                    failures.append(f"{relative_file}: path is outside the scanned target")
+                    self.progress.emit(index, total, label)
+                    continue
+
+                lrc_path = source_path.with_suffix(".lrc")
+                if not path_is_within_target(lrc_path, self.target_path):
+                    failed += 1
+                    failures.append(f"{relative_file}: lyrics path is outside the scanned target")
+                    self.progress.emit(index, total, label)
+                    continue
+
                 if not lyrics_text.strip():
                     failed += 1
                     failures.append(f"{relative_file}: no lyrics text")
                     self.progress.emit(index, total, label)
                     continue
 
-                lrc_path = source_path.with_suffix(".lrc")
                 existing = claimed.get(lrc_path)
                 if existing is not None and existing != source_path:
                     failed += 1

@@ -326,6 +326,11 @@ class MusicCompatibilityWidget(QWidget):
         self._conversion_worker = None
         self._conversion_thread = None
 
+    def cancel_running_job(self) -> None:
+        self._cancel_conversion()
+        if self._conversion_thread is not None and self._conversion_thread.isRunning():
+            self._conversion_thread.wait(8000)
+
     @Slot(int, int, str)
     def _on_conversion_progress(self, processed: int, total: int, detail: str) -> None:
         progress = self._conversion_progress

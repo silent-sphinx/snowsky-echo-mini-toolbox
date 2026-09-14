@@ -166,7 +166,9 @@ class MetadataSanitizer:
         """
         try:
             audio = mutagen.File(file_path)
-            if audio is None or audio.tags is None:
+            if audio is None:
+                return False, "Could not read audio tags"
+            if audio.tags is None:
                 return True, ""
 
             if self._is_vorbis_tagged(audio):
@@ -221,7 +223,7 @@ class MetadataSanitizer:
 
         except Exception as e:
             logger.debug(f"Failed to check metadata for {file_path}: {e}")
-            return True, ""
+            return False, f"Could not read tags: {e}"
 
     def _reorder_vorbis_comments(self, audio) -> bool:
         """Move core tags first, then short tags, then oversized values (e.g. LYRICS)."""
@@ -267,8 +269,10 @@ class MetadataSanitizer:
         """
         try:
             audio = mutagen.File(file_path)
-            if audio is None or audio.tags is None:
+            if audio is None:
                 return False
+            if audio.tags is None:
+                return True
 
             changed = False
 

@@ -65,7 +65,7 @@ class FileRenameTableModel(QAbstractTableModel):
             return Qt.NoItemFlags
         track = self._tracks[index.row()]
         if index.column() == RenameColumn.CHECK:
-            if track.rename_status in ("RENAME", "CONFLICT"):
+            if track.rename_status == "RENAME":
                 return Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
             return Qt.ItemIsEnabled | Qt.ItemIsSelectable
         return Qt.ItemIsEnabled | Qt.ItemIsSelectable
@@ -76,7 +76,7 @@ class FileRenameTableModel(QAbstractTableModel):
 
         if role == Qt.CheckStateRole and index.column() == RenameColumn.CHECK:
             track = self._tracks[index.row()]
-            if track.rename_status not in ("RENAME", "CONFLICT"):
+            if track.rename_status != "RENAME":
                 return False
             track.rename_is_checked = value in (Qt.Checked, Qt.CheckState.Checked, 2)
             self.dataChanged.emit(index, index, [Qt.CheckStateRole])
@@ -101,7 +101,7 @@ class FileRenameTableModel(QAbstractTableModel):
         track = self._tracks[row]
 
         if role == Qt.CheckStateRole and col == RenameColumn.CHECK:
-            if track.rename_status not in ("RENAME", "CONFLICT"):
+            if track.rename_status != "RENAME":
                 return None
             return Qt.Checked if track.rename_is_checked else Qt.Unchecked
 

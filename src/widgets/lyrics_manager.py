@@ -487,6 +487,14 @@ class LyricsManagerWidget(QWidget):
         self._lookup_worker = None
         self._lookup_thread = None
 
+    def cancel_running_job(self) -> None:
+        self._cancel_write()
+        self._cancel_lookup()
+        if self._write_thread is not None and self._write_thread.isRunning():
+            self._write_thread.wait(8000)
+        if self._lookup_thread is not None and self._lookup_thread.isRunning():
+            self._lookup_thread.wait(8000)
+
     @Slot(int, int, str)
     def _on_write_progress(self, processed: int, total: int, detail: str) -> None:
         progress = self._write_progress

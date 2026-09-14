@@ -104,7 +104,7 @@ def read_embedded_album_art(path: Path) -> tuple[bytes | None, str]:
     except Exception as exc:
         return None, f"Tag read failed: {exc}"
 
-    if not audio or not getattr(audio, "tags", None):
+    if not audio:
         return None, "No embedded art"
 
     if isinstance(audio, FLAC):
@@ -114,8 +114,12 @@ def read_embedded_album_art(path: Path) -> tuple[bytes | None, str]:
             mime = getattr(picture, "mime", "image/unknown") or "image/unknown"
             return bytes(picture.data), mime
 
+    tags = getattr(audio, "tags", None)
+    if tags is None:
+        return None, "No embedded art"
+
     try:
-        apic_frames = audio.tags.getall("APIC")
+        apic_frames = tags.getall("APIC")
         if apic_frames:
             frame = apic_frames[0]
             mime = getattr(frame, "mime", "image/unknown") or "image/unknown"
@@ -124,7 +128,7 @@ def read_embedded_album_art(path: Path) -> tuple[bytes | None, str]:
         logger.debug("Failed reading ID3 APIC album art from %s", path, exc_info=True)
 
     if isinstance(audio, MP4):
-        covr = audio.tags.get("covr")
+        covr = tags.get("covr")
         if covr:
             cover = covr[0]
             mime = "image/unknown"

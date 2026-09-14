@@ -136,6 +136,11 @@ class ZipBackupWorker(QObject):
             )
         except Exception as exc:
             logger.exception("Zip backup failed")
+            try:
+                if self.zip_path.exists():
+                    self.zip_path.unlink()
+            except Exception:
+                pass
             self.failed.emit(str(exc))
 
 
@@ -171,6 +176,8 @@ class FileTransferWorker(QObject):
         processed = 0
         total_files = 0
         skipped = 0
+        skipped_existing = 0
+        copied: list[Path] = []
         try:
             source = self.source_path
             destination = self.destination_path
@@ -201,12 +208,16 @@ class FileTransferWorker(QObject):
                 rel_file = source_file.relative_to(source)
                 target_file = destination / rel_file
                 target_file.parent.mkdir(parents=True, exist_ok=True)
+                if target_file.exists():
+                    skipped_existing += 1
+                    continue
                 shutil.copy2(str(source_file), str(target_file))
+                copied.append(source_file)
                 processed += 1
                 self.progress.emit(processed, max(total_files, 1), rel_file.as_posix())
 
             if self.mode == "move":
-                for source_file in source_files:
+                for source_file in copied:
                     try:
                         source_file.unlink()
                     except Exception:
@@ -224,6 +235,7 @@ class FileTransferWorker(QObject):
                     "processed": processed,
                     "total": total_files,
                     "skipped": skipped,
+                    "skipped_existing": skipped_existing,
                     "mode": self.mode,
                 }
             )

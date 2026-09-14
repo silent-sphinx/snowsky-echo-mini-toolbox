@@ -5,7 +5,9 @@ Kept free of Qt imports so the drive scanner can call it from worker threads.
 
 from __future__ import annotations
 
+import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -43,13 +45,15 @@ def lyrics_value_to_text(value) -> str:
 
 
 def decode_text_file_bytes(data: bytes) -> str:
-    """Decode an .lrc (or other text) file with a few common encodings."""
-    for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "latin-1"):
-        try:
-            return data.decode(encoding)
-        except Exception:
-            continue
-    return data.decode("utf-8", errors="replace")
+    """Decode an .lrc (or other text) file as UTF-8, honouring a UTF-16 BOM."""
+    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+        return data.decode("utf-16")
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data.decode("utf-8-sig")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", errors="replace")
 
 
 def preview_lyrics(lyrics_text: str, max_length: int = 96) -> str:
@@ -336,6 +340,29 @@ def backup_existing_lrc(
     shutil.copy2(str(lrc_path), str(backup_target))
 
 
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """Write text via a sibling temp file, then replace the destination."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.stem}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def write_lrc_sidecar(
     audio_path: Path,
     lyrics_text: str,
@@ -358,5 +385,5 @@ def write_lrc_sidecar(
     if backup_root is not None and lrc_path.exists():
         backup_existing_lrc(lrc_path, backup_root, relative_file or audio_path.name)
 
-    lrc_path.write_text(text, encoding="utf-8")
+    atomic_write_text(lrc_path, text)
     return lrc_path

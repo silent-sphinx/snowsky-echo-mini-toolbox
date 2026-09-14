@@ -62,6 +62,16 @@ REASON_EXISTS = "Target name already exists"
 
 _UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _DIGITS = re.compile(r"\d+")
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+)
 
 
 def is_rename_track(track: TrackMetadata) -> bool:
@@ -153,7 +163,13 @@ def safe_filename_component(name: str) -> str:
         cleaned = cleaned.replace(os.path.sep, "_")
     if os.path.altsep:
         cleaned = cleaned.replace(os.path.altsep, "_")
-    return " ".join(cleaned.split()).strip()
+    cleaned = " ".join(cleaned.split()).strip().rstrip(" .")
+    if not cleaned:
+        return ""
+    reserved_stem = cleaned.split(".", 1)[0].upper()
+    if cleaned.upper() in _WINDOWS_RESERVED_NAMES or reserved_stem in _WINDOWS_RESERVED_NAMES:
+        cleaned = f"_{cleaned}"
+    return cleaned
 
 
 def paths_are_same_file(first: Path, second: Path) -> bool:
@@ -276,6 +292,12 @@ def apply_rename_evaluations(
         key = str(target_path).lower()
         target_counts[key] = target_counts.get(key, 0) + 1
 
+    vacating_keys = {
+        str(Path(track.filepath)).lower()
+        for track, target_path in candidates
+        if str(target_path).lower() != str(Path(track.filepath)).lower()
+    }
+
     for track, target_path in candidates:
         key = str(target_path).lower()
         conflict_reason = ""
@@ -283,7 +305,7 @@ def apply_rename_evaluations(
             conflict_reason = REASON_DUPLICATE
         elif target_path.exists():
             source_path = Path(track.filepath)
-            if not paths_are_same_file(target_path, source_path):
+            if not paths_are_same_file(target_path, source_path) and key not in vacating_keys:
                 conflict_reason = REASON_EXISTS
 
         if conflict_reason:

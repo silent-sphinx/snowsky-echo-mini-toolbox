@@ -15,6 +15,7 @@ from ..utils.album_art import (
     to_non_progressive_jpeg,
     write_embedded_album_art,
 )
+from ..utils.file_cleanup import path_is_within_target
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,12 @@ class AlbumArtFixWorker(QObject):
                 source_path, relative_file = self._resolve_source_path(candidate)
                 detail_label = f"Processing {index}/{total}: {source_path.name}"
                 self.progress.emit(index - 1, total, detail_label)
+
+                if source_path.is_symlink() or not path_is_within_target(source_path, self.target_path):
+                    failed += 1
+                    failures.append(f"{relative_file}: path is outside the scanned target")
+                    self.progress.emit(index, total, detail_label)
+                    continue
 
                 if not source_path.exists():
                     failed += 1

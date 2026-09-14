@@ -58,6 +58,7 @@ class WorkflowExecutionWorker(QObject):
         self.review_mutex = QMutex()
         self.review_cond = QWaitCondition()
         self.review_result = False
+        self.review_ready = False
 
     def request_cancel(self) -> None:
         self._cancel_requested = True
@@ -65,12 +66,14 @@ class WorkflowExecutionWorker(QObject):
         if worker is not None and hasattr(worker, "request_cancel"):
             worker.request_cancel()
         self.review_mutex.lock()
+        self.review_ready = True
         self.review_cond.wakeAll()
         self.review_mutex.unlock()
 
     def submit_review_result(self, result: bool) -> None:
         self.review_mutex.lock()
         self.review_result = result
+        self.review_ready = True
         self.review_cond.wakeAll()
         self.review_mutex.unlock()
 
@@ -153,6 +156,15 @@ class WorkflowExecutionWorker(QObject):
             worker.run()
         finally:
             self._active_worker = None
+            for signal, slot in (
+                (worker.progress, self.step_progress),
+                (worker.failed, on_failed),
+                (worker.cancelled, on_cancelled),
+            ):
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
 
         if self._cancel_requested or box["cancelled"]:
             return False, "Cancelled"
@@ -302,9 +314,12 @@ class WorkflowExecutionWorker(QObject):
                 apply_it = auto_apply
                 if not auto_apply:
                     self.review_mutex.lock()
+                    self.review_ready = False
+                    self.review_result = False
                     self.request_lyrics_review.emit(track.filename, lyrics_text)
-                    self.review_cond.wait(self.review_mutex)
-                    apply_it = self.review_result
+                    while not self.review_ready and not self._cancel_requested:
+                        self.review_cond.wait(self.review_mutex)
+                    apply_it = bool(self.review_result) and not self._cancel_requested
                     self.review_mutex.unlock()
                     if self._cancel_requested:
                         return False, "Cancelled"
@@ -328,17 +343,24 @@ class WorkflowExecutionWorker(QObject):
             return True, ""
 
         # Write immediately for reviewed tracks so a later cancel still keeps accepted matches.
+        write_failures: list[str] = []
         for candidate in write_candidates:
             if self._cancel_requested:
                 return False, "Cancelled"
+            relative = str(candidate["relative_file"])
             try:
                 write_lrc_sidecar(
                     Path(str(candidate["filepath"])),
                     str(candidate["lyrics_text"]),
-                    relative_file=str(candidate["relative_file"]),
+                    relative_file=relative,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Workflow lyrics write failed for %s", relative, exc_info=True)
+                write_failures.append(f"{relative}: {exc}")
+        if write_failures:
+            preview = "; ".join(write_failures[:5])
+            extra = f" (+{len(write_failures) - 5} more)" if len(write_failures) > 5 else ""
+            return False, f"Failed to write {len(write_failures)} lyrics file(s): {preview}{extra}"
         return True, ""
 
     def _step_fix_album_art(self, _step: WorkflowStep) -> tuple[bool, str]:

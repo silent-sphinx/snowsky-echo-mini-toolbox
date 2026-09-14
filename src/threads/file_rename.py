@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Slot
@@ -10,6 +11,17 @@ from PySide6.QtCore import QObject, Signal, Slot
 from ..utils.file_rename import paths_are_same_file
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _RenameJob:
+    source: Path
+    target: Path
+    relative: str
+    label: str
+    lrc_needed: bool
+    lrc_source: Path
+    lrc_target: Path
 
 
 class FileRenameWorker(QObject):
@@ -32,7 +44,7 @@ class FileRenameWorker(QObject):
         try:
             candidate_path.resolve().relative_to(self.target_path.resolve())
             return True
-        except ValueError:
+        except (ValueError, OSError):
             return False
 
     def _unique_temp_path(self, source_path: Path) -> Path:
@@ -47,22 +59,43 @@ class FileRenameWorker(QObject):
             counter += 1
         raise RuntimeError("Could not allocate a temporary rename path")
 
+    def _path_key(self, path: Path) -> str:
+        try:
+            return str(path.resolve()).lower()
+        except OSError:
+            return str(path).lower()
+
+    def _restore_temp(self, temp_path: Path | None, original_path: Path) -> None:
+        if temp_path is None or not temp_path.exists():
+            return
+        try:
+            if original_path.exists() and not paths_are_same_file(temp_path, original_path):
+                return
+            temp_path.rename(original_path)
+        except Exception:
+            logger.debug("Failed to restore %s from %s", original_path, temp_path, exc_info=True)
+
     def _rename_path(self, source_path: Path, target_path: Path) -> None:
         if source_path == target_path:
             return
+        if target_path.exists() and not paths_are_same_file(source_path, target_path):
+            raise FileExistsError(f"target name already exists: {target_path.name}")
         if paths_are_same_file(source_path, target_path):
             temp_path = self._unique_temp_path(source_path)
             source_path.rename(temp_path)
             try:
                 temp_path.rename(target_path)
             except Exception:
-                try:
-                    temp_path.rename(source_path)
-                except Exception:
-                    pass
+                self._restore_temp(temp_path, source_path)
                 raise
             return
         source_path.rename(target_path)
+
+    def _restore_staged(self, staged: list[tuple[_RenameJob, Path, Path | None]]) -> None:
+        for job, audio_temp, lrc_temp in reversed(staged):
+            if audio_temp.exists():
+                self._restore_temp(lrc_temp, job.lrc_source)
+                self._restore_temp(audio_temp, job.source)
 
     @Slot()
     def run(self) -> None:
@@ -73,6 +106,7 @@ class FileRenameWorker(QObject):
         total = len(self.candidates)
 
         try:
+            jobs: list[_RenameJob] = []
             for index, candidate in enumerate(self.candidates, start=1):
                 if self._cancel_requested:
                     self.cancelled.emit(self._payload(renamed, lrc_renamed, failed, total, failures))
@@ -87,74 +121,128 @@ class FileRenameWorker(QObject):
                 if not source_path.name or not target_path.name:
                     failed += 1
                     failures.append(f"{relative_file}: missing source or target path")
-                    self.progress.emit(index, total, detail_label)
                     continue
 
                 if not self._is_path_within_target(source_path) or not self._is_path_within_target(target_path):
                     failed += 1
                     failures.append(f"{relative_file}: path is outside the scanned target")
-                    self.progress.emit(index, total, detail_label)
                     continue
 
                 if not source_path.exists():
                     failed += 1
                     failures.append(f"{relative_file}: source file no longer exists")
-                    self.progress.emit(index, total, detail_label)
-                    continue
-
-                if target_path.exists() and not paths_are_same_file(source_path, target_path):
-                    failed += 1
-                    failures.append(f"{relative_file}: target name already exists")
-                    self.progress.emit(index, total, detail_label)
                     continue
 
                 source_lrc_path = source_path.with_suffix(".lrc")
                 target_lrc_path = target_path.with_suffix(".lrc")
-                lrc_needed = source_lrc_path.exists() and target_lrc_path != source_lrc_path
+                jobs.append(
+                    _RenameJob(
+                        source=source_path,
+                        target=target_path,
+                        relative=relative_file,
+                        label=detail_label,
+                        lrc_needed=source_lrc_path.exists() and target_lrc_path != source_lrc_path,
+                        lrc_source=source_lrc_path,
+                        lrc_target=target_lrc_path,
+                    )
+                )
 
-                if lrc_needed and target_lrc_path.exists() and not paths_are_same_file(source_lrc_path, target_lrc_path):
-                    failed += 1
-                    failures.append(f"{relative_file}: matching .lrc target already exists")
-                    self.progress.emit(index, total, detail_label)
-                    continue
+            vacating = {self._path_key(job.source) for job in jobs}
+            for job in jobs:
+                if job.lrc_needed:
+                    vacating.add(self._path_key(job.lrc_source))
 
-                try:
-                    self._rename_path(source_path, target_path)
-                except Exception as exc:
-                    failed += 1
-                    failures.append(f"{relative_file}: {exc}")
-                    self.progress.emit(index, total, detail_label)
-                    continue
-
-                lrc_was_renamed = False
-                if lrc_needed:
-                    try:
-                        self._rename_path(source_lrc_path, target_lrc_path)
-                        lrc_was_renamed = True
-                        lrc_renamed += 1
-                    except Exception as lrc_exc:
-                        rollback_reason = ""
-                        try:
-                            self._rename_path(target_path, source_path)
-                        except Exception as rollback_exc:
-                            rollback_reason = f"; rollback failed: {rollback_exc}"
+            ready: list[_RenameJob] = []
+            for job in jobs:
+                if job.target.exists() and not paths_are_same_file(job.source, job.target):
+                    if self._path_key(job.target) not in vacating:
                         failed += 1
-                        failures.append(
-                            f"{relative_file}: renamed audio but failed to rename matching .lrc: {lrc_exc}{rollback_reason}"
-                        )
-                        self.progress.emit(index, total, detail_label)
+                        failures.append(f"{job.relative}: target name already exists")
                         continue
+                if job.lrc_needed and job.lrc_target.exists() and not paths_are_same_file(job.lrc_source, job.lrc_target):
+                    if self._path_key(job.lrc_target) not in vacating:
+                        failed += 1
+                        failures.append(f"{job.relative}: matching .lrc target already exists")
+                        continue
+                ready.append(job)
 
-                renamed += 1
-                processed = {
-                    "old_path": str(source_path),
-                    "new_path": str(target_path),
-                }
-                if lrc_was_renamed:
-                    processed["old_lrc"] = str(source_lrc_path)
-                    processed["new_lrc"] = str(target_lrc_path)
-                self._processed_paths.append(processed)
-                self.progress.emit(index, total, detail_label)
+            staged: list[tuple[_RenameJob, Path, Path | None]] = []
+            try:
+                for job in ready:
+                    if self._cancel_requested:
+                        break
+                    audio_temp = self._unique_temp_path(job.source)
+                    job.source.rename(audio_temp)
+                    lrc_temp: Path | None = None
+                    if job.lrc_needed:
+                        try:
+                            lrc_temp = self._unique_temp_path(job.lrc_source)
+                            job.lrc_source.rename(lrc_temp)
+                        except Exception as lrc_exc:
+                            self._restore_temp(audio_temp, job.source)
+                            failed += 1
+                            failures.append(f"{job.relative}: failed to stage matching .lrc: {lrc_exc}")
+                            continue
+                    staged.append((job, audio_temp, lrc_temp))
+
+                if not self._cancel_requested:
+                    for job, audio_temp, lrc_temp in staged:
+                        if self._cancel_requested:
+                            self._restore_temp(lrc_temp, job.lrc_source)
+                            self._restore_temp(audio_temp, job.source)
+                            continue
+
+                        try:
+                            if job.target.exists() and not paths_are_same_file(audio_temp, job.target):
+                                raise FileExistsError(f"target name already exists: {job.target.name}")
+                            self._rename_path(audio_temp, job.target)
+                        except Exception as exc:
+                            self._restore_temp(lrc_temp, job.lrc_source)
+                            self._restore_temp(audio_temp, job.source)
+                            failed += 1
+                            failures.append(f"{job.relative}: {exc}")
+                            continue
+
+                        lrc_was_renamed = False
+                        if lrc_temp is not None:
+                            try:
+                                if job.lrc_target.exists() and not paths_are_same_file(lrc_temp, job.lrc_target):
+                                    raise FileExistsError(
+                                        f"matching .lrc target already exists: {job.lrc_target.name}"
+                                    )
+                                self._rename_path(lrc_temp, job.lrc_target)
+                                lrc_was_renamed = True
+                                lrc_renamed += 1
+                            except Exception as lrc_exc:
+                                rollback_reason = ""
+                                try:
+                                    self._rename_path(job.target, job.source)
+                                except Exception as rollback_exc:
+                                    rollback_reason = f"; rollback failed: {rollback_exc}"
+                                self._restore_temp(lrc_temp, job.lrc_source)
+                                failed += 1
+                                failures.append(
+                                    f"{job.relative}: renamed audio but failed to rename matching .lrc: {lrc_exc}{rollback_reason}"
+                                )
+                                continue
+
+                        renamed += 1
+                        processed = {
+                            "old_path": str(job.source),
+                            "new_path": str(job.target),
+                        }
+                        if lrc_was_renamed:
+                            processed["old_lrc"] = str(job.lrc_source)
+                            processed["new_lrc"] = str(job.lrc_target)
+                        self._processed_paths.append(processed)
+                        self.progress.emit(renamed + failed, total, job.label)
+            finally:
+                if self._cancel_requested:
+                    self._restore_staged(staged)
+
+            if self._cancel_requested:
+                self.cancelled.emit(self._payload(renamed, lrc_renamed, failed, total, failures))
+                return
 
             self.finished.emit(self._payload(renamed, lrc_renamed, failed, total, failures))
         except Exception as exc:

@@ -90,6 +90,7 @@ class MainWindow(QMainWindow):
         
         # Index 1: File Browser
         self._music_browser = MusicBrowserWidget()
+        self._music_browser.library_changed.connect(self._on_library_changed)
         self._tabs.addTab(self._music_browser, "File Browser")
 
         # Index 2: Music Compatibility
@@ -155,10 +156,19 @@ class MainWindow(QMainWindow):
             )
             
     def closeEvent(self, event) -> None:
-        if hasattr(self, "_workflows"):
-            self._workflows.cancel_running_job()
-        if hasattr(self, "_file_cleanup"):
-            self._file_cleanup.cancel_running_job()
+        for widget in (
+            getattr(self, "_workflows", None),
+            getattr(self, "_file_cleanup", None),
+            getattr(self, "_music_compatibility", None),
+            getattr(self, "_music_browser", None),
+            getattr(self, "_metadata_manager", None),
+            getattr(self, "_album_art", None),
+            getattr(self, "_lyrics_manager", None),
+            getattr(self, "_file_rename", None),
+            getattr(self, "_backup_restore", None),
+        ):
+            if widget is not None and hasattr(widget, "cancel_running_job"):
+                widget.cancel_running_job()
         if hasattr(self, '_scanner_thread') and self._scanner_thread.isRunning():
             self._scanner_thread.cancel()
             self._scanner_thread.wait()

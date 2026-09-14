@@ -2,7 +2,7 @@ import os
 import subprocess
 import json
 from pathlib import Path
-from PySide6.QtCore import Qt, QThread, Slot
+from PySide6.QtCore import Qt, QThread, Slot, Signal
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush, QPixmap, QImage
 from PySide6.QtWidgets import (
     QWidget,
@@ -32,9 +32,10 @@ from PySide6.QtGui import QBrush
 
 from ..theme import Colours
 from ..models.drive_data import DriveDataModel, TrackMetadata
-from ..utils.lyrics import decode_text_file_bytes
+from ..utils.lyrics import atomic_write_text, decode_text_file_bytes
 from ..utils.metadata_writer import save_metadata
 from ..utils.album_art import extract_album_art
+from ..utils.file_rename import paths_are_same_file
 from ..threads.bulk_metadata import BulkMetadataWorker
 from .bulk_metadata_dialog import BulkMetadataDialog
 
@@ -175,7 +176,8 @@ class MusicBrowserWidget(QWidget):
     """
     Displays the directory tree of the drive and detailed metadata for the selected file.
     """
-    
+    library_changed = Signal(object)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._data_model: DriveDataModel = None
@@ -504,8 +506,35 @@ class MusicBrowserWidget(QWidget):
             old_name = os.path.basename(filepath)
             new_name, ok = QInputDialog.getText(self, "Rename", "New file name:", QLineEdit.Normal, old_name)
             if ok and new_name and new_name != old_name:
+                new_name = new_name.strip()
+                if not new_name or new_name in {".", ".."} or Path(new_name).name != new_name:
+                    QMessageBox.warning(
+                        self,
+                        "Invalid Name",
+                        "The new name cannot contain path separators or parent-folder references.",
+                    )
+                    return
                 dir_path = os.path.dirname(filepath)
-                new_filepath = os.path.join(dir_path, new_name)
+                new_path = Path(dir_path) / new_name
+                try:
+                    if new_path.resolve().parent != Path(dir_path).resolve():
+                        QMessageBox.warning(
+                            self,
+                            "Invalid Name",
+                            "The new name must stay in the same folder.",
+                        )
+                        return
+                except OSError as e:
+                    QMessageBox.critical(self, "Error", f"Failed to rename file:\n{e}")
+                    return
+                if new_path.exists() and not paths_are_same_file(Path(filepath), new_path):
+                    QMessageBox.warning(
+                        self,
+                        "File Exists",
+                        f"A file named “{new_name}” already exists in this folder.",
+                    )
+                    return
+                new_filepath = str(new_path)
                 try:
                     os.rename(filepath, new_filepath)
                     item.setText(new_name)
@@ -516,6 +545,8 @@ class MusicBrowserWidget(QWidget):
                         track.filename = new_name
                         self._data_model.tracks[new_filepath] = track
                     self._refresh_details_pane()
+                    if self._data_model is not None:
+                        self.library_changed.emit(self._data_model)
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Failed to rename file:\n{e}")
         elif action == delete_action:
@@ -536,6 +567,8 @@ class MusicBrowserWidget(QWidget):
                     if self._data_model and filepath in self._data_model.tracks:
                         del self._data_model.tracks[filepath]
                     self._refresh_details_pane()
+                    if self._data_model is not None:
+                        self.library_changed.emit(self._data_model)
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Failed to delete file:\n{e}")
         
@@ -769,6 +802,11 @@ class MusicBrowserWidget(QWidget):
     def _clear_bulk_refs(self) -> None:
         self._bulk_worker = None
         self._bulk_thread = None
+
+    def cancel_running_job(self) -> None:
+        self._cancel_bulk_edit()
+        if self._bulk_thread is not None and self._bulk_thread.isRunning():
+            self._bulk_thread.wait(8000)
 
     @Slot(int, int, str)
     def _on_bulk_progress(self, processed: int, total: int, detail: str) -> None:
@@ -1116,7 +1154,7 @@ class MusicBrowserWidget(QWidget):
         self._lyrics_save_btn.setText("Saving...")
         QApplication.processEvents()
         try:
-            Path(filepath).write_text(text, encoding="utf-8")
+            atomic_write_text(Path(filepath), text)
         except Exception as exc:
             self._lyrics_save_btn.setText("Save Changes")
             QMessageBox.critical(self, "Error", f"Failed to save LRC file:\n{exc}")

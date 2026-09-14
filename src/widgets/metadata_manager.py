@@ -327,6 +327,11 @@ class MetadataManager(QWidget):
         self._bulk_worker = None
         self._bulk_thread = None
 
+    def cancel_running_job(self) -> None:
+        self._cancel_bulk_edit()
+        if self._bulk_thread is not None and self._bulk_thread.isRunning():
+            self._bulk_thread.wait(8000)
+
     @Slot(int, int, str)
     def _on_bulk_progress(self, processed: int, total: int, detail: str) -> None:
         progress = self._bulk_progress

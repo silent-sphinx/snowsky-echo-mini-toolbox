@@ -259,7 +259,7 @@ class FileRenameWidget(QWidget):
     def _checked_tracks(self) -> list[TrackMetadata]:
         return [
             track for track in self._source_model.tracks()
-            if track.rename_is_checked and track.rename_status in ("RENAME", "CONFLICT")
+            if track.rename_is_checked and track.rename_status == "RENAME"
         ]
 
     def _is_ready(self) -> bool:
@@ -481,6 +481,11 @@ class FileRenameWidget(QWidget):
     def _clear_rename_refs(self) -> None:
         self._rename_worker = None
         self._rename_thread = None
+
+    def cancel_running_job(self) -> None:
+        self._cancel_rename()
+        if self._rename_thread is not None and self._rename_thread.isRunning():
+            self._rename_thread.wait(8000)
 
     @Slot(int, int, str)
     def _on_rename_progress(self, processed: int, total: int, detail: str) -> None:

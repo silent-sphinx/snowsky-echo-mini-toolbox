@@ -322,7 +322,10 @@ class BackupRestoreWidget(QWidget):
             merge = QMessageBox.question(
                 self,
                 "Destination Already Exists",
-                f"{destination_target} already exists. Continue and merge into this folder?",
+                (
+                    f"{destination_target} already exists. Continue and merge into this folder?\n\n"
+                    "Files that already exist at the destination will be skipped, not overwritten."
+                ),
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -401,6 +404,11 @@ class BackupRestoreWidget(QWidget):
         self._worker = None
         self._thread = None
 
+    def cancel_running_job(self) -> None:
+        self._cancel_job()
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.wait(8000)
+
     def _finish_job_ui(self) -> None:
         self._busy = False
         self._job_label = ""
@@ -446,13 +454,19 @@ class BackupRestoreWidget(QWidget):
         processed = int(payload.get("processed") or 0)
         total = int(payload.get("total") or 0)
         skipped = int(payload.get("skipped") or 0)
+        skipped_existing = int(payload.get("skipped_existing") or 0)
         mode = str(payload.get("mode") or "copy").lower()
         mode_label = "Move" if mode == "move" else "Copy"
         self._finish_job_ui()
         QMessageBox.information(
             self,
             f"{mode_label} Completed",
-            f"Destination:\n{destination}\n\nFiles processed: {processed}/{total}\nSymlink files skipped: {skipped}",
+            (
+                f"Destination:\n{destination}\n\n"
+                f"Files processed: {processed}/{total}\n"
+                f"Symlink files skipped: {skipped}\n"
+                f"Existing destination files skipped: {skipped_existing}"
+            ),
         )
         if mode == "move" and destination:
             self.target_relocated.emit(destination)
