@@ -61,10 +61,10 @@ body:
       description: Locate your music file using the 'File Browser' tab, right-click on the file and select 'debug', paste the output of the launched window here.
 
   - type: textarea
-      id: music-file
-      attributes:
-        label: Incompatible Music File
-        description: Drag and drop any incompatible audio files, or provide a link to a cloud-storage service like Google Drive.
+    id: music-file
+    attributes:
+      label: Incompatible Music File
+      description: Drag and drop any incompatible audio files, or provide a link to a cloud-storage service like Google Drive.
 
   - type: textarea
     id: additional-context
