@@ -27,6 +27,7 @@ This document describes exactly how the media compatibility checker evaluates au
 ## Tag Encoding
 
 * This device does not often work well with unusual encodings for tags, best to stick to UTF-16.
+* ID3v2 UTF-8 text frames (`encoding 0x03`) render as garbage because the firmware has no UTF-8 decoder. The checker marks those MP3/WAV/DSF files LIMITED; Convert rewrites the frames as UTF-16 (`0x01`) and saves ID3v2.3, without re-encoding audio.
 
 ## Album Art Requirements
 
@@ -40,11 +41,13 @@ The device has specific requirements for embedded album artwork to be displayed 
 
 The device handles most file names well, but there are exceptions based on tested edge cases:
 
-* **Emojis:** UNSUPPORTED. File names containing emojis (standard, skin tones, zero-width joiners, flags, etc.) do not work.
-* **Complex Asian Scripts:** UNSUPPORTED. Specific scripts like Hindi (Devanagari), Bengali, Khmer, and Burmese are not supported. (Note: Thai, Chinese, Japanese, and Korean are supported).
-* **Zalgo / Complex Diacritics:** RENDERS AS STANDARD TEXT. The text will render, but complex combining characters/diacritics are stripped and ignored.
-* **Latin Extended / Other Unicode:** SUPPORTED. Characters like `café`, Cyrillic, Greek, Arabic, Hebrew, and Math symbols work correctly.
-* **Long Names / Special Punctuation:** SUPPORTED. Works within reasonable filesystem bounds.
+| Name | Failure Description | Media Plays? | Supported Visually? |
+| ---- | ------------------- | ------------ | ------------------- |
+| Emojis | File names containing emojis (standard, skin tones, zero-width joiners, flags, etc.) | ✅ | ❌ |
+| Complex Asian Scripts | Specific scripts like Hindi (Devanagari), Bengali, Khmer, and Burmese are not supported. (Note: Thai, Chinese, Japanese, and Korean are supported). | ✅ | ❌ |
+| Zalgo / Complex Diacritics | The text will render, but complex combining characters/diacritics are stripped and ignored. | ✅ | ⚠️ |
+| Latin Extended / Other Unicode | Characters like `café`, Cyrillic, Greek, Arabic, Hebrew, and Math symbols work correctly. | ✅ | ✅ |
+| Long Names/ Special Punctuation | Works within reasonable filesystem bounds. | ✅ | ✅ |
 
 ## Metadata (Tag) Compatibility
 
@@ -59,3 +62,12 @@ The device has a very simplistic internal metadata parser that can be easily con
 - TRACKNUMBER (also matches Track)
 - DISCNUMBER (also matches Discnumber)
 - GENRE (also matches Genre)
+
+**Vorbis comment order (FLAC / OGG):**
+
+The firmware walks Vorbis comments in file order and copies values into a 128-character SRAM buffer. An oversized comment (commonly embedded `LYRICS` or `TIDAL_DATA`, thousands of characters) that appears *before* a core tag overflows that buffer.
+
+- Before `ALBUM`: the player often hard-reboots.
+- After `ALBUM` but before `ARTIST` / `ALBUMARTIST` / `TITLE` / `TRACKNUMBER`: the file may still play, but those later tags never land in the library, so albums fail to group.
+
+Safe order is every firmware-parsed tag first (`TITLE`, `ARTIST`, `ALBUM`, `ALBUMARTIST`, `TRACKNUMBER`, `DISCNUMBER`, `GENRE`), with oversized values such as `LYRICS` last. The checker flags any oversized comment that appears before a core tag still waiting in the file. Convert reorders core tags to the front and, by default, deletes every tag the device does not read.

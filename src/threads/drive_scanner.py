@@ -1,0 +1,297 @@
+import os
+import mutagen
+from mutagen.flac import FLAC
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, APIC, SYLT, USLT, TXXX
+from mutagen.mp4 import MP4
+import concurrent.futures
+from PySide6.QtCore import QThread, Signal
+from typing import Optional
+
+from ..constants import SUPPORTED_MEDIA_EXTENSIONS
+from ..models.drive_data import DriveDataModel, TrackMetadata
+
+
+def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
+    """Extract metadata from a single file. (Runs in separate processes)"""
+    filename = os.path.basename(filepath)
+    _, ext = os.path.splitext(filename)
+    size = os.path.getsize(filepath)
+    
+    meta = TrackMetadata(
+        filepath=filepath,
+        filename=filename,
+        extension=ext.lower(),
+        size_bytes=size
+    )
+    
+    if filepath.lower().endswith(".lrc"):
+        meta.format_name = "LRC Lyrics File"
+        return meta
+        
+    audio = None
+    try:
+        audio = mutagen.File(filepath, easy=False)
+    except Exception:
+        audio = None
+
+    if audio is None:
+        _apply_lyrics_scan(meta, filepath, None)
+        return meta
+        
+    meta.format_name = type(audio).__name__
+    if audio.info:
+        meta.duration_seconds = getattr(audio.info, "length", 0.0)
+        meta.bitrate_kbps = getattr(audio.info, "bitrate", 0) // 1000 if getattr(audio.info, "bitrate", 0) else 0
+        meta.sample_rate_hz = getattr(audio.info, "sample_rate", 0)
+        meta.channels = getattr(audio.info, "channels", 0)
+        
+    # Extract tags
+    if audio.tags:
+        # Capture all raw tags for display (skip binary/lyrics)
+        for key, val in audio.tags.items():
+            k_lower = str(key).lower()
+            if "apic" in k_lower or "pic" in k_lower or "covr" in k_lower or "lyrics" in k_lower or "sylt" in k_lower or "uslt" in k_lower:
+                continue
+            
+            # Mutagen often returns lists for values. Unpack them if possible.
+            if isinstance(val, list) and len(val) == 1:
+                clean_val = str(val[0])
+            elif isinstance(val, list):
+                clean_val = ", ".join(str(v) for v in val)
+            else:
+                clean_val = str(val)
+                
+            meta.all_tags[str(key)] = clean_val
+            
+        # Common tags (mutagen makes this slightly painful depending on format)
+        if isinstance(audio, FLAC):
+            meta.title = audio.get("title", [meta.title])[0]
+            meta.artist = audio.get("artist", [meta.artist])[0]
+            meta.album = audio.get("album", [meta.album])[0]
+            meta.genre = audio.get("genre", [""])[0]
+            meta.year = audio.get("date", [""])[0]
+            meta.track_num = audio.get("tracknumber", [""])[0]
+            
+            # Check for pictures
+            if audio.pictures:
+                meta.has_album_art = True
+
+        elif isinstance(audio, MP4):
+            def _mp4_tag(atom: str) -> str:
+                values = audio.tags.get(atom) if audio.tags else None
+                if not values:
+                    return ""
+                first = values[0]
+                return str(first) if not isinstance(first, bytes) else first.decode("utf-8", "replace")
+
+            meta.title = _mp4_tag("\xa9nam") or meta.title
+            meta.artist = _mp4_tag("\xa9ART") or meta.artist
+            meta.album = _mp4_tag("\xa9alb") or meta.album
+            meta.album_artist = _mp4_tag("aART")
+            meta.genre = _mp4_tag("\xa9gen") or meta.genre
+            meta.year = _mp4_tag("\xa9day") or meta.year
+
+            trkn = audio.tags.get("trkn") if audio.tags else None
+            if trkn:
+                try:
+                    meta.track_num = str(trkn[0][0])
+                except (IndexError, TypeError, ValueError):
+                    pass
+
+            if audio.tags and audio.tags.get("covr"):
+                meta.has_album_art = True
+
+        elif audio.tags:
+            # Try generic dict access
+            try:
+                meta.title = str(audio.tags.get("TIT2", audio.get("title", [meta.title])[0]))
+            except: pass
+            
+            try:
+                meta.artist = str(audio.tags.get("TPE1", audio.get("artist", [meta.artist])[0]))
+            except: pass
+            
+            try:
+                meta.album = str(audio.tags.get("TALB", audio.get("album", [meta.album])[0]))
+            except: pass
+            
+            # ID3 checks for art (lyrics are evaluated separately)
+            if hasattr(audio.tags, "getall"):
+                if audio.tags.getall("APIC"):
+                    meta.has_album_art = True
+
+        # Album artist drives album grouping for artwork lookups. FLAC uses a
+        # Vorbis comment, ID3 uses TPE2, and MP4 was already handled above.
+        if not meta.album_artist:
+            from ..utils.tag_normalization import first_tag, tag_or_empty
+
+            if isinstance(audio, FLAC):
+                meta.album_artist = tag_or_empty(audio.get("albumartist", [""])[0])
+            elif audio.tags is not None and hasattr(audio.tags, "getall"):
+                try:
+                    tpe2 = audio.tags.getall("TPE2")
+                    if tpe2:
+                        meta.album_artist = tag_or_empty(str(tpe2[0]))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+
+            if not meta.album_artist:
+                meta.album_artist = first_tag(
+                    meta.all_tags, "albumartist", "album artist", "album_artist", "TPE2", "aART"
+                )
+
+    # Run ffprobe compatibility check
+    if not filepath.lower().endswith(".lrc"):
+        try:
+            from pathlib import Path
+            from ..utils.music_compatibility import evaluate_music_file
+            
+            comp_result = evaluate_music_file(Path(filepath), Path(root_path))
+            meta.comp_status = comp_result.get("status", "UNKNOWN")
+            meta.comp_category = comp_result.get("category", "unknown")
+            meta.comp_reason = comp_result.get("reason", "")
+            meta.comp_eq = comp_result.get("eq_compatibility", "-")
+            meta.comp_codec = comp_result.get("codec", "-")
+            meta.comp_sample_rate = comp_result.get("sample_rate", "-")
+            meta.comp_bit_depth = comp_result.get("bit_depth", "-")
+            meta.comp_block_size = comp_result.get("block_size", "-")
+            meta.comp_dsd_profile = comp_result.get("dsd_profile", "-")
+            meta.comp_channels = comp_result.get("channels", "-")
+            meta.comp_streams = comp_result.get("stream_count", "-")
+            meta.comp_filename = comp_result.get("filename_compatibility", "-")
+            meta.comp_filename_reason = comp_result.get("filename_compatibility_reason", "-")
+            meta.comp_metadata = comp_result.get("metadata_compatibility", "-")
+            meta.comp_metadata_reason = comp_result.get("metadata_compatibility_reason", "-")
+            meta.comp_channel_compat = comp_result.get("channel_compatibility", "-")
+            meta.comp_channel_compat_reason = comp_result.get("channel_compatibility_reason", "-")
+            meta.comp_wav_codec = comp_result.get("wav_codec_compatibility", "-")
+            meta.comp_wav_codec_reason = comp_result.get("wav_codec_compatibility_reason", "-")
+            meta.comp_dsd_bitdepth = comp_result.get("dsd_bitdepth_compatibility", "-")
+            meta.comp_dsd_bitdepth_reason = comp_result.get("dsd_bitdepth_compatibility_reason", "-")
+            meta.comp_tag_encoding = comp_result.get("tag_encoding_compatibility", "-")
+            meta.comp_tag_encoding_reason = comp_result.get("tag_encoding_compatibility_reason", "-")
+            meta.comp_tag_length = comp_result.get("tag_length_compatibility", "-")
+            meta.comp_tag_length_reason = comp_result.get("tag_length_compatibility_reason", "-")
+        except Exception as e:
+            print(f"Compatibility scan failed for {filepath}: {e}")
+
+        # Album art validation (also authoritative for has_album_art, since it
+        # covers MP4 covr atoms that the tag pass above does not read).
+        try:
+            from pathlib import Path
+            from ..utils.album_art_planner import apply_album_art_result
+            from ..utils.album_art_validation import evaluate_album_art
+
+            apply_album_art_result(meta, evaluate_album_art(Path(filepath)))
+        except Exception as e:
+            print(f"Album art scan failed for {filepath}: {e}")
+
+        _apply_lyrics_scan(meta, filepath, audio)
+
+    return meta
+
+
+def _apply_lyrics_scan(meta: TrackMetadata, filepath: str, audio) -> None:
+    """Evaluate embedded lyrics and matching .lrc sidecars."""
+    try:
+        from pathlib import Path
+        from ..utils.lyrics import apply_lyrics_result, evaluate_lyrics_from_audio
+
+        apply_lyrics_result(meta, evaluate_lyrics_from_audio(Path(filepath), audio))
+    except Exception as e:
+        print(f"Lyrics scan failed for {filepath}: {e}")
+
+
+class DriveScannerThread(QThread):
+    """
+    Background thread that scans a drive for all supported media files and
+    extracts deep metadata via mutagen.
+    
+    Signals:
+        progress_updated (int, int, str): current_track, total_tracks, current_file
+        scan_finished (DriveDataModel): Emitted when scan is complete.
+    """
+    progress_updated = Signal(int, int, str)
+    scan_finished = Signal(object)  # Passes the DriveDataModel
+
+    def __init__(self, path: str, parent=None):
+        super().__init__(parent)
+        self.path = path
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        data_model = DriveDataModel(self.path)
+
+        try:
+            # Phase 1: Collect supported media paths.
+            supported_files = []
+            last_emit_count = 0
+            self.progress_updated.emit(0, 0, "Discovering files...")
+            for root, dirs, files in os.walk(self.path):
+                if self._is_cancelled:
+                    return
+
+                # Exclude hidden directories from being traversed
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+
+                for file in files:
+                    if file.startswith('.'):
+                        continue
+                    ext = os.path.splitext(file)[1].lower()
+                    if ext in SUPPORTED_MEDIA_EXTENSIONS or ext == ".lrc":
+                        supported_files.append(os.path.join(root, file))
+
+                found = len(supported_files)
+                if found - last_emit_count >= 50:
+                    last_emit_count = found
+                    self.progress_updated.emit(0, 0, f"Discovering files: {found}")
+
+            if self._is_cancelled:
+                return
+
+            total_files = len(supported_files)
+            self.progress_updated.emit(0, total_files, "Starting analysis...")
+
+            # Threads, not processes: ProcessPoolExecutor deadlocks from QThread on macOS.
+            max_workers = max(1, (os.cpu_count() or 2) - 1)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_path = {
+                    executor.submit(extract_metadata_worker, path, self.path): path
+                    for path in supported_files
+                }
+
+                for i, future in enumerate(concurrent.futures.as_completed(future_to_path)):
+                    if self._is_cancelled:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        return
+
+                    filepath = future_to_path[future]
+                    self.progress_updated.emit(i + 1, total_files, filepath)
+
+                    try:
+                        meta = future.result()
+                        data_model.add_track(meta)
+                    except Exception as e:
+                        print(f"Error parsing {filepath}: {e}")
+                        filename = os.path.basename(filepath)
+                        _, ext = os.path.splitext(filename)
+                        size = os.path.getsize(filepath)
+                        meta = TrackMetadata(
+                            filepath=filepath,
+                            filename=filename,
+                            extension=ext.lower(),
+                            size_bytes=size
+                        )
+                        data_model.add_track(meta)
+
+            if not self._is_cancelled:
+                self.scan_finished.emit(data_model)
+        except Exception as e:
+            print(f"Drive scan failed: {e}")
+            if not self._is_cancelled:
+                self.scan_finished.emit(data_model)
