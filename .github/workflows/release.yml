@@ -323,13 +323,20 @@ jobs:
           curl \
             --fail \
             --location \
-            --silent \
             --show-error \
-            "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
-            --output ffmpeg.tar.xz
+            "https://github.com/Tyrrrz/FFmpegBin/releases/latest/download/ffmpeg-linux-x64.zip" \
+            --output ffmpeg.zip
 
-          mkdir ffmpeg_extract
-          tar -xf ffmpeg.tar.xz -C ffmpeg_extract
+          echo "Downloaded archive:"
+          ls -lh ffmpeg.zip
+          file ffmpeg.zip
+
+          if ! file ffmpeg.zip | grep -qi 'zip'; then
+            echo "ERROR: downloaded FFmpeg archive is not a zip file"
+            exit 1
+          fi
+
+          unzip -q ffmpeg.zip -d ffmpeg_extract
           echo "Downloaded FFmpeg files:"
           find ffmpeg_extract -type f -print
 
