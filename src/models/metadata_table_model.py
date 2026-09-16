@@ -2,12 +2,10 @@
 Model-View-Controller components for Metadata Browser.
 """
 
-import os
-
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, Signal
 from PySide6.QtGui import QColor
 
-from ..models.drive_data import DriveDataModel, TrackMetadata
+from ..models.drive_data import DriveDataModel, TrackMetadata, relative_track_path
 from ..theme import Colours, colours_for_status
 from ..utils.metadata_status import (
     is_metadata_track,
@@ -220,10 +218,7 @@ class MetadataTableModel(QAbstractTableModel):
             if col == MetaColumn.REASON:
                 return reason
             if col == MetaColumn.FILE:
-                try:
-                    return os.path.relpath(track.filepath, self._root_path)
-                except Exception:
-                    return track.filepath
+                return relative_track_path(track.filepath, self._root_path)
 
         if role == Qt.BackgroundRole:
             bg, _ = colours_for_status(self._status_token_for_cell(track, col))

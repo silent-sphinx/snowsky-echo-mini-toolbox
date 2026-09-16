@@ -34,7 +34,7 @@ from ..utils.file_rename import (
     is_rename_track,
     rename_candidate_dict,
 )
-from .page_chrome import filter_toolbar, flow_steps, loading_page, page_header
+from .page_chrome import filter_toolbar, flow_steps, freeze_view, loading_page, page_header, PATH_COLUMN_WIDTH
 from .stat_card import StatCard
 from .grouped_header_view import GroupedHeaderView
 
@@ -647,7 +647,8 @@ class FileRenameWidget(QWidget):
 
     def populate_data(self, data_model: DriveDataModel) -> None:
         self._data_model = data_model
-        self._refresh_suggestions(reset_checks=True)
+        with freeze_view(self._table):
+            self._refresh_suggestions(reset_checks=True)
 
         header = self._table.horizontalHeader()
         font_metrics = header.fontMetrics()
@@ -669,7 +670,7 @@ class FileRenameWidget(QWidget):
                 text_width = font_metrics.horizontalAdvance(RenameColumn.HEADERS[col].upper()) + 45
                 header.resizeSection(col, max(baselines[col], text_width))
 
-        self._table.resizeColumnToContents(RenameColumn.FILE)
+        header.resizeSection(RenameColumn.FILE, PATH_COLUMN_WIDTH)
         self._update_rename_button_state()
         QTimer.singleShot(100, self._update_stats)
 

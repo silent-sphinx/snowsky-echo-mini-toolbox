@@ -418,14 +418,13 @@ class MainWindow(QMainWindow):
             
     def _on_scan_finished(self, data_model) -> None:
         """Handle completion of the global drive scan."""
-        self._set_processing_state(False)
-        
-        # Pass the unified data model to the child tabs
+        self._prog_status_lbl.setText("Loading tables...")
+        # Load models before revealing tables. Measuring every path column
+        # while the views are visible is what used to stall/crash large scans.
         self._populate_library_tabs(data_model)
-        
-        # Update the DriveInfoWidget track count and charts
         if self._tabs.isTabVisible(0):
             self._drive_info.populate_data(data_model)
+        self._set_processing_state(False)
 
     def _on_library_changed(self, data_model) -> None:
         """Refresh tabs after an in-place library mutation such as a rename."""
@@ -434,15 +433,21 @@ class MainWindow(QMainWindow):
             self._drive_info.populate_data(data_model)
 
     def _populate_library_tabs(self, data_model) -> None:
-        self._music_browser.populate_data(data_model)
-        self._music_compatibility.populate_data(data_model)
-        self._metadata_manager.populate_data(data_model)
-        self._album_art.populate_data(data_model)
-        self._lyrics_manager.populate_data(data_model)
-        self._file_rename.populate_data(data_model)
-        self._file_cleanup.populate_data(data_model)
-        self._backup_restore.populate_data(data_model)
-        self._workflows.populate_data(data_model)
+        for name, populate in (
+            ("file browser", self._music_browser.populate_data),
+            ("music compatibility", self._music_compatibility.populate_data),
+            ("metadata", self._metadata_manager.populate_data),
+            ("album art", self._album_art.populate_data),
+            ("lyrics", self._lyrics_manager.populate_data),
+            ("file rename", self._file_rename.populate_data),
+            ("file cleanup", self._file_cleanup.populate_data),
+            ("backup restore", self._backup_restore.populate_data),
+            ("workflows", self._workflows.populate_data),
+        ):
+            try:
+                populate(data_model)
+            except Exception as exc:
+                print(f"Failed to populate {name}: {exc}")
 
     def _set_processing_state(self, is_processing: bool, status_text: str = "Processing data...") -> None:
         """Toggle the global loading state and UI indicators."""

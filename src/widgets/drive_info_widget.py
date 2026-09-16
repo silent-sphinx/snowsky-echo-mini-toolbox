@@ -508,7 +508,7 @@ class DriveInfoWidget(QWidget):
         # ── Stat cards ──────────────────────────────────────────
         self._sc_tracks._val.setText(f"{count:,}")
 
-        total_dur = sum(t.duration_seconds for t in tracks)
+        total_dur = sum((t.duration_seconds or 0.0) for t in tracks)
         self._sc_duration._val.setText(_format_duration(total_dur))
 
         self._sc_mediasize._val.setText(_format_bytes(data_model.total_size_bytes))

@@ -1,11 +1,9 @@
 """Model-View-Controller components for File Rename."""
 
-import os
-
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt
 from PySide6.QtGui import QColor
 
-from ..models.drive_data import TrackMetadata
+from ..models.drive_data import TrackMetadata, relative_track_path
 from ..theme import Colours, colours_for_status
 from ..utils.file_rename import is_rename_track
 
@@ -125,10 +123,7 @@ class FileRenameTableModel(QAbstractTableModel):
             if col == RenameColumn.TRACK_NO:
                 return track.rename_track_no or "-"
             if col == RenameColumn.FILE:
-                try:
-                    return os.path.relpath(track.filepath, self._root_path)
-                except Exception:
-                    return track.filepath
+                return relative_track_path(track.filepath, self._root_path)
 
         if role == Qt.BackgroundRole:
             bg, _ = colours_for_status(self._status_token_for_cell(track, col))

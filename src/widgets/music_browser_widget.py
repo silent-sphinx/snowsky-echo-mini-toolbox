@@ -38,6 +38,7 @@ from ..utils.album_art import extract_album_art
 from ..utils.file_rename import paths_are_same_file
 from ..threads.bulk_metadata import BulkMetadataWorker
 from .bulk_metadata_dialog import BulkMetadataDialog
+from .page_chrome import freeze_view
 
 _NON_MUSIC_EXTENSIONS = {".lrc", ".cue"}
 
@@ -582,10 +583,10 @@ class MusicBrowserWidget(QWidget):
     def populate_data(self, data_model: DriveDataModel) -> None:
         """Populate the UI using the centralized data model."""
         self._data_model = data_model
-        self._tree_model.clear()
-        
-        root_item = self._tree_model.invisibleRootItem()
-        self._build_tree(data_model.tree, root_item, data_model.root_path)
+        with freeze_view(self._tree):
+            self._tree_model.clear()
+            root_item = self._tree_model.invisibleRootItem()
+            self._build_tree(data_model.tree, root_item, data_model.root_path)
         self._show_blank_details()
         
     def _build_tree(self, tree_dict: dict, parent_item: QStandardItem, current_path: str) -> None:
@@ -594,6 +595,7 @@ class MusicBrowserWidget(QWidget):
             tree_dict.items(), 
             key=lambda x: (x[1] is None, x[0].lower())
         )
+        dir_icon = QApplication.style().standardIcon(QStyle.SP_DirIcon)
         
         for name, sub_dict in sorted_items:
             full_path = os.path.join(current_path, name)
@@ -604,8 +606,7 @@ class MusicBrowserWidget(QWidget):
             
             if sub_dict is not None:
                 # It's a directory
-                icon = QApplication.style().standardIcon(QStyle.SP_DirIcon)
-                item.setIcon(icon)
+                item.setIcon(dir_icon)
                 item.setCheckable(True)
                 self._build_tree(sub_dict, item, full_path)
             else:

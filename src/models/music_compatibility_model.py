@@ -2,11 +2,10 @@
 Model-View-Controller components for Music Compatibility.
 """
 
-import os
 from PySide6.QtCore import QAbstractTableModel, QSortFilterProxyModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
 
-from ..models.drive_data import TrackMetadata
+from ..models.drive_data import TrackMetadata, relative_track_path
 from ..theme import Colours, colours_for_status
 
 class CompColumn:
@@ -161,7 +160,7 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
             elif col == CompColumn.STREAMS: return track.comp_streams
             elif col == CompColumn.FILENAME: return track.comp_filename
             elif col == CompColumn.METADATA: return track.comp_metadata
-            elif col == CompColumn.FILE: return os.path.relpath(track.filepath, self._root_path)
+            elif col == CompColumn.FILE: return relative_track_path(track.filepath, self._root_path)
             
         elif role == Qt.BackgroundRole:
             bg, _ = colours_for_status(self._status_token_for_cell(track, col))

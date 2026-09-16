@@ -25,7 +25,7 @@ from ..models.metadata_table_model import (
 )
 from ..threads.bulk_metadata import BulkMetadataWorker
 from .bulk_metadata_dialog import BulkMetadataDialog
-from .page_chrome import filter_toolbar, loading_page, page_header
+from .page_chrome import filter_toolbar, freeze_view, loading_page, page_header, PATH_COLUMN_WIDTH
 from .stat_card import StatCard
 from .grouped_header_view import GroupedHeaderView
 
@@ -446,7 +446,8 @@ class MetadataManager(QWidget):
         for track in tracks:
             track.meta_is_checked = False
 
-        self._source_model.update_data(tracks, data_model.root_path, data_model)
+        with freeze_view(self._table):
+            self._source_model.update_data(tracks, data_model.root_path, data_model)
 
         header = self._table.horizontalHeader()
         font_metrics = header.fontMetrics()
@@ -469,7 +470,7 @@ class MetadataManager(QWidget):
                 text_width = font_metrics.horizontalAdvance(MetaColumn.HEADERS[col].upper()) + 45
                 header.resizeSection(col, max(baselines[col], text_width))
 
-        self._table.resizeColumnToContents(MetaColumn.FILE)
+        header.resizeSection(MetaColumn.FILE, PATH_COLUMN_WIDTH)
         self._update_action_button_state()
         QTimer.singleShot(100, self._update_stats)
 

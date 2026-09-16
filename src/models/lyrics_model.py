@@ -1,10 +1,9 @@
 """Model-View-Controller components for Lyrics Manager."""
 
-import os
 from PySide6.QtCore import QAbstractTableModel, QSortFilterProxyModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
 
-from ..models.drive_data import TrackMetadata
+from ..models.drive_data import TrackMetadata, relative_track_path
 from ..theme import Colours, colours_for_status
 
 
@@ -131,10 +130,7 @@ class LyricsTableModel(QAbstractTableModel):
             if col == LyricsColumn.PREVIEW:
                 return track.lyrics_preview
             if col == LyricsColumn.FILE:
-                try:
-                    return os.path.relpath(track.filepath, self._root_path)
-                except Exception:
-                    return track.filepath
+                return relative_track_path(track.filepath, self._root_path)
 
         if role == Qt.BackgroundRole:
             bg, _ = colours_for_status(self._status_token_for_cell(track, col))

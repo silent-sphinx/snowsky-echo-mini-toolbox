@@ -1,7 +1,10 @@
 """Shared page chrome for the manager-style tabs."""
 
+from contextlib import contextmanager
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -10,6 +13,25 @@ from PySide6.QtWidgets import (
 )
 
 from ..theme import Colours
+
+PATH_COLUMN_WIDTH = 440
+
+
+@contextmanager
+def freeze_view(view: QAbstractItemView):
+    """Pause painting and sorting while a large model is swapped in."""
+    sorting = False
+    sorter = getattr(view, "isSortingEnabled", None)
+    if callable(sorter):
+        sorting = bool(sorter())
+        view.setSortingEnabled(False)
+    view.setUpdatesEnabled(False)
+    try:
+        yield
+    finally:
+        view.setUpdatesEnabled(True)
+        if callable(getattr(view, "setSortingEnabled", None)):
+            view.setSortingEnabled(sorting)
 
 
 def page_header(

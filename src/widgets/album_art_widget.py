@@ -34,7 +34,7 @@ from ..utils.album_art_planner import apply_album_art_result
 from ..utils.album_art_validation import evaluate_album_art
 from .album_art_download_dialog import AlbumArtDownloadDialog
 from .album_art_fix_dialog import AlbumArtFixDialog
-from .page_chrome import filter_toolbar, loading_page, page_header
+from .page_chrome import filter_toolbar, freeze_view, loading_page, page_header, PATH_COLUMN_WIDTH
 from .stat_card import StatCard
 from .grouped_header_view import GroupedHeaderView
 
@@ -809,7 +809,8 @@ class AlbumArtWidget(QWidget):
         for track in tracks:
             track.art_is_checked = track.art_status == "INCOMPATIBLE"
 
-        self._source_model.update_data(tracks, data_model.root_path)
+        with freeze_view(self._table):
+            self._source_model.update_data(tracks, data_model.root_path)
 
         header = self._table.horizontalHeader()
         font_metrics = header.fontMetrics()
@@ -837,7 +838,7 @@ class AlbumArtWidget(QWidget):
                 text_width = font_metrics.horizontalAdvance(ArtColumn.HEADERS[col].upper()) + 45
                 header.resizeSection(col, max(baselines[col], text_width))
 
-        self._table.resizeColumnToContents(ArtColumn.FILE)
+        header.resizeSection(ArtColumn.FILE, PATH_COLUMN_WIDTH)
         self._update_convert_button_state()
         QTimer.singleShot(100, self._update_stats)
 

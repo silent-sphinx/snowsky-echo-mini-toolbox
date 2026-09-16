@@ -58,13 +58,24 @@ _WHITESPACE_PATTERN = re.compile(r"\s+")
 _APOSTROPHE_PATTERN = re.compile(r"[\u2019\u02bc']")
 
 
+def coerce_tag_text(value, fallback: str = "") -> str:
+    """Force a mutagen/tag value into a NUL-free string Qt can display."""
+    if value is None:
+        return fallback
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", "replace")
+    else:
+        text = str(value)
+    text = text.replace("\x00", " ")
+    return text if text else fallback
+
+
 def clean_tag_value(value: str | None) -> str:
     """Collapse whitespace and strip stray separators from a raw tag."""
     if not value:
         return ""
 
-    text = unicodedata.normalize("NFC", str(value))
-    text = text.replace("\x00", " ")
+    text = unicodedata.normalize("NFC", coerce_tag_text(value))
     text = _WHITESPACE_PATTERN.sub(" ", text).strip()
     return text.strip(" -_/\\|")
 

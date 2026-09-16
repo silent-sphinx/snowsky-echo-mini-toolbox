@@ -2,11 +2,10 @@
 Model-View-Controller components for Album Art validation.
 """
 
-import os
 from PySide6.QtCore import QAbstractTableModel, QSortFilterProxyModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
 
-from ..models.drive_data import TrackMetadata
+from ..models.drive_data import TrackMetadata, relative_track_path
 from ..theme import Colours, colours_for_status
 from ..utils.album_art_validation import MAX_ART_DIMENSION
 
@@ -137,7 +136,7 @@ class AlbumArtTableModel(QAbstractTableModel):
             elif col == ArtColumn.SCAN_CHECK: return track.art_scan_compat
             elif col == ArtColumn.RESOLUTION_CHECK: return track.art_resolution_compat
             elif col == ArtColumn.METADATA: return track.art_metadata_status
-            elif col == ArtColumn.FILE: return os.path.relpath(track.filepath, self._root_path)
+            elif col == ArtColumn.FILE: return relative_track_path(track.filepath, self._root_path)
 
         elif role == Qt.BackgroundRole:
             bg, _ = colours_for_status(self._status_token_for_cell(track, col))
