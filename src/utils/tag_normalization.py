@@ -168,3 +168,87 @@ def first_tag(tags: dict[str, str] | None, *names: str) -> str:
         if cleaned:
             return cleaned
     return ""
+
+
+_ID3_EASY_KEYS = {
+    "title": "TIT2",
+    "artist": "TPE1",
+    "album": "TALB",
+    "albumartist": "TPE2",
+    "genre": "TCON",
+}
+_MP4_EASY_KEYS = {
+    "title": "\xa9nam",
+    "artist": "\xa9ART",
+    "album": "\xa9alb",
+    "albumartist": "aART",
+    "genre": "\xa9gen",
+}
+
+
+def _values_as_strings(values) -> list[str]:
+    if not values:
+        return []
+    if not isinstance(values, list):
+        values = [values]
+    texts: list[str] = []
+    for value in values:
+        if isinstance(value, bytes):
+            texts.append(value.decode("utf-8", "replace"))
+        else:
+            texts.append(str(value))
+    return [text for text in texts if text]
+
+
+def easy_tag_values(audio, key: str) -> list[str]:
+    """Return text values for an easy tag name from a mutagen File."""
+    if audio is None:
+        return []
+
+    try:
+        texts = _values_as_strings(audio.get(key))
+        if texts:
+            return texts
+    except Exception:
+        pass
+
+    tags = getattr(audio, "tags", None)
+    if tags is None:
+        return []
+
+    frame_id = _ID3_EASY_KEYS.get(key)
+    if frame_id and hasattr(tags, "getall"):
+        try:
+            frames = tags.getall(frame_id)
+        except Exception:
+            frames = None
+        if frames:
+            texts: list[str] = []
+            for frame in frames:
+                text = getattr(frame, "text", None)
+                if text:
+                    texts.extend(_values_as_strings(list(text)))
+                else:
+                    texts.append(str(frame))
+            if texts:
+                return texts
+
+    atom = _MP4_EASY_KEYS.get(key)
+    if atom:
+        try:
+            texts = _values_as_strings(tags.get(atom))
+            if texts:
+                return texts
+        except Exception:
+            pass
+    return []
+
+
+def first_easy_tag(audio, *keys: str) -> str:
+    """Return the first populated easy tag from a mutagen File."""
+    for key in keys:
+        for value in easy_tag_values(audio, key):
+            cleaned = tag_or_empty(value)
+            if cleaned:
+                return cleaned
+    return ""

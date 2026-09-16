@@ -5,15 +5,41 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, SYLT, USLT, TXXX
 from mutagen.mp4 import MP4
 import concurrent.futures
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QStorageInfo, QThread, Signal
 from typing import Optional
 
 from ..constants import SUPPORTED_MEDIA_EXTENSIONS
 from ..models.drive_data import DriveDataModel, TrackMetadata
 
+_REMOVABLE_FILESYSTEMS = frozenset({
+    "FAT",
+    "FAT12",
+    "FAT16",
+    "FAT32",
+    "EXFAT",
+    "MSDOS",
+    "VFAT",
+})
+_REMOVABLE_WORKER_CAP = 2
+
+
+def _scan_worker_count(path: str) -> int:
+    """Use fewer workers on USB/FAT volumes where concurrent small I/O contends."""
+    cpu_workers = max(1, (os.cpu_count() or 2) - 1)
+    try:
+        info = QStorageInfo(path)
+        if not info.isValid():
+            return cpu_workers
+        fs_type = bytes(info.fileSystemType() or b"").decode("utf-8", "ignore").upper()
+        if info.isRemovable() or fs_type in _REMOVABLE_FILESYSTEMS:
+            return min(_REMOVABLE_WORKER_CAP, cpu_workers)
+    except Exception:
+        pass
+    return cpu_workers
+
 
 def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
-    """Extract metadata from a single file. (Runs in separate processes)"""
+    """Extract metadata from a single file."""
     filename = os.path.basename(filepath)
     _, ext = os.path.splitext(filename)
     size = os.path.getsize(filepath)
@@ -141,13 +167,13 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
                     meta.all_tags, "albumartist", "album artist", "album_artist", "TPE2", "aART"
                 )
 
-    # Run ffprobe compatibility check
+    # Compatibility, artwork, and lyrics all reuse the mutagen object above.
     if not filepath.lower().endswith(".lrc"):
         try:
             from pathlib import Path
             from ..utils.music_compatibility import evaluate_music_file
             
-            comp_result = evaluate_music_file(Path(filepath), Path(root_path))
+            comp_result = evaluate_music_file(Path(filepath), Path(root_path), audio=audio)
             meta.comp_status = comp_result.get("status", "UNKNOWN")
             meta.comp_category = comp_result.get("category", "unknown")
             meta.comp_reason = comp_result.get("reason", "")
@@ -183,7 +209,7 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
             from ..utils.album_art_planner import apply_album_art_result
             from ..utils.album_art_validation import evaluate_album_art
 
-            apply_album_art_result(meta, evaluate_album_art(Path(filepath)))
+            apply_album_art_result(meta, evaluate_album_art(Path(filepath), audio=audio))
         except Exception as e:
             print(f"Album art scan failed for {filepath}: {e}")
 
@@ -257,7 +283,8 @@ class DriveScannerThread(QThread):
             self.progress_updated.emit(0, total_files, "Starting analysis...")
 
             # Threads, not processes: ProcessPoolExecutor deadlocks from QThread on macOS.
-            max_workers = max(1, (os.cpu_count() or 2) - 1)
+            # Removable FAT/exFAT volumes serialize small reads, so extra workers hurt.
+            max_workers = _scan_worker_count(self.path)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_path = {

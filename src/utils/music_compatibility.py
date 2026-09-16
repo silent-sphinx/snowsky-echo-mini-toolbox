@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 from collections import OrderedDict
+from functools import lru_cache
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Slot
@@ -162,6 +163,230 @@ def _read_flac_streaminfo_block_max_size(path: Path) -> int | None:
         return None
 
 
+_WAV_FORMAT_PCM = 0x0001
+_WAV_FORMAT_MS_ADPCM = 0x0002
+_WAV_FORMAT_IEEE_FLOAT = 0x0003
+_WAV_FORMAT_IMA_ADPCM = 0x0011
+_WAV_FORMAT_EXTENSIBLE = 0xFFFE
+
+_LOSSY_DEFAULT_BIT_DEPTH = {
+    ".mp1": 16,
+    ".mp2": 16,
+    ".mp3": 16,
+    ".ogg": 16,
+    ".m4a": 16,
+    ".m4b": 16,
+    ".m4p": 16,
+    ".wma": 16,
+}
+
+_MUTAGEN_TYPE_CODECS = {
+    "mp3": "mp3",
+    "easymp3": "mp3",
+    "flac": "flac",
+    "oggvorbis": "vorbis",
+    "oggopus": "opus",
+    "oggspeex": "speex",
+    "oggflac": "flac",
+    "monkeysaudio": "ape",
+    "dsf": "dsd_lsbf_planar",
+    "asf": "wma",
+    "trueaudio": "tta",
+    "aac": "aac",
+}
+
+
+def _blank_audio_metadata(**overrides) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "sample_rate": None,
+        "bit_depth": None,
+        "flac_block_max": None,
+        "stream_index": None,
+        "codec_name": None,
+        "channels": None,
+        "audio_stream_count": None,
+        "total_stream_count": None,
+        "audio_streams": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _read_wav_format(path: Path) -> dict[str, int] | None:
+    """Read the WAV fmt chunk without spawning ffprobe."""
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(12)
+            if len(header) < 12 or header[8:12] != b"WAVE":
+                return None
+            if header[0:4] not in (b"RIFF", b"RF64"):
+                return None
+
+            while True:
+                chunk_header = handle.read(8)
+                if len(chunk_header) < 8:
+                    return None
+                chunk_id = chunk_header[0:4]
+                chunk_size = int.from_bytes(chunk_header[4:8], "little")
+                if chunk_id == b"fmt ":
+                    payload = handle.read(min(chunk_size, 64))
+                    if len(payload) < 16:
+                        return None
+                    format_tag = int.from_bytes(payload[0:2], "little")
+                    channels = int.from_bytes(payload[2:4], "little")
+                    sample_rate = int.from_bytes(payload[4:8], "little")
+                    bits_per_sample = int.from_bytes(payload[14:16], "little")
+                    result = {
+                        "format_tag": format_tag,
+                        "channels": channels,
+                        "sample_rate": sample_rate,
+                        "bits_per_sample": bits_per_sample,
+                    }
+                    if format_tag == _WAV_FORMAT_EXTENSIBLE and len(payload) >= 40:
+                        result["subformat"] = int.from_bytes(payload[24:26], "little")
+                    return result
+                skip = chunk_size + (chunk_size & 1)
+                if skip < 0:
+                    return None
+                handle.seek(skip, os.SEEK_CUR)
+    except OSError:
+        return None
+
+
+def _wav_codec_name(format_tag: int, bits_per_sample: int) -> str | None:
+    if format_tag == _WAV_FORMAT_PCM:
+        return {8: "pcm_u8", 16: "pcm_s16le", 24: "pcm_s24le", 32: "pcm_s32le"}.get(bits_per_sample)
+    if format_tag == _WAV_FORMAT_IEEE_FLOAT:
+        return {32: "pcm_f32le", 64: "pcm_f64le"}.get(bits_per_sample)
+    if format_tag == _WAV_FORMAT_MS_ADPCM:
+        return "adpcm_ms"
+    if format_tag == _WAV_FORMAT_IMA_ADPCM:
+        return "adpcm_ima_wav"
+    return None
+
+
+def _normalize_mutagen_codec_name(audio, path: Path) -> str | None:
+    info = getattr(audio, "info", None)
+    raw = getattr(info, "codec", None)
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    if raw:
+        codec = str(raw).strip().lower()
+        if codec == "mp4a":
+            return "aac"
+        if codec:
+            return codec
+
+    type_name = type(audio).__name__.lower()
+    mapped = _MUTAGEN_TYPE_CODECS.get(type_name)
+    if mapped:
+        return mapped
+
+    extension = path.suffix.lower()
+    return {
+        ".mp3": "mp3",
+        ".mp2": "mp2",
+        ".mp1": "mp1",
+        ".flac": "flac",
+        ".ogg": "vorbis",
+        ".m4a": "aac",
+        ".wma": "wma",
+        ".ape": "ape",
+        ".dsf": "dsd_lsbf_planar",
+        ".dff": "dsd_lsbf",
+    }.get(extension)
+
+
+def _mutagen_metadata_is_sufficient(extension: str, metadata: dict[str, object]) -> bool:
+    if metadata.get("sample_rate") is None or metadata.get("channels") is None:
+        return False
+    if extension in PCM_FORMATS:
+        if metadata.get("bit_depth") is None:
+            return False
+        if extension == ".flac" and metadata.get("flac_block_max") is None:
+            return False
+        if extension == ".wav" and not metadata.get("codec_name"):
+            return False
+        return True
+    if extension in DSD_FORMATS:
+        return True
+    if extension in LOSSY_FORMATS:
+        if extension in {".m4a", ".m4b", ".m4p"} and not metadata.get("codec_name"):
+            return False
+        channels = _safe_int(metadata.get("channels")) or 0
+        if extension == ".wma" and channels > MAX_CHANNELS_STEREO:
+            return False
+        return True
+    return False
+
+
+def _audio_metadata_from_mutagen(path: Path, audio) -> dict[str, object] | None:
+    if audio is None:
+        try:
+            audio = mutagen.File(path)
+        except Exception:
+            audio = None
+
+    extension = path.suffix.lower()
+    if audio is None and extension not in {".wav", ".flac"}:
+        return None
+
+    info = getattr(audio, "info", None) if audio is not None else None
+    sample_rate = _positive_int_or_none(_safe_int(getattr(info, "sample_rate", None)))
+    channels = _positive_int_or_none(_safe_int(getattr(info, "channels", None)))
+    bit_depth = _positive_int_or_none(_safe_int(getattr(info, "bits_per_sample", None)))
+    codec_name = _normalize_mutagen_codec_name(audio, path) if audio is not None else None
+    flac_block_max = None
+
+    if extension == ".wav":
+        wav_fmt = _read_wav_format(path)
+        if wav_fmt is not None:
+            sample_rate = _positive_int_or_none(wav_fmt.get("sample_rate")) or sample_rate
+            channels = _positive_int_or_none(wav_fmt.get("channels")) or channels
+            bit_depth = _positive_int_or_none(wav_fmt.get("bits_per_sample")) or bit_depth
+            format_tag = wav_fmt.get("format_tag")
+            if format_tag == _WAV_FORMAT_EXTENSIBLE:
+                format_tag = wav_fmt.get("subformat") or format_tag
+            if format_tag is not None:
+                codec_name = _wav_codec_name(int(format_tag), int(wav_fmt.get("bits_per_sample") or 0)) or codec_name
+
+    if extension == ".flac":
+        flac_block_max = _positive_int_or_none(_safe_int(getattr(info, "max_blocksize", None)))
+        if flac_block_max is None:
+            flac_block_max = _read_flac_streaminfo_block_max_size(path)
+        codec_name = codec_name or "flac"
+
+    if bit_depth is None and extension in DSD_FORMATS:
+        bit_depth = 1
+    if bit_depth is None:
+        bit_depth = _LOSSY_DEFAULT_BIT_DEPTH.get(extension)
+
+    if sample_rate is None and channels is None and codec_name is None:
+        return None
+
+    stream = {
+        "sample_rate": sample_rate,
+        "bit_depth": bit_depth,
+        "codec_name": codec_name,
+        "channels": channels,
+        "flac_block_max": flac_block_max,
+        "stream_index": 0,
+        "stream_pos": 0,
+    }
+    return _blank_audio_metadata(
+        sample_rate=sample_rate,
+        bit_depth=bit_depth,
+        flac_block_max=flac_block_max,
+        stream_index=0,
+        codec_name=codec_name,
+        channels=channels,
+        audio_stream_count=1,
+        total_stream_count=1,
+        audio_streams=[stream],
+    )
+
+
+@lru_cache(maxsize=1)
 def _resolve_ffprobe_executable() -> str | None:
     ffprobe_path = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
     if ffprobe_path:
@@ -182,6 +407,7 @@ def _resolve_ffprobe_executable() -> str | None:
     return None
 
 
+@lru_cache(maxsize=1)
 def _resolve_ffmpeg_executable() -> str | None:
     """Resolve an ffmpeg executable path.
 
@@ -774,49 +1000,34 @@ def _get_audio_codec(path: Path) -> str | None:
     return ffprobe_info.get("codec_name")
 
 
-def _read_audio_metadata(path: Path) -> dict[str, object]:
-    """Read audio metadata using ffprobe exclusively."""
+def _audio_metadata_from_ffprobe(path: Path) -> dict[str, object]:
+    """Read audio metadata using ffprobe."""
     ffprobe_info = _ffprobe_audio_info(path)
     if ffprobe_info is None:
-        return {
-            "sample_rate": None,
-            "bit_depth": None,
-            "flac_block_max": None,
-            "stream_index": None,
-            "codec_name": None,
-            "channels": None,
-            "audio_stream_count": None,
-            "total_stream_count": None,
-            "audio_streams": [],
-        }
+        return _blank_audio_metadata()
 
-    # If ffprobe reported an error, return that information for higher-level
-    # callers to surface a more informative reason instead of failing silently.
     if isinstance(ffprobe_info, dict) and ffprobe_info.get("error"):
-        return {
-            "sample_rate": None,
-            "bit_depth": None,
-            "flac_block_max": None,
-            "stream_index": None,
-            "codec_name": None,
-            "channels": None,
-            "audio_stream_count": None,
-            "total_stream_count": None,
-            "ffprobe_error": ffprobe_info.get("error"),
-            "audio_streams": [],
-        }
+        return _blank_audio_metadata(ffprobe_error=ffprobe_info.get("error"))
 
-    return {
-        "sample_rate": ffprobe_info.get("sample_rate"),
-        "bit_depth": ffprobe_info.get("bit_depth"),
-        "flac_block_max": ffprobe_info.get("flac_block_max"),
-        "stream_index": ffprobe_info.get("stream_index"),
-        "codec_name": ffprobe_info.get("codec_name"),
-        "channels": ffprobe_info.get("channels"),
-        "audio_stream_count": ffprobe_info.get("audio_stream_count"),
-        "total_stream_count": ffprobe_info.get("total_stream_count"),
-        "audio_streams": ffprobe_info.get("audio_streams") or [],
-    }
+    return _blank_audio_metadata(
+        sample_rate=ffprobe_info.get("sample_rate"),
+        bit_depth=ffprobe_info.get("bit_depth"),
+        flac_block_max=ffprobe_info.get("flac_block_max"),
+        stream_index=ffprobe_info.get("stream_index"),
+        codec_name=ffprobe_info.get("codec_name"),
+        channels=ffprobe_info.get("channels"),
+        audio_stream_count=ffprobe_info.get("audio_stream_count"),
+        total_stream_count=ffprobe_info.get("total_stream_count"),
+        audio_streams=ffprobe_info.get("audio_streams") or [],
+    )
+
+
+def _read_audio_metadata(path: Path, audio=None) -> dict[str, object]:
+    """Read audio metadata from mutagen when it can answer, otherwise ffprobe."""
+    mutagen_info = _audio_metadata_from_mutagen(path, audio)
+    if mutagen_info is not None and _mutagen_metadata_is_sufficient(path.suffix.lower(), mutagen_info):
+        return mutagen_info
+    return _audio_metadata_from_ffprobe(path)
 
 
 def _short_missing_metadata_reason(missing_fields: list[str]) -> str:
@@ -925,15 +1136,27 @@ def _validate_dsd_bit_depth(bit_depth: int | None) -> tuple[str, str]:
     return "INCOMPATIBLE", f"DSD file declares {bit_depth}-bit depth — firmware rejects bit_depth ≥ 8"
 
 
-def _check_id3v2_utf8_encoding(path: Path) -> tuple[str, str]:
+def _id3_tags(path: Path, audio=None):
+    """Reuse an already-parsed ID3 tag set when the scanner opened the file."""
+    if audio is not None:
+        tags = getattr(audio, "tags", None)
+        if isinstance(tags, ID3) or (tags is not None and hasattr(tags, "getall")):
+            return tags
+        return None
+    try:
+        return ID3(str(path))
+    except Exception:
+        return None
+
+
+def _check_id3v2_utf8_encoding(path: Path, audio=None) -> tuple[str, str]:
     """Check if ID3v2 text frames use UTF-8 encoding (0x03).
     
     The firmware has no UTF-8 decoder — UTF-8 encoded tags render as garbage.
     Safe encodings: ISO-8859-1 (0x00), UTF-16 BOM (0x01), UTF-16BE (0x02).
     """
-    try:
-        tags = ID3(str(path))
-    except Exception:
+    tags = _id3_tags(path, audio)
+    if tags is None:
         return "COMPATIBLE", ""
 
     utf8_frames = []
@@ -951,42 +1174,12 @@ def _check_id3v2_utf8_encoding(path: Path) -> tuple[str, str]:
         return "INCOMPATIBLE", f"{len(utf8_frames)} tags use UTF-8 encoding — device has no UTF-8 decoder, text will display as garbage"
 
     return "COMPATIBLE", ""
-    has_tit2 = "TIT2" in tags
-    has_tpe1 = "TPE1" in tags
-    
-    if not has_tit2 and not has_tpe1:
-        return "COMPATIBLE", ""
-        
-    accumulated_size = 10 # 10 bytes for ID3 header
-    
-    for frame_id, frame in tags.items():
-        if frame_id in ("TIT2", "TPE1"):
-            # If we reached a core tag and accumulated size > 4096, it's pushed out
-            if accumulated_size > 4096:
-                return "INCOMPATIBLE", f"ID3v2 Read Window Bug: Large preceding frames push '{frame_id}' beyond 4KB SRAM buffer"
-                
-        # Approximate size of the frame
-        if frame_id.startswith("APIC"):
-            accumulated_size += len(getattr(frame, "data", b"")) + 100
-        elif frame_id.startswith(("COMM", "USLT", "SYLT")):
-            text_data = getattr(frame, "text", [""])[0] if getattr(frame, "text", []) else ""
-            accumulated_size += len(str(text_data).encode("utf-8", "ignore")) + 100
-        elif frame_id.startswith("TXXX"):
-            desc = getattr(frame, "desc", "")
-            text_data = getattr(frame, "text", [""])[0] if getattr(frame, "text", []) else ""
-            accumulated_size += len(str(desc).encode("utf-8", "ignore")) + len(str(text_data).encode("utf-8", "ignore")) + 100
-        else:
-            accumulated_size += 100
-            
-    return "COMPATIBLE", ""
 
 
-
-def _check_id3v2_read_window(path: Path) -> tuple[str, str]:
+def _check_id3v2_read_window(path: Path, audio=None) -> tuple[str, str]:
     """Check if large unrecognized frames push core tags beyond the 4KB firmware read window."""
-    try:
-        tags = mutagen.id3.ID3(str(path))
-    except Exception:
+    tags = _id3_tags(path, audio)
+    if tags is None:
         return "COMPATIBLE", ""
         
     has_tit2 = "TIT2" in tags
@@ -1004,12 +1197,12 @@ def _check_id3v2_read_window(path: Path) -> tuple[str, str]:
                 return "INCOMPATIBLE", f"ID3v2 Read Window Bug: Large preceding frames push '{frame_id}' beyond 4KB SRAM buffer"
                 
         # Approximate size of the frame
-        if frame_id.startswith("APIC"):
+        if str(frame_id).startswith("APIC"):
             accumulated_size += len(getattr(frame, "data", b"")) + 100
-        elif frame_id.startswith(("COMM", "USLT", "SYLT")):
+        elif str(frame_id).startswith(("COMM", "USLT", "SYLT")):
             text_data = getattr(frame, "text", [""])[0] if getattr(frame, "text", []) else ""
             accumulated_size += len(str(text_data).encode("utf-8", "ignore")) + 100
-        elif frame_id.startswith("TXXX"):
+        elif str(frame_id).startswith("TXXX"):
             desc = getattr(frame, "desc", "")
             text_data = getattr(frame, "text", [""])[0] if getattr(frame, "text", []) else ""
             accumulated_size += len(str(desc).encode("utf-8", "ignore")) + len(str(text_data).encode("utf-8", "ignore")) + 100
@@ -1037,27 +1230,37 @@ def _check_cue_sheet_limits(path: Path) -> tuple[str, str]:
         return "UNKNOWN", "Failed to parse CUE sheet"
 
 
-def _check_tag_string_lengths(path: Path) -> tuple[str, str]:
+def _check_tag_string_lengths(path: Path, audio=None) -> tuple[str, str]:
     """Check if any core tag string exceeds the firmware's 128-character SRAM buffer.
     
     Tags longer than MAX_TAG_TEXT_LENGTH risk buffer overflow and UI corruption.
     """
-    try:
-        audio = mutagen.File(str(path), easy=True)
-        if audio is None or audio.tags is None:
-            return "COMPATIBLE", ""
-    except Exception:
+    from .tag_normalization import easy_tag_values
+
+    opened = audio
+    if opened is None:
+        try:
+            opened = mutagen.File(str(path), easy=True)
+        except Exception:
+            opened = None
+    if opened is None or getattr(opened, "tags", None) is None:
         return "COMPATIBLE", ""
 
     check_keys = ["title", "artist", "album", "albumartist", "genre"]
     long_tags = []
     for key in check_keys:
-        values = audio.tags.get(key)
-        if values:
-            for val in (values if isinstance(values, list) else [values]):
-                text = str(val)
-                if len(text) > MAX_TAG_TEXT_LENGTH:
-                    long_tags.append(f"{key} ({len(text)} chars)")
+        values = easy_tag_values(opened, key)
+        if not values:
+            try:
+                raw = opened.tags.get(key) if opened.tags is not None else None
+            except Exception:
+                raw = None
+            if raw:
+                values = [str(val) for val in (raw if isinstance(raw, list) else [raw])]
+        for val in values:
+            text = str(val)
+            if len(text) > MAX_TAG_TEXT_LENGTH:
+                long_tags.append(f"{key} ({len(text)} chars)")
 
     if long_tags:
         if len(long_tags) == 1:
@@ -1099,7 +1302,7 @@ def _evaluate_music_file_with_cache(path: Path, target_dir: Path) -> dict[str, s
     return result
 
 
-def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
+def evaluate_music_file(path: Path, target_dir: Path, audio=None) -> dict[str, str]:
     relative_path = _relative_path_for_target(path, target_dir)
 
     extension = path.suffix.lower()
@@ -1114,6 +1317,8 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
     codec_text = "-"
     eq_sample_rate = None
     eq_bit_depth = None
+    metadata: dict[str, object] = {}
+    opened_audio = audio
 
     if path.name.startswith("."):
         reason = "Hidden dot-file ignored by compatibility rules"
@@ -1145,6 +1350,12 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
             "tag_length_compatibility_reason": "-",
         }
 
+    if opened_audio is None and extension in (LOSSY_FORMATS | PCM_FORMATS | DSD_FORMATS):
+        try:
+            opened_audio = mutagen.File(path)
+        except Exception:
+            opened_audio = None
+
     if not extension:
         status = "UNSUPPORTED"
         category = "unsupported"
@@ -1158,7 +1369,7 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
         category = "unsupported"
         reason = f"Explicitly unsupported format: {extension}"
     elif extension in LOSSY_FORMATS:
-        metadata = _read_audio_metadata(path)
+        metadata = _read_audio_metadata(path, opened_audio)
         ffprobe_error = metadata.get("ffprobe_error")
         sample_rate = metadata.get("sample_rate")
         bit_depth = metadata.get("bit_depth")
@@ -1253,7 +1464,7 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
             "tag_length_compatibility_reason": "-",
         }
     elif extension in PCM_FORMATS:
-        metadata = _read_audio_metadata(path)
+        metadata = _read_audio_metadata(path, opened_audio)
         ffprobe_error = metadata.get("ffprobe_error")
         sample_rate = metadata.get("sample_rate")
         bit_depth = metadata.get("bit_depth")
@@ -1351,7 +1562,7 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
             eq_sample_rate = max_eq_sample_rate
             eq_bit_depth = max_eq_bit_depth
     elif extension in DSD_FORMATS:
-        metadata = _read_audio_metadata(path)
+        metadata = _read_audio_metadata(path, opened_audio)
         ffprobe_error = metadata.get("ffprobe_error")
         sample_rate = metadata.get("sample_rate")
         codec_name = metadata.get("codec_name")
@@ -1474,25 +1685,25 @@ def evaluate_music_file(path: Path, target_dir: Path) -> dict[str, str]:
     tag_encoding_comp_reason = "-"
     ID3_FORMATS = {".mp3", ".mp1", ".mp2", ".wav", ".dsf"}
     if extension in ID3_FORMATS and category != "skipped":
-        tag_encoding_comp_status, tag_encoding_comp_reason = _check_id3v2_utf8_encoding(path)
+        tag_encoding_comp_status, tag_encoding_comp_reason = _check_id3v2_utf8_encoding(path, opened_audio)
 
     
     # ── ID3v2 Read Window validation ──────────────────────────────────
     id3_window_comp_status = "-"
     id3_window_comp_reason = "-"
     if extension in ID3_FORMATS and category != "skipped":
-        id3_window_comp_status, id3_window_comp_reason = _check_id3v2_read_window(path)
+        id3_window_comp_status, id3_window_comp_reason = _check_id3v2_read_window(path, opened_audio)
 
     # ── Tag string length validation ──────────────────────────────────
     tag_length_comp_status = "-"
     tag_length_comp_reason = "-"
     if extension in (PCM_FORMATS | DSD_FORMATS | LOSSY_FORMATS) and category != "skipped":
-        tag_length_comp_status, tag_length_comp_reason = _check_tag_string_lengths(path)
+        tag_length_comp_status, tag_length_comp_reason = _check_tag_string_lengths(path, opened_audio)
 
     # ── Metadata bloat check (sanitizer) ──────────────────────────────
     from .metadata_sanitizer import MetadataSanitizer
     sanitizer = MetadataSanitizer()
-    meta_ok, meta_reason = sanitizer.check_metadata(path)
+    meta_ok, meta_reason = sanitizer.check_metadata(path, audio=opened_audio)
     
     # Merge new metadata checks
     if id3_window_comp_status == "INCOMPATIBLE":
