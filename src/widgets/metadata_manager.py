@@ -191,7 +191,6 @@ class MetadataManager(QWidget):
         self._table.setEditTriggers(QTableView.DoubleClicked | QTableView.EditKeyPressed)
         self._table.verticalHeader().setVisible(False)
         self._table.verticalHeader().setDefaultSectionSize(28)
-        self._table.setUniformRowHeights(True)
 
         header_view = GroupedHeaderView(self._table)
         self._table.setHorizontalHeader(header_view)
