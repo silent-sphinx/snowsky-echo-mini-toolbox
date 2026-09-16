@@ -2,13 +2,15 @@
 
 from contextlib import contextmanager
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QEventLoop, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QTreeView,
     QVBoxLayout,
     QWidget,
 )
@@ -17,9 +19,19 @@ from ..theme import Colours
 
 PATH_COLUMN_WIDTH = 440
 
+_UI_ALIVE_FLAGS = QEventLoop.ExcludeUserInputEvents
+
+
+def keep_ui_alive() -> None:
+    """Pump paint/timer events so Windows does not mark the window hung."""
+    app = QApplication.instance()
+    if app is None:
+        return
+    app.processEvents(_UI_ALIVE_FLAGS)
+
 
 @contextmanager
-def freeze_view(view: QAbstractItemView):
+def freeze_view(view: QAbstractItemView, *, restore_sorting: bool = True):
     """Pause painting, sorting, and mouse hits while a large model is swapped in."""
     sorting = False
     sorter = getattr(view, "isSortingEnabled", None)
@@ -33,8 +45,19 @@ def freeze_view(view: QAbstractItemView):
     finally:
         view.setAttribute(Qt.WA_TransparentForMouseEvents, False)
         view.setUpdatesEnabled(True)
-        if callable(getattr(view, "setSortingEnabled", None)):
-            view.setSortingEnabled(sorting)
+        keep_ui_alive()
+        # File trees are inserted in order; re-sorting thousands of items
+        # after populate is what freezes Windows if the user clicks.
+        should_sort = (
+            restore_sorting
+            and sorting
+            and not isinstance(view, QTreeView)
+        )
+        if should_sort and callable(getattr(view, "setSortingEnabled", None)):
+            view.setSortingEnabled(True)
+            keep_ui_alive()
+        elif sorting and isinstance(view, QTreeView):
+            view.setSortingEnabled(False)
 
 
 def page_header(

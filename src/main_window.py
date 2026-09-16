@@ -37,6 +37,7 @@ from .threads.drive_scanner import DriveScannerThread
 from .theme import Colours
 from .constants import APP_VERSION
 from .utils.volume import eject_volume, removable_volume_for_path
+from .widgets.page_chrome import keep_ui_alive
 
 
 class MainWindow(QMainWindow):
@@ -555,7 +556,7 @@ class MainWindow(QMainWindow):
         if generation != self._populate_generation:
             return
         if not self._populate_queue:
-            self._set_processing_state(False)
+            self._finish_library_populate(generation)
             return
 
         label, _widget, populate = self._populate_queue.pop(0)
@@ -565,13 +566,41 @@ class MainWindow(QMainWindow):
         )
         self._global_progress.setValue(self._populate_done - 1)
 
+        keep_ui_alive()
         try:
             populate()
         except Exception as exc:
             print(f"Failed to populate {label}: {exc}")
+        keep_ui_alive()
 
         self._global_progress.setValue(self._populate_done)
         QTimer.singleShot(0, lambda: self._pump_library_populate(generation))
+
+    def _finish_library_populate(self, generation: int) -> None:
+        """Show filled tables one by one so the first paint cannot stall Windows."""
+        if generation != self._populate_generation:
+            return
+        self._prog_status_lbl.setText("Showing tables...")
+        keep_ui_alive()
+        for widget in (
+            self._music_browser,
+            self._music_compatibility,
+            self._metadata_manager,
+            self._album_art,
+            self._lyrics_manager,
+            self._file_rename,
+            self._file_cleanup,
+            self._backup_restore,
+            self._workflows,
+        ):
+            widget.set_processing_state(False)
+            keep_ui_alive()
+
+        self._prog_container.hide()
+        self._global_progress.setRange(0, 0)
+        if hasattr(self, "_refresh_btn"):
+            self._refresh_btn.setEnabled(bool(self._current_drive))
+        QTimer.singleShot(0, self._unlock_input_after_populate)
 
     def _on_library_tab_changed(self, index: int) -> None:
         """Load the tab the user just opened next, instead of leaving it queued."""
@@ -610,5 +639,10 @@ class MainWindow(QMainWindow):
         self._workflows.set_processing_state(is_processing)
 
         if not is_processing:
-            self._set_input_locked(False)
+            QTimer.singleShot(0, self._unlock_input_after_populate)
+
+    def _unlock_input_after_populate(self) -> None:
+        if self._populate_queue:
+            return
+        self._set_input_locked(False)
 
