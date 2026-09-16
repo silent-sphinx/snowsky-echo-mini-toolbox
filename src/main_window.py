@@ -547,8 +547,7 @@ class MainWindow(QMainWindow):
         self._set_input_locked(True)
         self._prog_status_lbl.setText(f"{self._populate_status_prefix}...")
         self._prog_container.show()
-        self._global_progress.setRange(0, max(self._populate_total, 1))
-        self._global_progress.setValue(0)
+        self._global_progress.setRange(0, 0)
         generation = self._populate_generation
         QTimer.singleShot(0, lambda: self._pump_library_populate(generation))
 
@@ -564,7 +563,6 @@ class MainWindow(QMainWindow):
         self._prog_status_lbl.setText(
             f"{self._populate_status_prefix}: {label} ({self._populate_done}/{self._populate_total})"
         )
-        self._global_progress.setValue(self._populate_done - 1)
 
         keep_ui_alive()
         try:
@@ -573,7 +571,6 @@ class MainWindow(QMainWindow):
             print(f"Failed to populate {label}: {exc}")
         keep_ui_alive()
 
-        self._global_progress.setValue(self._populate_done)
         QTimer.singleShot(0, lambda: self._pump_library_populate(generation))
 
     def _finish_library_populate(self, generation: int) -> None:
