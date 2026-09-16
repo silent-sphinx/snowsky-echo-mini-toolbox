@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -298,12 +299,17 @@ def apply_rename_evaluations(
         if str(target_path).lower() != str(Path(track.filepath)).lower()
     }
 
+    # One listdir per folder beats thousands of exists() calls on USB/FAT.
+    dir_names = _directory_name_index(target_path.parent for _, target_path in candidates)
+
     for track, target_path in candidates:
         key = str(target_path).lower()
         conflict_reason = ""
+        parent_key = str(target_path.parent)
+        name_exists = target_path.name.lower() in dir_names.get(parent_key, set())
         if target_counts.get(key, 0) > 1:
             conflict_reason = REASON_DUPLICATE
-        elif target_path.exists():
+        elif name_exists:
             source_path = Path(track.filepath)
             if not paths_are_same_file(target_path, source_path) and key not in vacating_keys:
                 conflict_reason = REASON_EXISTS
@@ -312,6 +318,20 @@ def apply_rename_evaluations(
             track.rename_status = "CONFLICT"
             track.rename_reason = conflict_reason
             track.rename_is_checked = False
+
+
+def _directory_name_index(parents: Iterable[Path]) -> dict[str, set[str]]:
+    """Map parent path → lowercased names currently in that folder."""
+    index: dict[str, set[str]] = {}
+    for parent in parents:
+        parent_key = str(parent)
+        if parent_key in index:
+            continue
+        try:
+            index[parent_key] = {entry.lower() for entry in os.listdir(parent_key)}
+        except OSError:
+            index[parent_key] = set()
+    return index
 
 
 def rename_candidate_dict(track: TrackMetadata, root_path: str) -> dict[str, object]:

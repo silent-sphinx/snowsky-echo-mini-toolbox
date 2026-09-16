@@ -5,9 +5,10 @@ Provides a minimal tabbed interface that houses the Metadata Manager
 and serves as the foundation for the full app rewrite.
 """
 
-from PySide6.QtCore import Qt, QTimer, QStorageInfo
+from PySide6.QtCore import Qt, QEventLoop, QTimer, QStorageInfo
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -49,6 +50,12 @@ class MainWindow(QMainWindow):
 
         self._current_drive = ""
         self._initial_dialog_shown = False
+        self._populate_queue: list[tuple[str, QWidget, object]] = []
+        self._populate_generation = 0
+        self._populate_total = 0
+        self._populate_done = 0
+        self._populate_reveal = False
+        self._populate_status_prefix = "Loading tables"
         self._init_ui()
 
     def showEvent(self, event) -> None:
@@ -128,6 +135,7 @@ class MainWindow(QMainWindow):
         self._workflows = WorkflowWidget()
         self._workflows.needs_rescan.connect(self._rescan_current_target)
         self._tabs.addTab(self._workflows, "Workflows")
+        self._tabs.currentChanged.connect(self._on_library_tab_changed)
         
         tab_layout.addWidget(self._tabs)
         main_layout.addWidget(tab_container)
@@ -156,6 +164,7 @@ class MainWindow(QMainWindow):
             )
             
     def closeEvent(self, event) -> None:
+        self._cancel_library_populate()
         for widget in (
             getattr(self, "_workflows", None),
             getattr(self, "_file_cleanup", None),
@@ -354,6 +363,7 @@ class MainWindow(QMainWindow):
             self._scanner_thread.cancel()
             self._scanner_thread.wait()
 
+        self._cancel_library_populate()
         self._current_drive = ""
         self._drive_btn.setText("Select Target Drive...")
         self._set_processing_state(False)
@@ -397,6 +407,7 @@ class MainWindow(QMainWindow):
         self._start_library_scan(self._current_drive)
 
     def _start_library_scan(self, path: str) -> None:
+        self._cancel_library_populate()
         self._set_processing_state(True, "Initializing scan...")
         if hasattr(self, "_scanner_thread") and self._scanner_thread.isRunning():
             self._scanner_thread.cancel()
@@ -418,42 +429,101 @@ class MainWindow(QMainWindow):
             
     def _on_scan_finished(self, data_model) -> None:
         """Handle completion of the global drive scan."""
-        self._prog_status_lbl.setText("Loading tables...")
-        # Load models before revealing tables. Measuring every path column
-        # while the views are visible is what used to stall/crash large scans.
-        self._populate_library_tabs(data_model)
-        if self._tabs.isTabVisible(0):
-            self._drive_info.populate_data(data_model)
-        self._set_processing_state(False)
+        self._begin_library_populate(data_model, reveal_tabs_incrementally=True)
 
     def _on_library_changed(self, data_model) -> None:
         """Refresh tabs after an in-place library mutation such as a rename."""
-        self._populate_library_tabs(data_model)
-        if self._tabs.isTabVisible(0):
-            self._drive_info.populate_data(data_model)
+        self._begin_library_populate(data_model, reveal_tabs_incrementally=False)
 
-    def _populate_library_tabs(self, data_model) -> None:
-        for name, populate in (
-            ("file browser", self._music_browser.populate_data),
-            ("music compatibility", self._music_compatibility.populate_data),
-            ("metadata", self._metadata_manager.populate_data),
-            ("album art", self._album_art.populate_data),
-            ("lyrics", self._lyrics_manager.populate_data),
-            ("file rename", self._file_rename.populate_data),
-            ("file cleanup", self._file_cleanup.populate_data),
-            ("backup restore", self._backup_restore.populate_data),
-            ("workflows", self._workflows.populate_data),
-        ):
-            try:
-                populate(data_model)
-            except Exception as exc:
-                print(f"Failed to populate {name}: {exc}")
+    def _library_populate_jobs(self, data_model) -> list[tuple[str, QWidget, object]]:
+        jobs: list[tuple[str, QWidget, object]] = []
+        if self._tabs.isTabVisible(0):
+            jobs.append(
+                ("Drive Information", self._drive_info, lambda: self._drive_info.populate_data(data_model))
+            )
+        jobs.extend(
+            [
+                ("File Browser", self._music_browser, lambda: self._music_browser.populate_data(data_model)),
+                ("Music Compatibility", self._music_compatibility, lambda: self._music_compatibility.populate_data(data_model)),
+                ("Metadata Browser", self._metadata_manager, lambda: self._metadata_manager.populate_data(data_model)),
+                ("Album Art Manager", self._album_art, lambda: self._album_art.populate_data(data_model)),
+                ("Lyrics Manager", self._lyrics_manager, lambda: self._lyrics_manager.populate_data(data_model)),
+                ("File Rename", self._file_rename, lambda: self._file_rename.populate_data(data_model)),
+                ("File Cleanup", self._file_cleanup, lambda: self._file_cleanup.populate_data(data_model)),
+                ("Backup / Restore", self._backup_restore, lambda: self._backup_restore.populate_data(data_model)),
+                ("Workflows", self._workflows, lambda: self._workflows.populate_data(data_model)),
+            ]
+        )
+        return jobs
+
+    def _cancel_library_populate(self) -> None:
+        self._populate_generation += 1
+        self._populate_queue = []
+
+    def _begin_library_populate(self, data_model, *, reveal_tabs_incrementally: bool) -> None:
+        """Fill tabs one at a time so the progress bar can paint between them."""
+        self._populate_generation += 1
+        jobs = self._library_populate_jobs(data_model)
+        current = self._tabs.currentWidget()
+        jobs.sort(key=lambda job: 0 if job[1] is current else 1)
+        self._populate_queue = jobs
+        self._populate_total = len(jobs)
+        self._populate_done = 0
+        self._populate_reveal = reveal_tabs_incrementally
+        self._populate_status_prefix = (
+            "Loading tables" if reveal_tabs_incrementally else "Updating tables"
+        )
+        self._prog_status_lbl.setText(f"{self._populate_status_prefix}...")
+        self._prog_container.show()
+        self._global_progress.setRange(0, max(self._populate_total, 1))
+        self._global_progress.setValue(0)
+        if hasattr(self, "_refresh_btn"):
+            self._refresh_btn.setEnabled(False)
+        generation = self._populate_generation
+        QTimer.singleShot(0, lambda: self._pump_library_populate(generation))
+
+    def _pump_library_populate(self, generation: int) -> None:
+        if generation != self._populate_generation:
+            return
+        if not self._populate_queue:
+            self._set_processing_state(False)
+            return
+
+        label, widget, populate = self._populate_queue.pop(0)
+        self._populate_done += 1
+        self._prog_status_lbl.setText(
+            f"{self._populate_status_prefix}: {label} ({self._populate_done}/{self._populate_total})"
+        )
+        self._global_progress.setValue(self._populate_done - 1)
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+
+        try:
+            populate()
+        except Exception as exc:
+            print(f"Failed to populate {label}: {exc}")
+
+        if self._populate_reveal and hasattr(widget, "set_processing_state"):
+            widget.set_processing_state(False)
+
+        self._global_progress.setValue(self._populate_done)
+        QTimer.singleShot(0, lambda: self._pump_library_populate(generation))
+
+    def _on_library_tab_changed(self, index: int) -> None:
+        """Load the tab the user just opened next, instead of leaving it queued."""
+        if not self._populate_queue:
+            return
+        widget = self._tabs.widget(index)
+        for i, job in enumerate(self._populate_queue):
+            if job[1] is widget:
+                self._populate_queue.insert(0, self._populate_queue.pop(i))
+                break
 
     def _set_processing_state(self, is_processing: bool, status_text: str = "Processing data...") -> None:
         """Toggle the global loading state and UI indicators."""
         if is_processing:
             self._prog_status_lbl.setText(status_text)
             self._prog_container.show()
+            self._global_progress.setRange(0, 0)
         else:
             self._prog_container.hide()
             # Reset progress bar for next time
