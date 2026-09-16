@@ -68,17 +68,6 @@ class CrashReporter(QObject):
             _SHOWING_CRASH_DIALOG = False
 
 
-class CrashAwareApplication(QApplication):
-    """Catch exceptions raised while Qt is delivering events and slots."""
-
-    def notify(self, receiver, event):
-        try:
-            return super().notify(receiver, event)
-        except Exception:
-            _report_exception(*sys.exc_info())
-            return False
-
-
 def _format_exception(exc_type, exc, tb) -> str:
     return "".join(traceback.format_exception(exc_type, exc, tb))
 
@@ -104,7 +93,7 @@ def _report_exception(exc_type, exc, tb) -> None:
 def _show_startup_crash_dialog(title: str, details: str) -> None:
     """Last-resort dialog when the crash reporter is not installed yet."""
     try:
-        app = QApplication.instance() or CrashAwareApplication(sys.argv)
+        app = QApplication.instance() or QApplication(sys.argv)
         reporter = CrashReporter(app)
         reporter.report(title, details)
     except Exception:
@@ -164,7 +153,7 @@ def main() -> int:
     QCoreApplication.setApplicationName("Snowsky Echo Mini Toolbox")
 
     try:
-        app = CrashAwareApplication(sys.argv)
+        app = QApplication(sys.argv)
         _install_crash_hooks(app)
 
         # Apply global theme (palette, styles, fonts)

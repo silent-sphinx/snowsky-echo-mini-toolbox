@@ -129,7 +129,7 @@ class DriveSelectorPanel(QFrame):
 
     def __init__(self, parent=None, current_path: str = ""):
         super().__init__(parent)
-        self.setFixedSize(500, 460)
+        self.setFixedSize(500, 500)
 
         # Ensure it traps clicks and sits on top
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -160,6 +160,11 @@ class DriveSelectorPanel(QFrame):
         subtitle.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 13px;")
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
+
+        tip = QLabel("Plug the SD card in directly to your pc, it's much faster than the Echo Mini.")
+        tip.setStyleSheet(f"color: {Colours.TEXT_TERTIARY}; font-size: 12px;")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
 
         # ── Stacked Widget (List vs Empty State) ────────────────
         self._stack = QStackedWidget()
