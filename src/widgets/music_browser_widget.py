@@ -38,6 +38,7 @@ from ..utils.album_art import extract_album_art
 from ..utils.file_rename import paths_are_same_file
 from ..threads.bulk_metadata import BulkMetadataWorker
 from .bulk_metadata_dialog import BulkMetadataDialog
+from .page_chrome import freeze_view, keep_ui_alive
 
 _NON_MUSIC_EXTENSIONS = {".lrc", ".cue"}
 
@@ -189,6 +190,7 @@ class MusicBrowserWidget(QWidget):
         self._bulk_tags: dict[str, str | None] = {}
         self._editing_lrc_path: str | None = None
         self._original_meta_keys: list[str] = []
+        self._tree_items_built = 0
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -230,8 +232,8 @@ class MusicBrowserWidget(QWidget):
         
         self._tree = QTreeView()
         self._tree.setHeaderHidden(True)
-        self._tree.setAnimated(True)
-        self._tree.setSortingEnabled(True)
+        self._tree.setAnimated(False)
+        self._tree.setSortingEnabled(False)
         self._tree.setSelectionMode(QTreeView.ExtendedSelection)
         self._tree.setSelectionBehavior(QTreeView.SelectItems)
         
@@ -582,10 +584,17 @@ class MusicBrowserWidget(QWidget):
     def populate_data(self, data_model: DriveDataModel) -> None:
         """Populate the UI using the centralized data model."""
         self._data_model = data_model
-        self._tree_model.clear()
-        
-        root_item = self._tree_model.invisibleRootItem()
-        self._build_tree(data_model.tree, root_item, data_model.root_path)
+        self._tree_items_built = 0
+        self._tree_model.blockSignals(True)
+        try:
+            with freeze_view(self._tree, restore_sorting=False):
+                self._tree_model.clear()
+                root_item = self._tree_model.invisibleRootItem()
+                self._build_tree(data_model.tree, root_item, data_model.root_path)
+        finally:
+            self._tree_model.blockSignals(False)
+            self._tree.reset()
+            keep_ui_alive()
         self._show_blank_details()
         
     def _build_tree(self, tree_dict: dict, parent_item: QStandardItem, current_path: str) -> None:
@@ -594,27 +603,27 @@ class MusicBrowserWidget(QWidget):
             tree_dict.items(), 
             key=lambda x: (x[1] is None, x[0].lower())
         )
+        dir_icon = QApplication.style().standardIcon(QStyle.SP_DirIcon)
+        rows: list[QStandardItem] = []
         
         for name, sub_dict in sorted_items:
             full_path = os.path.join(current_path, name)
             item = QStandardItem(name)
             item.setEditable(False)
-            # Store the full filepath in UserRole for retrieval on click
             item.setData(full_path, Qt.UserRole)
+            item.setCheckable(True)
             
             if sub_dict is not None:
-                # It's a directory
-                icon = QApplication.style().standardIcon(QStyle.SP_DirIcon)
-                item.setIcon(icon)
-                item.setCheckable(True)
+                item.setIcon(dir_icon)
                 self._build_tree(sub_dict, item, full_path)
-            else:
-                # It's a file
-                item.setCheckable(True)
             
-            # Store the full filepath in UserRole for retrieval on click
-            item.setData(full_path, Qt.UserRole)
-            parent_item.appendRow(item)
+            rows.append(item)
+            self._tree_items_built += 1
+            if self._tree_items_built % 150 == 0:
+                keep_ui_alive()
+
+        if rows:
+            parent_item.appendRows(rows)
 
     def _music_tracks(self, tracks: list[TrackMetadata]) -> list[TrackMetadata]:
         return [

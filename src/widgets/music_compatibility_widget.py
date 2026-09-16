@@ -31,7 +31,7 @@ from ..threads.music_conversion import MusicConversionWorker
 from ..utils.music_compatibility import _resolve_ffmpeg_executable, evaluate_music_file
 from ..utils.music_conversion_planner import apply_compatibility_result
 from .music_conversion_dialog import MusicConversionDialog
-from .page_chrome import filter_toolbar, loading_page, page_header
+from .page_chrome import bind_search_field, filter_toolbar, freeze_view, loading_page, page_header, PATH_COLUMN_WIDTH
 from .stat_card import StatCard
 from .grouped_header_view import GroupedHeaderView
 
@@ -184,7 +184,7 @@ class MusicCompatibilityWidget(QWidget):
         layout.addWidget(self._stack, 1)
 
     def _connect_signals(self) -> None:
-        self._search_input.textChanged.connect(self._on_search_changed)
+        bind_search_field(self._search_input, self._on_search_changed)
         self._status_combo.currentTextChanged.connect(self._on_status_filter_changed)
         self._table.clicked.connect(self._on_table_clicked)
         self._convert_btn.clicked.connect(self._open_conversion_dialog)
@@ -499,7 +499,8 @@ class MusicCompatibilityWidget(QWidget):
     def populate_data(self, data_model: DriveDataModel) -> None:
         self._data_model = data_model
         tracks = list(data_model.tracks.values())
-        self._source_model.update_data(tracks, data_model.root_path)
+        with freeze_view(self._table):
+            self._source_model.update_data(tracks, data_model.root_path)
 
         header = self._table.horizontalHeader()
         font_metrics = header.fontMetrics()
@@ -534,7 +535,7 @@ class MusicCompatibilityWidget(QWidget):
                 text_width = font_metrics.horizontalAdvance(CompColumn.HEADERS[col].upper()) + 45
                 header.resizeSection(col, max(baselines[col], text_width))
 
-        self._table.resizeColumnToContents(CompColumn.FILE)
+        header.resizeSection(CompColumn.FILE, PATH_COLUMN_WIDTH)
         self._update_convert_button_state()
         QTimer.singleShot(100, self._update_stats)
 

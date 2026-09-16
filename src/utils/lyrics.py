@@ -290,7 +290,7 @@ def apply_lyrics_result(track: TrackMetadata, result: dict[str, str]) -> None:
     track.lyrics_source = result.get("source", "-")
     track.lyrics_preview = result.get("preview", "")
     track.has_lyrics = result.get("has_lyrics") == "True"
-    lyrics_text = result.get("lyrics_text") or ""
+    lyrics_text = (result.get("lyrics_text") or "").replace("\x00", "")
     track.lyrics_text = lyrics_text or None
 
 

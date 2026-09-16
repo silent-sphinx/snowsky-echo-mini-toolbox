@@ -1,15 +1,63 @@
 """Shared page chrome for the manager-style tabs."""
 
-from PySide6.QtCore import Qt
+from contextlib import contextmanager
+
+from PySide6.QtCore import Qt, QEventLoop, QTimer
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QTreeView,
     QVBoxLayout,
     QWidget,
 )
 
 from ..theme import Colours
+
+PATH_COLUMN_WIDTH = 440
+
+_UI_ALIVE_FLAGS = QEventLoop.ExcludeUserInputEvents
+
+
+def keep_ui_alive() -> None:
+    """Pump paint/timer events so Windows does not mark the window hung."""
+    app = QApplication.instance()
+    if app is None:
+        return
+    app.processEvents(_UI_ALIVE_FLAGS)
+
+
+@contextmanager
+def freeze_view(view: QAbstractItemView, *, restore_sorting: bool = True):
+    """Pause painting, sorting, and mouse hits while a large model is swapped in."""
+    sorting = False
+    sorter = getattr(view, "isSortingEnabled", None)
+    if callable(sorter):
+        sorting = bool(sorter())
+        view.setSortingEnabled(False)
+    view.setUpdatesEnabled(False)
+    view.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+    try:
+        yield
+    finally:
+        view.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        view.setUpdatesEnabled(True)
+        keep_ui_alive()
+        # File trees are inserted in order; re-sorting thousands of items
+        # after populate is what freezes Windows if the user clicks.
+        should_sort = (
+            restore_sorting
+            and sorting
+            and not isinstance(view, QTreeView)
+        )
+        if should_sort and callable(getattr(view, "setSortingEnabled", None)):
+            view.setSortingEnabled(True)
+            keep_ui_alive()
+        elif sorting and isinstance(view, QTreeView):
+            view.setSortingEnabled(False)
 
 
 def page_header(
@@ -91,6 +139,16 @@ def filter_toolbar() -> tuple[QWidget, QHBoxLayout]:
     toolbar.setContentsMargins(12, 8, 12, 8)
     toolbar.setSpacing(8)
     return panel, toolbar
+
+
+def bind_search_field(line_edit: QLineEdit, callback, delay_ms: int = 100) -> QTimer:
+    """Apply search after typing pauses so each keystroke is not a full table rebuild."""
+    timer = QTimer(line_edit)
+    timer.setSingleShot(True)
+    timer.setInterval(delay_ms)
+    line_edit.textChanged.connect(timer.start)
+    timer.timeout.connect(lambda: callback(line_edit.text()))
+    return timer
 
 
 def flow_steps(steps: list[tuple[str, str, str]]) -> QWidget:

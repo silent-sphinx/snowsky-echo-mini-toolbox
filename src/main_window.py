@@ -5,9 +5,10 @@ Provides a minimal tabbed interface that houses the Metadata Manager
 and serves as the foundation for the full app rewrite.
 """
 
-from PySide6.QtCore import Qt, QTimer, QStorageInfo
+from PySide6.QtCore import Qt, QEvent, QTimer, QStorageInfo
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -36,6 +37,7 @@ from .threads.drive_scanner import DriveScannerThread
 from .theme import Colours
 from .constants import APP_VERSION
 from .utils.volume import eject_volume, removable_volume_for_path
+from .widgets.page_chrome import keep_ui_alive
 
 
 class MainWindow(QMainWindow):
@@ -49,7 +51,16 @@ class MainWindow(QMainWindow):
 
         self._current_drive = ""
         self._initial_dialog_shown = False
+        self._populate_queue: list[tuple[str, QWidget, object]] = []
+        self._populate_generation = 0
+        self._populate_total = 0
+        self._populate_done = 0
+        self._populate_status_prefix = "Loading tables"
+        self._input_locked = False
         self._init_ui()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -62,6 +73,43 @@ class MainWindow(QMainWindow):
                 handle.devicePixelRatio()
             # Wait until the first expose has finished before showing the overlay.
             QTimer.singleShot(100, self._show_drive_selector)
+
+    def eventFilter(self, obj, event) -> bool:
+        """Drop input while tables are being filled so a click cannot land on a widget that is about to be rebuilt."""
+        if self._input_locked and self._event_is_blocked_input(obj, event):
+            return True
+        return super().eventFilter(obj, event)
+
+    def _event_is_blocked_input(self, obj, event) -> bool:
+        event_type = event.type()
+        if event_type not in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+            QEvent.Type.MouseButtonDblClick,
+            QEvent.Type.MouseMove,
+            QEvent.Type.Wheel,
+            QEvent.Type.HoverEnter,
+            QEvent.Type.HoverLeave,
+            QEvent.Type.HoverMove,
+            QEvent.Type.Enter,
+            QEvent.Type.Leave,
+            QEvent.Type.KeyPress,
+            QEvent.Type.KeyRelease,
+            QEvent.Type.Shortcut,
+            QEvent.Type.ShortcutOverride,
+            QEvent.Type.ContextMenu,
+            QEvent.Type.FocusIn,
+            QEvent.Type.TouchBegin,
+            QEvent.Type.TouchUpdate,
+            QEvent.Type.TouchEnd,
+        ):
+            return False
+        if obj is self:
+            return True
+        if isinstance(obj, QWidget) and self.isAncestorOf(obj):
+            return True
+        handle = self.windowHandle()
+        return handle is not None and obj is handle
 
     def _init_ui(self) -> None:
         # Central widget and main layout
@@ -128,6 +176,7 @@ class MainWindow(QMainWindow):
         self._workflows = WorkflowWidget()
         self._workflows.needs_rescan.connect(self._rescan_current_target)
         self._tabs.addTab(self._workflows, "Workflows")
+        self._tabs.currentChanged.connect(self._on_library_tab_changed)
         
         tab_layout.addWidget(self._tabs)
         main_layout.addWidget(tab_container)
@@ -136,6 +185,13 @@ class MainWindow(QMainWindow):
         self._overlay = QWidget(central)
         self._overlay.setStyleSheet("background-color: rgba(20, 20, 20, 180);")
         self._overlay.hide()
+
+        # Eats clicks while tables are filling. A press must not land on a
+        # widget that the next populate step is about to rebuild.
+        self._input_guard = QWidget(central)
+        self._input_guard.setStyleSheet("background-color: transparent;")
+        self._input_guard.setCursor(Qt.BusyCursor)
+        self._input_guard.hide()
         
         # ── In-App Modal Panel ──────────────────────────────────
         self._drive_panel = DriveSelectorPanel(central, current_path=self._current_drive)
@@ -149,6 +205,9 @@ class MainWindow(QMainWindow):
         # Qt's cached devicePixelRatio on Retina displays (QTBUG-118794).
         if hasattr(self, '_overlay') and self._overlay.isVisible():
             self._overlay.resize(self.centralWidget().size())
+        if hasattr(self, '_input_guard') and self._input_guard.isVisible():
+            self._input_guard.resize(self.centralWidget().size())
+            self._input_guard.raise_()
         if hasattr(self, '_drive_panel') and self._drive_panel.isVisible():
             self._drive_panel.move(
                 self.centralWidget().width() // 2 - self._drive_panel.width() // 2,
@@ -156,6 +215,11 @@ class MainWindow(QMainWindow):
             )
             
     def closeEvent(self, event) -> None:
+        self._set_input_locked(False)
+        self._cancel_library_populate()
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         for widget in (
             getattr(self, "_workflows", None),
             getattr(self, "_file_cleanup", None),
@@ -354,6 +418,7 @@ class MainWindow(QMainWindow):
             self._scanner_thread.cancel()
             self._scanner_thread.wait()
 
+        self._cancel_library_populate()
         self._current_drive = ""
         self._drive_btn.setText("Select Target Drive...")
         self._set_processing_state(False)
@@ -397,6 +462,7 @@ class MainWindow(QMainWindow):
         self._start_library_scan(self._current_drive)
 
     def _start_library_scan(self, path: str) -> None:
+        self._cancel_library_populate()
         self._set_processing_state(True, "Initializing scan...")
         if hasattr(self, "_scanner_thread") and self._scanner_thread.isRunning():
             self._scanner_thread.cancel()
@@ -418,37 +484,138 @@ class MainWindow(QMainWindow):
             
     def _on_scan_finished(self, data_model) -> None:
         """Handle completion of the global drive scan."""
-        self._set_processing_state(False)
-        
-        # Pass the unified data model to the child tabs
-        self._populate_library_tabs(data_model)
-        
-        # Update the DriveInfoWidget track count and charts
-        if self._tabs.isTabVisible(0):
-            self._drive_info.populate_data(data_model)
+        self._begin_library_populate(data_model, status_prefix="Loading tables")
 
     def _on_library_changed(self, data_model) -> None:
         """Refresh tabs after an in-place library mutation such as a rename."""
-        self._populate_library_tabs(data_model)
-        if self._tabs.isTabVisible(0):
-            self._drive_info.populate_data(data_model)
+        self._begin_library_populate(data_model, status_prefix="Updating tables")
 
-    def _populate_library_tabs(self, data_model) -> None:
-        self._music_browser.populate_data(data_model)
-        self._music_compatibility.populate_data(data_model)
-        self._metadata_manager.populate_data(data_model)
-        self._album_art.populate_data(data_model)
-        self._lyrics_manager.populate_data(data_model)
-        self._file_rename.populate_data(data_model)
-        self._file_cleanup.populate_data(data_model)
-        self._backup_restore.populate_data(data_model)
-        self._workflows.populate_data(data_model)
+    def _library_populate_jobs(self, data_model) -> list[tuple[str, QWidget, object]]:
+        jobs: list[tuple[str, QWidget, object]] = []
+        if self._tabs.isTabVisible(0):
+            jobs.append(
+                ("Drive Information", self._drive_info, lambda: self._drive_info.populate_data(data_model))
+            )
+        jobs.extend(
+            [
+                ("File Browser", self._music_browser, lambda: self._music_browser.populate_data(data_model)),
+                ("Music Compatibility", self._music_compatibility, lambda: self._music_compatibility.populate_data(data_model)),
+                ("Metadata Browser", self._metadata_manager, lambda: self._metadata_manager.populate_data(data_model)),
+                ("Album Art Manager", self._album_art, lambda: self._album_art.populate_data(data_model)),
+                ("Lyrics Manager", self._lyrics_manager, lambda: self._lyrics_manager.populate_data(data_model)),
+                ("File Rename", self._file_rename, lambda: self._file_rename.populate_data(data_model)),
+                ("File Cleanup", self._file_cleanup, lambda: self._file_cleanup.populate_data(data_model)),
+                ("Backup / Restore", self._backup_restore, lambda: self._backup_restore.populate_data(data_model)),
+                ("Workflows", self._workflows, lambda: self._workflows.populate_data(data_model)),
+            ]
+        )
+        return jobs
+
+    def _cancel_library_populate(self) -> None:
+        self._populate_generation += 1
+        self._populate_queue = []
+
+    def _set_input_locked(self, locked: bool) -> None:
+        if self._input_locked == locked:
+            if locked and hasattr(self, "_input_guard"):
+                self._input_guard.resize(self.centralWidget().size())
+                self._input_guard.raise_()
+            return
+        self._input_locked = locked
+        if hasattr(self, "_drive_btn"):
+            self._drive_btn.setEnabled(not locked)
+        if hasattr(self, "_refresh_btn") and locked:
+            self._refresh_btn.setEnabled(False)
+        if hasattr(self, "_input_guard"):
+            if locked:
+                self._input_guard.resize(self.centralWidget().size())
+                self._input_guard.show()
+                self._input_guard.raise_()
+            else:
+                self._input_guard.hide()
+
+    def _begin_library_populate(self, data_model, *, status_prefix: str) -> None:
+        """Fill tabs one at a time so the progress bar can paint between them."""
+        self._populate_generation += 1
+        jobs = self._library_populate_jobs(data_model)
+        current = self._tabs.currentWidget()
+        jobs.sort(key=lambda job: 0 if job[1] is current else 1)
+        self._populate_queue = jobs
+        self._populate_total = len(jobs)
+        self._populate_done = 0
+        self._populate_status_prefix = status_prefix
+        self._set_input_locked(True)
+        self._prog_status_lbl.setText(f"{self._populate_status_prefix}...")
+        self._prog_container.show()
+        self._global_progress.setRange(0, 0)
+        generation = self._populate_generation
+        QTimer.singleShot(0, lambda: self._pump_library_populate(generation))
+
+    def _pump_library_populate(self, generation: int) -> None:
+        if generation != self._populate_generation:
+            return
+        if not self._populate_queue:
+            self._finish_library_populate(generation)
+            return
+
+        label, _widget, populate = self._populate_queue.pop(0)
+        self._populate_done += 1
+        self._prog_status_lbl.setText(
+            f"{self._populate_status_prefix}: {label} ({self._populate_done}/{self._populate_total})"
+        )
+
+        keep_ui_alive()
+        try:
+            populate()
+        except Exception as exc:
+            print(f"Failed to populate {label}: {exc}")
+        keep_ui_alive()
+
+        QTimer.singleShot(0, lambda: self._pump_library_populate(generation))
+
+    def _finish_library_populate(self, generation: int) -> None:
+        """Show filled tables one by one so the first paint cannot stall Windows."""
+        if generation != self._populate_generation:
+            return
+        self._prog_status_lbl.setText("Showing tables...")
+        keep_ui_alive()
+        for widget in (
+            self._music_browser,
+            self._music_compatibility,
+            self._metadata_manager,
+            self._album_art,
+            self._lyrics_manager,
+            self._file_rename,
+            self._file_cleanup,
+            self._backup_restore,
+            self._workflows,
+        ):
+            widget.set_processing_state(False)
+            keep_ui_alive()
+
+        self._prog_container.hide()
+        self._global_progress.setRange(0, 0)
+        if hasattr(self, "_refresh_btn"):
+            self._refresh_btn.setEnabled(bool(self._current_drive))
+        QTimer.singleShot(0, self._unlock_input_after_populate)
+
+    def _on_library_tab_changed(self, index: int) -> None:
+        """Load the tab the user just opened next, instead of leaving it queued."""
+        if self._input_locked or not self._populate_queue:
+            return
+        widget = self._tabs.widget(index)
+        for i, job in enumerate(self._populate_queue):
+            if job[1] is widget:
+                self._populate_queue.insert(0, self._populate_queue.pop(i))
+                break
 
     def _set_processing_state(self, is_processing: bool, status_text: str = "Processing data...") -> None:
         """Toggle the global loading state and UI indicators."""
         if is_processing:
             self._prog_status_lbl.setText(status_text)
             self._prog_container.show()
+            self._global_progress.setRange(0, 0)
+            self._set_input_locked(False)
         else:
             self._prog_container.hide()
             # Reset progress bar for next time
@@ -467,4 +634,12 @@ class MainWindow(QMainWindow):
         self._file_cleanup.set_processing_state(is_processing)
         self._backup_restore.set_processing_state(is_processing)
         self._workflows.set_processing_state(is_processing)
+
+        if not is_processing:
+            QTimer.singleShot(0, self._unlock_input_after_populate)
+
+    def _unlock_input_after_populate(self) -> None:
+        if self._populate_queue:
+            return
+        self._set_input_locked(False)
 

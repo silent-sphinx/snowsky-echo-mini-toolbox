@@ -13,7 +13,7 @@ import mutagen
 from mutagen.flac import FLAC
 from mutagen.mp4 import MP4, MP4Cover
 
-from .tag_normalization import tag_or_empty
+from .tag_normalization import first_easy_tag
 
 logger = logging.getLogger(__name__)
 
@@ -98,23 +98,31 @@ def image_size_from_bytes(data: bytes) -> tuple[int, int] | None:
     return None
 
 
-def read_embedded_album_art(path: Path) -> tuple[bytes | None, str]:
+def _load_audio(path: Path, audio=None):
+    if audio is not None:
+        return audio, None
     try:
-        audio = mutagen.File(path)
+        return mutagen.File(path), None
     except Exception as exc:
-        return None, f"Tag read failed: {exc}"
+        return None, exc
 
-    if not audio:
+
+def read_embedded_album_art(path: Path, audio=None) -> tuple[bytes | None, str]:
+    opened, error = _load_audio(path, audio)
+    if error is not None:
+        return None, f"Tag read failed: {error}"
+
+    if not opened:
         return None, "No embedded art"
 
-    if isinstance(audio, FLAC):
-        pictures = getattr(audio, "pictures", [])
+    if isinstance(opened, FLAC):
+        pictures = getattr(opened, "pictures", [])
         if pictures:
             picture = pictures[0]
             mime = getattr(picture, "mime", "image/unknown") or "image/unknown"
             return bytes(picture.data), mime
 
-    tags = getattr(audio, "tags", None)
+    tags = getattr(opened, "tags", None)
     if tags is None:
         return None, "No embedded art"
 
@@ -127,7 +135,7 @@ def read_embedded_album_art(path: Path) -> tuple[bytes | None, str]:
     except (AttributeError, TypeError, ValueError):
         logger.debug("Failed reading ID3 APIC album art from %s", path, exc_info=True)
 
-    if isinstance(audio, MP4):
+    if isinstance(opened, MP4):
         covr = tags.get("covr")
         if covr:
             cover = covr[0]
@@ -142,20 +150,16 @@ def read_embedded_album_art(path: Path) -> tuple[bytes | None, str]:
     return None, "No embedded art"
 
 
-def _art_source(path: Path) -> str:
+def _art_source(path: Path, audio=None) -> str:
     """Identify which tag container holds the embedded picture."""
-    try:
-        audio = mutagen.File(path)
-    except Exception:
+    opened, _error = _load_audio(path, audio)
+    if opened is None:
         return "-"
 
-    if audio is None:
-        return "-"
-
-    if isinstance(audio, FLAC) and getattr(audio, "pictures", []):
+    if isinstance(opened, FLAC) and getattr(opened, "pictures", []):
         return "FLAC Picture"
 
-    tags = getattr(audio, "tags", None)
+    tags = getattr(opened, "tags", None)
     if tags is not None:
         try:
             if tags.getall("APIC"):
@@ -163,27 +167,27 @@ def _art_source(path: Path) -> str:
         except (AttributeError, TypeError, ValueError):
             pass
 
-    if isinstance(audio, MP4) and tags is not None and tags.get("covr"):
+    if isinstance(opened, MP4) and tags is not None and tags.get("covr"):
         return "MP4 covr"
 
     return "-"
 
 
-def _metadata_status(path: Path) -> str:
+def _metadata_status(path: Path, audio=None) -> str:
     """Report whether artist/album tags exist for artwork lookups."""
-    try:
-        audio = mutagen.File(path, easy=True)
-    except Exception:
-        return "Tag Read Error"
+    opened = audio
+    if opened is None:
+        try:
+            opened = mutagen.File(path, easy=True)
+        except Exception:
+            return "Tag Read Error"
 
-    if not audio:
+    if not opened:
         return "-"
 
     try:
-        artist = tag_or_empty((audio.get("artist", [""]) or [""])[0])
-        album = tag_or_empty((audio.get("album", [""]) or [""])[0])
-        if not artist:
-            artist = tag_or_empty((audio.get("albumartist", [""]) or [""])[0])
+        artist = first_easy_tag(opened, "artist", "albumartist")
+        album = first_easy_tag(opened, "album")
     except Exception:
         return "Tag Read Error"
 
@@ -226,7 +230,7 @@ def _base_result() -> dict[str, str]:
     }
 
 
-def evaluate_album_art(path: Path) -> dict[str, str]:
+def evaluate_album_art(path: Path, audio=None) -> dict[str, str]:
     """Evaluate a file's embedded artwork against the device requirements."""
     result = _base_result()
 
@@ -235,21 +239,20 @@ def evaluate_album_art(path: Path) -> dict[str, str]:
         result["reason"] = f"Skipped non-artwork extension: {path.suffix.lower()}"
         return result
 
-    try:
-        audio = mutagen.File(path)
-    except Exception as exc:
+    opened, error = _load_audio(path, audio)
+    if error is not None:
         result["status"] = "SKIPPED"
-        result["reason"] = f"Tag read failed: {exc}"
+        result["reason"] = f"Tag read failed: {error}"
         return result
 
-    if audio is None:
+    if opened is None:
         result["status"] = "SKIPPED"
         result["reason"] = "Unsupported or unreadable audio file"
         return result
 
-    result["metadata_status"] = _metadata_status(path)
+    result["metadata_status"] = _metadata_status(path, opened)
 
-    art_bytes, art_mime = read_embedded_album_art(path)
+    art_bytes, art_mime = read_embedded_album_art(path, opened)
 
     if not art_bytes:
         result["status"] = "MISSING"
@@ -258,7 +261,7 @@ def evaluate_album_art(path: Path) -> dict[str, str]:
 
     result["art_present"] = "True"
     result["art_size"] = _format_size(len(art_bytes))
-    result["art_source"] = _art_source(path)
+    result["art_source"] = _art_source(path, opened)
 
     mime = (art_mime or "").lower()
     if "/" in art_mime:

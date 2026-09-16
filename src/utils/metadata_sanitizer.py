@@ -150,7 +150,7 @@ class MetadataSanitizer:
         else:
             audio.save()
 
-    def check_metadata(self, file_path: str | Path) -> tuple[bool, str]:
+    def check_metadata(self, file_path: str | Path, audio=None) -> tuple[bool, str]:
         """
         Check if the metadata contains too many unknown tags that would
         exceed the device's parser limits, or Vorbis comments in an order
@@ -165,15 +165,17 @@ class MetadataSanitizer:
         Returns a tuple: (is_compatible, reason_if_not)
         """
         try:
-            audio = mutagen.File(file_path)
-            if audio is None:
+            opened = audio
+            if opened is None:
+                opened = mutagen.File(file_path)
+            if opened is None:
                 return False, "Could not read audio tags"
-            if audio.tags is None:
+            if opened.tags is None:
                 return True, ""
 
-            if self._is_vorbis_tagged(audio):
+            if self._is_vorbis_tagged(opened):
                 unknown_count = 0
-                for key in audio.tags.keys():
+                for key in opened.tags.keys():
                     if key.lower() not in self.known_tags:
                         unknown_count += 1
 
@@ -186,7 +188,7 @@ class MetadataSanitizer:
                         f"tags and safely reduce the count."
                     )
 
-                offending = oversized_comment_before_core_tags(_vorbis_comment_pairs(audio.tags))
+                offending = oversized_comment_before_core_tags(_vorbis_comment_pairs(opened.tags))
                 if offending is not None:
                     key, length, pending = offending
                     pending_label = ", ".join(name.upper() for name in pending)
@@ -203,9 +205,9 @@ class MetadataSanitizer:
             # ID3v2 formats: the firmware reads a fixed ~2-4KB window of the
             # ID3v2 header. Non-standard frames (TXXX, COMM, USLT, etc.) at
             # the start push core tags (TIT2, TPE1) outside this window.
-            if hasattr(audio.tags, "getall"):
+            if hasattr(opened.tags, "getall"):
                 unknown_count = 0
-                for frame_id in audio.tags.keys():
+                for frame_id in opened.tags.keys():
                     # Extract base frame ID (e.g. "TXXX:foo" -> "TXXX")
                     base_id = str(frame_id).split(":")[0].upper()
                     if base_id not in CORE_ID3_FRAMES:

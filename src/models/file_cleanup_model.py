@@ -1,8 +1,9 @@
 """Model-View-Controller components for File Cleanup."""
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
 
+from ..models.table_filter import FastFilterProxyModel, join_search_haystack
 from ..theme import Colours, colours_for_status
 from ..utils.file_cleanup import (
     CATEGORY_INDEX,
@@ -32,14 +33,35 @@ class FileCleanupTableModel(QAbstractTableModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._rows: list[CleanupTypeStats] = []
+        self._haystacks: list[str] = []
 
     def update_data(self, rows: list[CleanupTypeStats]) -> None:
         self.beginResetModel()
         self._rows = sort_cleanup_rows(list(rows))
+        self._haystacks = [
+            join_search_haystack(
+                row.file_type,
+                row.category,
+                row.description,
+                row.count,
+                format_bytes(row.size_bytes),
+            )
+            for row in self._rows
+        ]
         self.endResetModel()
 
     def rows(self) -> list[CleanupTypeStats]:
         return self._rows
+
+    def search_haystack(self, row: int) -> str:
+        if 0 <= row < len(self._haystacks):
+            return self._haystacks[row]
+        return ""
+
+    def filter_status(self, row: int) -> str:
+        if 0 <= row < len(self._rows):
+            return self._rows[row].category
+        return ""
 
     def rowCount(self, parent=QModelIndex()) -> int:
         if parent.isValid():
@@ -155,14 +177,7 @@ class FileCleanupTableModel(QAbstractTableModel):
         return sum(row.size_bytes for row in self._rows if row.category == category)
 
 
-class FileCleanupFilterProxyModel(QSortFilterProxyModel):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._search_query = ""
-        self._category_filter = ""
-        self.setSortCaseSensitivity(Qt.CaseInsensitive)
-        self.setDynamicSortFilter(True)
-
+class FileCleanupFilterProxyModel(FastFilterProxyModel):
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
         col = left.column()
         if col == CleanupColumn.CHECK:
@@ -172,35 +187,3 @@ class FileCleanupFilterProxyModel(QSortFilterProxyModel):
         left_val = left.data(Qt.DisplayRole)
         right_val = right.data(Qt.DisplayRole)
         return str(left_val or "").casefold() < str(right_val or "").casefold()
-
-    def set_search_query(self, query: str):
-        self._search_query = query.lower()
-        self.invalidateFilter()
-
-    def set_category_filter(self, category: str):
-        self._category_filter = category.lower()
-        self.invalidateFilter()
-
-    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
-        model = self.sourceModel()
-        if not model:
-            return True
-
-        if self._category_filter and self._category_filter != "all categories":
-            category_index = model.index(source_row, CleanupColumn.CATEGORY, source_parent)
-            category_val = model.data(category_index, Qt.DisplayRole)
-            if not category_val or str(category_val).lower() != self._category_filter:
-                return False
-
-        if self._search_query:
-            row_matches = False
-            for col in range(model.columnCount(source_parent)):
-                index = model.index(source_row, col, source_parent)
-                val = model.data(index, Qt.DisplayRole)
-                if val is not None and self._search_query in str(val).lower():
-                    row_matches = True
-                    break
-            if not row_matches:
-                return False
-
-        return True

@@ -5,15 +5,42 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, SYLT, USLT, TXXX
 from mutagen.mp4 import MP4
 import concurrent.futures
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QStorageInfo, QThread, Signal
 from typing import Optional
 
 from ..constants import SUPPORTED_MEDIA_EXTENSIONS
 from ..models.drive_data import DriveDataModel, TrackMetadata
+from ..utils.tag_normalization import coerce_tag_text
+
+_REMOVABLE_FILESYSTEMS = frozenset({
+    "FAT",
+    "FAT12",
+    "FAT16",
+    "FAT32",
+    "EXFAT",
+    "MSDOS",
+    "VFAT",
+})
+_REMOVABLE_WORKER_CAP = 2
+
+
+def _scan_worker_count(path: str) -> int:
+    """Use fewer workers on USB/FAT volumes where concurrent small I/O contends."""
+    cpu_workers = max(1, (os.cpu_count() or 2) - 1)
+    try:
+        info = QStorageInfo(path)
+        if not info.isValid():
+            return cpu_workers
+        fs_type = bytes(info.fileSystemType() or b"").decode("utf-8", "ignore").upper()
+        if info.isRemovable() or fs_type in _REMOVABLE_FILESYSTEMS:
+            return min(_REMOVABLE_WORKER_CAP, cpu_workers)
+    except Exception:
+        pass
+    return cpu_workers
 
 
 def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
-    """Extract metadata from a single file. (Runs in separate processes)"""
+    """Extract metadata from a single file."""
     filename = os.path.basename(filepath)
     _, ext = os.path.splitext(filename)
     size = os.path.getsize(filepath)
@@ -41,10 +68,24 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
         
     meta.format_name = type(audio).__name__
     if audio.info:
-        meta.duration_seconds = getattr(audio.info, "length", 0.0)
-        meta.bitrate_kbps = getattr(audio.info, "bitrate", 0) // 1000 if getattr(audio.info, "bitrate", 0) else 0
-        meta.sample_rate_hz = getattr(audio.info, "sample_rate", 0)
-        meta.channels = getattr(audio.info, "channels", 0)
+        length = getattr(audio.info, "length", 0.0)
+        try:
+            meta.duration_seconds = float(length or 0.0)
+        except (TypeError, ValueError):
+            meta.duration_seconds = 0.0
+        bitrate = getattr(audio.info, "bitrate", 0) or 0
+        try:
+            meta.bitrate_kbps = int(bitrate) // 1000
+        except (TypeError, ValueError):
+            meta.bitrate_kbps = 0
+        try:
+            meta.sample_rate_hz = int(getattr(audio.info, "sample_rate", 0) or 0)
+        except (TypeError, ValueError):
+            meta.sample_rate_hz = 0
+        try:
+            meta.channels = int(getattr(audio.info, "channels", 0) or 0)
+        except (TypeError, ValueError):
+            meta.channels = 0
         
     # Extract tags
     if audio.tags:
@@ -56,22 +97,22 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
             
             # Mutagen often returns lists for values. Unpack them if possible.
             if isinstance(val, list) and len(val) == 1:
-                clean_val = str(val[0])
+                clean_val = coerce_tag_text(val[0])
             elif isinstance(val, list):
-                clean_val = ", ".join(str(v) for v in val)
+                clean_val = ", ".join(coerce_tag_text(v) for v in val)
             else:
-                clean_val = str(val)
+                clean_val = coerce_tag_text(val)
                 
             meta.all_tags[str(key)] = clean_val
             
         # Common tags (mutagen makes this slightly painful depending on format)
         if isinstance(audio, FLAC):
-            meta.title = audio.get("title", [meta.title])[0]
-            meta.artist = audio.get("artist", [meta.artist])[0]
-            meta.album = audio.get("album", [meta.album])[0]
-            meta.genre = audio.get("genre", [""])[0]
-            meta.year = audio.get("date", [""])[0]
-            meta.track_num = audio.get("tracknumber", [""])[0]
+            meta.title = coerce_tag_text(audio.get("title", [meta.title])[0], meta.title)
+            meta.artist = coerce_tag_text(audio.get("artist", [meta.artist])[0], meta.artist)
+            meta.album = coerce_tag_text(audio.get("album", [meta.album])[0], meta.album)
+            meta.genre = coerce_tag_text(audio.get("genre", [""])[0])
+            meta.year = coerce_tag_text(audio.get("date", [""])[0])
+            meta.track_num = coerce_tag_text(audio.get("tracknumber", [""])[0])
             
             # Check for pictures
             if audio.pictures:
@@ -83,7 +124,9 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
                 if not values:
                     return ""
                 first = values[0]
-                return str(first) if not isinstance(first, bytes) else first.decode("utf-8", "replace")
+                if isinstance(first, bytes):
+                    return coerce_tag_text(first.decode("utf-8", "replace"))
+                return coerce_tag_text(first)
 
             meta.title = _mp4_tag("\xa9nam") or meta.title
             meta.artist = _mp4_tag("\xa9ART") or meta.artist
@@ -105,16 +148,19 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
         elif audio.tags:
             # Try generic dict access
             try:
-                meta.title = str(audio.tags.get("TIT2", audio.get("title", [meta.title])[0]))
-            except: pass
+                meta.title = coerce_tag_text(audio.tags.get("TIT2", audio.get("title", [meta.title])[0]), meta.title)
+            except Exception:
+                pass
             
             try:
-                meta.artist = str(audio.tags.get("TPE1", audio.get("artist", [meta.artist])[0]))
-            except: pass
+                meta.artist = coerce_tag_text(audio.tags.get("TPE1", audio.get("artist", [meta.artist])[0]), meta.artist)
+            except Exception:
+                pass
             
             try:
-                meta.album = str(audio.tags.get("TALB", audio.get("album", [meta.album])[0]))
-            except: pass
+                meta.album = coerce_tag_text(audio.tags.get("TALB", audio.get("album", [meta.album])[0]), meta.album)
+            except Exception:
+                pass
             
             # ID3 checks for art (lyrics are evaluated separately)
             if hasattr(audio.tags, "getall"):
@@ -141,13 +187,13 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
                     meta.all_tags, "albumartist", "album artist", "album_artist", "TPE2", "aART"
                 )
 
-    # Run ffprobe compatibility check
+    # Compatibility, artwork, and lyrics all reuse the mutagen object above.
     if not filepath.lower().endswith(".lrc"):
         try:
             from pathlib import Path
             from ..utils.music_compatibility import evaluate_music_file
             
-            comp_result = evaluate_music_file(Path(filepath), Path(root_path))
+            comp_result = evaluate_music_file(Path(filepath), Path(root_path), audio=audio)
             meta.comp_status = comp_result.get("status", "UNKNOWN")
             meta.comp_category = comp_result.get("category", "unknown")
             meta.comp_reason = comp_result.get("reason", "")
@@ -183,7 +229,7 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
             from ..utils.album_art_planner import apply_album_art_result
             from ..utils.album_art_validation import evaluate_album_art
 
-            apply_album_art_result(meta, evaluate_album_art(Path(filepath)))
+            apply_album_art_result(meta, evaluate_album_art(Path(filepath), audio=audio))
         except Exception as e:
             print(f"Album art scan failed for {filepath}: {e}")
 
@@ -257,7 +303,8 @@ class DriveScannerThread(QThread):
             self.progress_updated.emit(0, total_files, "Starting analysis...")
 
             # Threads, not processes: ProcessPoolExecutor deadlocks from QThread on macOS.
-            max_workers = max(1, (os.cpu_count() or 2) - 1)
+            # Removable FAT/exFAT volumes serialize small reads, so extra workers hurt.
+            max_workers = _scan_worker_count(self.path)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_path = {

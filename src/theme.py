@@ -110,9 +110,15 @@ _STATUS_COLOURS: dict[str, tuple[str, str]] = {
 
 def colours_for_status(status: str | None) -> tuple[str, str] | tuple[None, None]:
     """Return (background, foreground) hex colours for a status token."""
-    if not status:
+    if status is None:
         return None, None
-    return _STATUS_COLOURS.get(status.strip().upper(), (None, None))
+    try:
+        token = str(status).strip().upper()
+    except Exception:
+        return None, None
+    if not token:
+        return None, None
+    return _STATUS_COLOURS.get(token, (None, None))
 
 
 # ── Font Setup ──────────────────────────────────────────────────────────────

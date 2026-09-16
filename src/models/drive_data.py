@@ -123,6 +123,14 @@ class TrackMetadata:
         return f"{m}:{s:02d}"
 
 
+def relative_track_path(filepath: str, root_path: str) -> str:
+    """Return a display path that never raises (Windows mixed mounts, etc.)."""
+    try:
+        return os.path.relpath(filepath, root_path)
+    except Exception:
+        return filepath
+
+
 class DriveDataModel:
     """
     Central repository for all scanned drive data.
@@ -145,7 +153,7 @@ class DriveDataModel:
         
     def _add_to_tree(self, filepath: str) -> None:
         # Build tree representation relative to root
-        rel_path = os.path.relpath(filepath, self.root_path)
+        rel_path = relative_track_path(filepath, self.root_path)
         parts = rel_path.split(os.sep)
         
         curr = self.tree
