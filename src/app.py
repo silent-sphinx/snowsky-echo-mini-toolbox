@@ -21,6 +21,12 @@ _CRASH_REPORTER: CrashReporter | None = None
 _SHOWING_CRASH_DIALOG = False
 
 
+def _write_stderr(message: str) -> None:
+    stream = sys.stderr or sys.__stderr__
+    if stream is not None:
+        stream.write(message)
+
+
 class CrashReporter(QObject):
     """Show uncaught errors on the GUI thread as a Qt message box."""
 
@@ -33,7 +39,7 @@ class CrashReporter(QObject):
     def report(self, title: str, details: str) -> None:
         app = QApplication.instance()
         if app is None:
-            sys.stderr.write(f"{title}\n{details}\n")
+            _write_stderr(f"{title}\n{details}\n")
             return
         if QThread.currentThread() is app.thread():
             self._display(title, details)
@@ -43,7 +49,7 @@ class CrashReporter(QObject):
     def _display(self, title: str, details: str) -> None:
         global _SHOWING_CRASH_DIALOG
         if _SHOWING_CRASH_DIALOG:
-            sys.stderr.write(f"{title}\n{details}\n")
+            _write_stderr(f"{title}\n{details}\n")
             return
 
         _SHOWING_CRASH_DIALOG = True
@@ -63,7 +69,7 @@ class CrashReporter(QObject):
             if box.exec() == QMessageBox.Abort:
                 QApplication.instance().quit()
         except Exception:
-            sys.stderr.write(f"{title}\n{details}\n")
+            _write_stderr(f"{title}\n{details}\n")
         finally:
             _SHOWING_CRASH_DIALOG = False
 
@@ -79,9 +85,9 @@ def _report_exception(exc_type, exc, tb) -> None:
 
     title = f"{getattr(exc_type, '__name__', 'Error')}: {exc}"
     details = _format_exception(exc_type, exc, tb)
-    sys.stderr.write(details)
+    _write_stderr(details)
     if not details.endswith("\n"):
-        sys.stderr.write("\n")
+        _write_stderr("\n")
 
     if _CRASH_REPORTER is not None:
         _CRASH_REPORTER.report(title, details)
@@ -97,7 +103,7 @@ def _show_startup_crash_dialog(title: str, details: str) -> None:
         reporter = CrashReporter(app)
         reporter.report(title, details)
     except Exception:
-        sys.stderr.write(f"{title}\n{details}\n")
+        _write_stderr(f"{title}\n{details}\n")
 
 
 def _thread_excepthook(args: threading.ExceptHookArgs) -> None:
@@ -119,7 +125,7 @@ def _qt_message_handler(mode, context, message: str) -> None:
         QtMsgType.QtFatalMsg: "Fatal",
     }
     prefix = prefixes.get(mode, "Qt")
-    sys.stderr.write(f"{prefix}: {message}\n")
+    _write_stderr(f"{prefix}: {message}\n")
 
     if mode == QtMsgType.QtFatalMsg:
         details = message
@@ -142,7 +148,8 @@ def _install_crash_hooks(app: QApplication) -> CrashReporter:
 
 def main() -> int:
     """Run the application."""
-    faulthandler.enable(all_threads=True)
+    if sys.stderr is not None:
+        faulthandler.enable(all_threads=True)
 
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
