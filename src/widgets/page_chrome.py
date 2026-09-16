@@ -2,12 +2,13 @@
 
 from contextlib import contextmanager
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -19,16 +20,18 @@ PATH_COLUMN_WIDTH = 440
 
 @contextmanager
 def freeze_view(view: QAbstractItemView):
-    """Pause painting and sorting while a large model is swapped in."""
+    """Pause painting, sorting, and mouse hits while a large model is swapped in."""
     sorting = False
     sorter = getattr(view, "isSortingEnabled", None)
     if callable(sorter):
         sorting = bool(sorter())
         view.setSortingEnabled(False)
     view.setUpdatesEnabled(False)
+    view.setAttribute(Qt.WA_TransparentForMouseEvents, True)
     try:
         yield
     finally:
+        view.setAttribute(Qt.WA_TransparentForMouseEvents, False)
         view.setUpdatesEnabled(True)
         if callable(getattr(view, "setSortingEnabled", None)):
             view.setSortingEnabled(sorting)
@@ -113,6 +116,16 @@ def filter_toolbar() -> tuple[QWidget, QHBoxLayout]:
     toolbar.setContentsMargins(12, 8, 12, 8)
     toolbar.setSpacing(8)
     return panel, toolbar
+
+
+def bind_search_field(line_edit: QLineEdit, callback, delay_ms: int = 100) -> QTimer:
+    """Apply search after typing pauses so each keystroke is not a full table rebuild."""
+    timer = QTimer(line_edit)
+    timer.setSingleShot(True)
+    timer.setInterval(delay_ms)
+    line_edit.textChanged.connect(timer.start)
+    timer.timeout.connect(lambda: callback(line_edit.text()))
+    return timer
 
 
 def flow_steps(steps: list[tuple[str, str, str]]) -> QWidget:

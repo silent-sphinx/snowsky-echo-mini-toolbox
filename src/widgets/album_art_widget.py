@@ -34,7 +34,7 @@ from ..utils.album_art_planner import apply_album_art_result
 from ..utils.album_art_validation import evaluate_album_art
 from .album_art_download_dialog import AlbumArtDownloadDialog
 from .album_art_fix_dialog import AlbumArtFixDialog
-from .page_chrome import filter_toolbar, freeze_view, loading_page, page_header, PATH_COLUMN_WIDTH
+from .page_chrome import bind_search_field, filter_toolbar, freeze_view, loading_page, page_header, PATH_COLUMN_WIDTH
 from .stat_card import StatCard
 from .grouped_header_view import GroupedHeaderView
 
@@ -182,6 +182,7 @@ class AlbumArtWidget(QWidget):
         self._table.setSelectionMode(QTableView.ExtendedSelection)
         self._table.verticalHeader().setVisible(False)
         self._table.verticalHeader().setDefaultSectionSize(28)
+        self._table.setUniformRowHeights(True)
 
         header_view = GroupedHeaderView(self._table)
         self._table.setHorizontalHeader(header_view)
@@ -203,7 +204,7 @@ class AlbumArtWidget(QWidget):
         layout.addWidget(self._stack, 1)
 
     def _connect_signals(self) -> None:
-        self._search_input.textChanged.connect(self._on_search_changed)
+        bind_search_field(self._search_input, self._on_search_changed)
         self._status_combo.currentTextChanged.connect(self._on_status_filter_changed)
         self._table.clicked.connect(self._on_table_clicked)
         self._convert_btn.clicked.connect(self._open_fix_dialog)

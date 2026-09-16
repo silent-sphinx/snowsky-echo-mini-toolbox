@@ -2,10 +2,11 @@
 Model-View-Controller components for Music Compatibility.
 """
 
-from PySide6.QtCore import QAbstractTableModel, QSortFilterProxyModel, QModelIndex, Qt
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
 
 from ..models.drive_data import TrackMetadata, relative_track_path
+from ..models.table_filter import FastFilterProxyModel, track_search_haystack
 from ..theme import Colours, colours_for_status
 
 class CompColumn:
@@ -60,16 +61,52 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
         super().__init__(parent)
         self._tracks: list[TrackMetadata] = []
         self._root_path = ""
+        self._haystacks: list[str] = []
         
     def update_data(self, tracks: list[TrackMetadata], root_path: str) -> None:
         self.beginResetModel()
         self._tracks = [t for t in tracks if t.extension.lower() != ".lrc"]
         self._root_path = root_path
         self._tracks.sort(key=lambda t: t.filepath)
+        self._haystacks = [self._haystack_for(track) for track in self._tracks]
         self.endResetModel()
         
     def tracks(self) -> list[TrackMetadata]:
         return self._tracks
+
+    def _haystack_for(self, track: TrackMetadata) -> str:
+        return track_search_haystack(
+            track,
+            self._root_path,
+            track.comp_status,
+            track.comp_reason,
+            track.comp_eq,
+            track.comp_codec,
+            track.comp_sample_rate,
+            track.comp_bit_depth,
+            track.comp_channels,
+            track.comp_channel_compat,
+            track.extension,
+            track.comp_block_size,
+            track.comp_dsd_profile,
+            track.comp_dsd_bitdepth,
+            track.comp_wav_codec,
+            track.comp_tag_encoding,
+            track.comp_tag_length,
+            track.comp_streams,
+            track.comp_filename,
+            track.comp_metadata,
+        )
+
+    def search_haystack(self, row: int) -> str:
+        if 0 <= row < len(self._haystacks):
+            return self._haystacks[row]
+        return ""
+
+    def filter_status(self, row: int) -> str:
+        if 0 <= row < len(self._tracks):
+            return self._tracks[row].comp_status
+        return ""
         
     def rowCount(self, parent=QModelIndex()) -> int:
         if parent.isValid(): return 0
@@ -214,52 +251,5 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
         return sum(1 for t in self._tracks if t.comp_eq == eq_status)
 
 
-class MusicCompatibilityFilterProxyModel(QSortFilterProxyModel):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._search_query = ""
-        self._status_filter = ""
-        self.setSortCaseSensitivity(Qt.CaseInsensitive)
-        self.setDynamicSortFilter(True)
-
-    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
-        if left.column() == CompColumn.CHECK:
-            return int(left.data(Qt.CheckStateRole) or 0) < int(right.data(Qt.CheckStateRole) or 0)
-        left_val = left.data(Qt.DisplayRole)
-        right_val = right.data(Qt.DisplayRole)
-        return str(left_val or "").casefold() < str(right_val or "").casefold()
-        
-    def set_search_query(self, query: str):
-        self._search_query = query.lower()
-        self.invalidateFilter()
-        
-    def set_status_filter(self, status: str):
-        self._status_filter = status.lower()
-        self.invalidateFilter()
-        
-    def visible_row_count(self) -> int:
-        return self.rowCount()
-        
-    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
-        model = self.sourceModel()
-        if not model:
-            return True
-            
-        if self._status_filter and self._status_filter != "all statuses":
-            status_index = model.index(source_row, CompColumn.STATUS, source_parent)
-            status_val = model.data(status_index, Qt.DisplayRole)
-            if not status_val or status_val.lower() != self._status_filter:
-                return False
-                
-        if self._search_query:
-            row_matches = False
-            for col in range(model.columnCount(source_parent)):
-                index = model.index(source_row, col, source_parent)
-                val = model.data(index, Qt.DisplayRole)
-                if val and self._search_query in str(val).lower():
-                    row_matches = True
-                    break
-            if not row_matches:
-                return False
-                
-        return True
+class MusicCompatibilityFilterProxyModel(FastFilterProxyModel):
+    pass

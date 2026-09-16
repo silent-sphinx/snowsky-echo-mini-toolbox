@@ -28,7 +28,7 @@ from ..models.file_cleanup_model import (
 )
 from ..threads.file_cleanup import FileCleanupDeleteWorker, FileCleanupScanWorker
 from ..utils.file_cleanup import CATEGORY_ORDER, format_bytes
-from .page_chrome import filter_toolbar, flow_steps, loading_page, page_header
+from .page_chrome import bind_search_field, filter_toolbar, flow_steps, loading_page, page_header
 from .stat_card import StatCard
 from .grouped_header_view import GroupedHeaderView
 
@@ -225,6 +225,7 @@ class FileCleanupWidget(QWidget):
         self._table.verticalHeader().setVisible(False)
         self._table.verticalHeader().setDefaultSectionSize(28)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.setUniformRowHeights(True)
 
         header_view = GroupedHeaderView(self._table)
         self._table.setHorizontalHeader(header_view)
@@ -244,7 +245,7 @@ class FileCleanupWidget(QWidget):
         layout.addWidget(self._stack, 1)
 
     def _connect_signals(self) -> None:
-        self._search_input.textChanged.connect(self._on_search_changed)
+        bind_search_field(self._search_input, self._on_search_changed)
         self._category_combo.currentTextChanged.connect(self._on_category_filter_changed)
         self._table.clicked.connect(self._on_table_clicked)
         self._table.customContextMenuRequested.connect(self._show_context_menu)

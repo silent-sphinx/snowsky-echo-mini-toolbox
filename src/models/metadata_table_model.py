@@ -2,10 +2,11 @@
 Model-View-Controller components for Metadata Browser.
 """
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, Signal
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
 from PySide6.QtGui import QColor
 
 from ..models.drive_data import DriveDataModel, TrackMetadata, relative_track_path
+from ..models.table_filter import FastFilterProxyModel, track_search_haystack
 from ..theme import Colours, colours_for_status
 from ..utils.metadata_status import (
     is_metadata_track,
@@ -72,6 +73,7 @@ class MetadataTableModel(QAbstractTableModel):
         self._tracks: list[TrackMetadata] = []
         self._root_path = ""
         self._data_model: DriveDataModel | None = None
+        self._haystacks: list[str] = []
 
     def update_data(
         self,
@@ -84,10 +86,35 @@ class MetadataTableModel(QAbstractTableModel):
         self._root_path = root_path
         self._data_model = data_model
         self._tracks.sort(key=lambda t: t.filepath)
+        self._rebuild_haystacks()
         self.endResetModel()
 
     def tracks(self) -> list[TrackMetadata]:
         return self._tracks
+
+    def _haystack_for(self, track: TrackMetadata) -> str:
+        status, reason = metadata_status(track)
+        return track_search_haystack(
+            track,
+            self._root_path,
+            self._display_tag(track.title),
+            self._display_tag(track.artist),
+            self._display_tag(track.album),
+            self._display_tag(track.album_artist),
+            track.track_num,
+            track.genre,
+            track.year,
+            status,
+            reason,
+        )
+
+    def _rebuild_haystacks(self) -> None:
+        self._haystacks = [self._haystack_for(track) for track in self._tracks]
+
+    def search_haystack(self, row: int) -> str:
+        if 0 <= row < len(self._haystacks):
+            return self._haystacks[row]
+        return ""
 
     def rowCount(self, parent=QModelIndex()) -> int:
         if parent.isValid():
@@ -145,6 +172,8 @@ class MetadataTableModel(QAbstractTableModel):
 
         top_left = self.index(row, 0)
         bottom_right = self.index(row, MetaColumn.COUNT - 1)
+        if 0 <= row < len(self._haystacks):
+            self._haystacks[row] = self._haystack_for(track)
         self.dataChanged.emit(top_left, bottom_right)
         return True
 
@@ -152,6 +181,7 @@ class MetadataTableModel(QAbstractTableModel):
         if not self._tracks:
             return
         if not filepaths:
+            self._rebuild_haystacks()
             self.dataChanged.emit(
                 self.index(0, 0),
                 self.index(len(self._tracks) - 1, MetaColumn.COUNT - 1),
@@ -161,6 +191,7 @@ class MetadataTableModel(QAbstractTableModel):
         wanted = set(filepaths)
         for row, track in enumerate(self._tracks):
             if track.filepath in wanted:
+                self._haystacks[row] = self._haystack_for(track)
                 self.dataChanged.emit(
                     self.index(row, 0),
                     self.index(row, MetaColumn.COUNT - 1),
@@ -273,70 +304,35 @@ class MetadataTableModel(QAbstractTableModel):
         return sum(1 for t in self._tracks if is_missing_album(t))
 
 
-class MetadataFilterProxyModel(QSortFilterProxyModel):
+class MetadataFilterProxyModel(FastFilterProxyModel):
     STATUS_LABEL_MAP = {
         "complete": "complete",
         "missing metadata": "missing",
     }
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._search_query = ""
-        self._status_filter = ""
-        self.setSortCaseSensitivity(Qt.CaseInsensitive)
-        self.setDynamicSortFilter(True)
-
-    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
-        if left.column() == MetaColumn.CHECK:
-            return int(left.data(Qt.CheckStateRole) or 0) < int(right.data(Qt.CheckStateRole) or 0)
-        left_val = left.data(Qt.DisplayRole)
-        right_val = right.data(Qt.DisplayRole)
-        return str(left_val or "").casefold() < str(right_val or "").casefold()
-
-    def set_search_query(self, query: str):
-        self._search_query = query.lower()
-        self.invalidateFilter()
-
-    def set_status_filter(self, status: str):
-        self._status_filter = status.lower()
-        self.invalidateFilter()
-
-    def visible_row_count(self) -> int:
-        return self.rowCount()
-
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
-        model = self.sourceModel()
-        if not model:
+        if source_parent.isValid():
             return True
-
+        model = self.sourceModel()
         tracks = getattr(model, "tracks", lambda: [])()
         track = tracks[source_row] if 0 <= source_row < len(tracks) else None
 
-        if self._status_filter and self._status_filter != "all statuses" and track is not None:
-            if self._status_filter == "missing title":
+        if self._choice_is_active() and track is not None:
+            if self._choice_filter == "missing title":
                 if not is_missing_title(track):
                     return False
-            elif self._status_filter == "missing artist":
+            elif self._choice_filter == "missing artist":
                 if not is_missing_artist(track):
                     return False
-            elif self._status_filter == "missing album":
+            elif self._choice_filter == "missing album":
                 if not is_missing_album(track):
                     return False
             else:
-                expected = self.STATUS_LABEL_MAP.get(self._status_filter, self._status_filter)
+                expected = self.STATUS_LABEL_MAP.get(self._choice_filter, self._choice_filter)
                 status, _ = metadata_status(track)
                 if status.lower() != expected:
                     return False
 
-        if self._search_query:
-            row_matches = False
-            for col in range(model.columnCount(source_parent)):
-                index = model.index(source_row, col, source_parent)
-                val = model.data(index, Qt.DisplayRole)
-                if val and self._search_query in str(val).lower():
-                    row_matches = True
-                    break
-            if not row_matches:
-                return False
-
+        if self._search_query and self._search_query not in self._source_haystack(source_row):
+            return False
         return True

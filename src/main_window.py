@@ -5,7 +5,7 @@ Provides a minimal tabbed interface that houses the Metadata Manager
 and serves as the foundation for the full app rewrite.
 """
 
-from PySide6.QtCore import Qt, QEventLoop, QTimer, QStorageInfo
+from PySide6.QtCore import Qt, QEvent, QTimer, QStorageInfo
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -54,9 +54,12 @@ class MainWindow(QMainWindow):
         self._populate_generation = 0
         self._populate_total = 0
         self._populate_done = 0
-        self._populate_reveal = False
         self._populate_status_prefix = "Loading tables"
+        self._input_locked = False
         self._init_ui()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -69,6 +72,43 @@ class MainWindow(QMainWindow):
                 handle.devicePixelRatio()
             # Wait until the first expose has finished before showing the overlay.
             QTimer.singleShot(100, self._show_drive_selector)
+
+    def eventFilter(self, obj, event) -> bool:
+        """Drop input while tables are being filled so a click cannot land on a widget that is about to be rebuilt."""
+        if self._input_locked and self._event_is_blocked_input(obj, event):
+            return True
+        return super().eventFilter(obj, event)
+
+    def _event_is_blocked_input(self, obj, event) -> bool:
+        event_type = event.type()
+        if event_type not in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+            QEvent.Type.MouseButtonDblClick,
+            QEvent.Type.MouseMove,
+            QEvent.Type.Wheel,
+            QEvent.Type.HoverEnter,
+            QEvent.Type.HoverLeave,
+            QEvent.Type.HoverMove,
+            QEvent.Type.Enter,
+            QEvent.Type.Leave,
+            QEvent.Type.KeyPress,
+            QEvent.Type.KeyRelease,
+            QEvent.Type.Shortcut,
+            QEvent.Type.ShortcutOverride,
+            QEvent.Type.ContextMenu,
+            QEvent.Type.FocusIn,
+            QEvent.Type.TouchBegin,
+            QEvent.Type.TouchUpdate,
+            QEvent.Type.TouchEnd,
+        ):
+            return False
+        if obj is self:
+            return True
+        if isinstance(obj, QWidget) and self.isAncestorOf(obj):
+            return True
+        handle = self.windowHandle()
+        return handle is not None and obj is handle
 
     def _init_ui(self) -> None:
         # Central widget and main layout
@@ -144,6 +184,13 @@ class MainWindow(QMainWindow):
         self._overlay = QWidget(central)
         self._overlay.setStyleSheet("background-color: rgba(20, 20, 20, 180);")
         self._overlay.hide()
+
+        # Eats clicks while tables are filling. A press must not land on a
+        # widget that the next populate step is about to rebuild.
+        self._input_guard = QWidget(central)
+        self._input_guard.setStyleSheet("background-color: transparent;")
+        self._input_guard.setCursor(Qt.BusyCursor)
+        self._input_guard.hide()
         
         # ── In-App Modal Panel ──────────────────────────────────
         self._drive_panel = DriveSelectorPanel(central, current_path=self._current_drive)
@@ -157,6 +204,9 @@ class MainWindow(QMainWindow):
         # Qt's cached devicePixelRatio on Retina displays (QTBUG-118794).
         if hasattr(self, '_overlay') and self._overlay.isVisible():
             self._overlay.resize(self.centralWidget().size())
+        if hasattr(self, '_input_guard') and self._input_guard.isVisible():
+            self._input_guard.resize(self.centralWidget().size())
+            self._input_guard.raise_()
         if hasattr(self, '_drive_panel') and self._drive_panel.isVisible():
             self._drive_panel.move(
                 self.centralWidget().width() // 2 - self._drive_panel.width() // 2,
@@ -164,7 +214,11 @@ class MainWindow(QMainWindow):
             )
             
     def closeEvent(self, event) -> None:
+        self._set_input_locked(False)
         self._cancel_library_populate()
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         for widget in (
             getattr(self, "_workflows", None),
             getattr(self, "_file_cleanup", None),
@@ -429,11 +483,11 @@ class MainWindow(QMainWindow):
             
     def _on_scan_finished(self, data_model) -> None:
         """Handle completion of the global drive scan."""
-        self._begin_library_populate(data_model, reveal_tabs_incrementally=True)
+        self._begin_library_populate(data_model, status_prefix="Loading tables")
 
     def _on_library_changed(self, data_model) -> None:
         """Refresh tabs after an in-place library mutation such as a rename."""
-        self._begin_library_populate(data_model, reveal_tabs_incrementally=False)
+        self._begin_library_populate(data_model, status_prefix="Updating tables")
 
     def _library_populate_jobs(self, data_model) -> list[tuple[str, QWidget, object]]:
         jobs: list[tuple[str, QWidget, object]] = []
@@ -460,7 +514,26 @@ class MainWindow(QMainWindow):
         self._populate_generation += 1
         self._populate_queue = []
 
-    def _begin_library_populate(self, data_model, *, reveal_tabs_incrementally: bool) -> None:
+    def _set_input_locked(self, locked: bool) -> None:
+        if self._input_locked == locked:
+            if locked and hasattr(self, "_input_guard"):
+                self._input_guard.resize(self.centralWidget().size())
+                self._input_guard.raise_()
+            return
+        self._input_locked = locked
+        if hasattr(self, "_drive_btn"):
+            self._drive_btn.setEnabled(not locked)
+        if hasattr(self, "_refresh_btn") and locked:
+            self._refresh_btn.setEnabled(False)
+        if hasattr(self, "_input_guard"):
+            if locked:
+                self._input_guard.resize(self.centralWidget().size())
+                self._input_guard.show()
+                self._input_guard.raise_()
+            else:
+                self._input_guard.hide()
+
+    def _begin_library_populate(self, data_model, *, status_prefix: str) -> None:
         """Fill tabs one at a time so the progress bar can paint between them."""
         self._populate_generation += 1
         jobs = self._library_populate_jobs(data_model)
@@ -469,16 +542,12 @@ class MainWindow(QMainWindow):
         self._populate_queue = jobs
         self._populate_total = len(jobs)
         self._populate_done = 0
-        self._populate_reveal = reveal_tabs_incrementally
-        self._populate_status_prefix = (
-            "Loading tables" if reveal_tabs_incrementally else "Updating tables"
-        )
+        self._populate_status_prefix = status_prefix
+        self._set_input_locked(True)
         self._prog_status_lbl.setText(f"{self._populate_status_prefix}...")
         self._prog_container.show()
         self._global_progress.setRange(0, max(self._populate_total, 1))
         self._global_progress.setValue(0)
-        if hasattr(self, "_refresh_btn"):
-            self._refresh_btn.setEnabled(False)
         generation = self._populate_generation
         QTimer.singleShot(0, lambda: self._pump_library_populate(generation))
 
@@ -489,28 +558,24 @@ class MainWindow(QMainWindow):
             self._set_processing_state(False)
             return
 
-        label, widget, populate = self._populate_queue.pop(0)
+        label, _widget, populate = self._populate_queue.pop(0)
         self._populate_done += 1
         self._prog_status_lbl.setText(
             f"{self._populate_status_prefix}: {label} ({self._populate_done}/{self._populate_total})"
         )
         self._global_progress.setValue(self._populate_done - 1)
-        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
 
         try:
             populate()
         except Exception as exc:
             print(f"Failed to populate {label}: {exc}")
 
-        if self._populate_reveal and hasattr(widget, "set_processing_state"):
-            widget.set_processing_state(False)
-
         self._global_progress.setValue(self._populate_done)
         QTimer.singleShot(0, lambda: self._pump_library_populate(generation))
 
     def _on_library_tab_changed(self, index: int) -> None:
         """Load the tab the user just opened next, instead of leaving it queued."""
-        if not self._populate_queue:
+        if self._input_locked or not self._populate_queue:
             return
         widget = self._tabs.widget(index)
         for i, job in enumerate(self._populate_queue):
@@ -524,6 +589,7 @@ class MainWindow(QMainWindow):
             self._prog_status_lbl.setText(status_text)
             self._prog_container.show()
             self._global_progress.setRange(0, 0)
+            self._set_input_locked(False)
         else:
             self._prog_container.hide()
             # Reset progress bar for next time
@@ -542,4 +608,7 @@ class MainWindow(QMainWindow):
         self._file_cleanup.set_processing_state(is_processing)
         self._backup_restore.set_processing_state(is_processing)
         self._workflows.set_processing_state(is_processing)
+
+        if not is_processing:
+            self._set_input_locked(False)
 

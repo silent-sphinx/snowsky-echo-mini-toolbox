@@ -34,7 +34,7 @@ from ..utils.file_rename import (
     is_rename_track,
     rename_candidate_dict,
 )
-from .page_chrome import filter_toolbar, flow_steps, freeze_view, loading_page, page_header, PATH_COLUMN_WIDTH
+from .page_chrome import bind_search_field, filter_toolbar, flow_steps, freeze_view, loading_page, page_header, PATH_COLUMN_WIDTH
 from .stat_card import StatCard
 from .grouped_header_view import GroupedHeaderView
 
@@ -223,6 +223,7 @@ class FileRenameWidget(QWidget):
         self._table.verticalHeader().setVisible(False)
         self._table.verticalHeader().setDefaultSectionSize(28)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.setUniformRowHeights(True)
 
         header_view = GroupedHeaderView(self._table)
         self._table.setHorizontalHeader(header_view)
@@ -243,7 +244,7 @@ class FileRenameWidget(QWidget):
         layout.addWidget(self._stack, 1)
 
     def _connect_signals(self) -> None:
-        self._search_input.textChanged.connect(self._on_search_changed)
+        bind_search_field(self._search_input, self._on_search_changed)
         self._preset_combo.currentIndexChanged.connect(self._on_preset_changed)
         self._status_combo.currentTextChanged.connect(self._on_status_filter_changed)
         self._table.clicked.connect(self._on_table_clicked)
