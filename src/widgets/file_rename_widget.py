@@ -5,7 +5,6 @@ from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
-    QTableView,
     QStackedWidget,
     QLineEdit,
     QComboBox,
@@ -37,6 +36,11 @@ from ..utils.file_rename import (
 from .page_chrome import bind_search_field, filter_toolbar, flow_steps, freeze_view, loading_page, page_header, PATH_COLUMN_WIDTH
 from .stat_card import StatCard
 from .grouped_header_view import GroupedHeaderView
+from .table_select import (
+    SelectAllTableView,
+    add_select_all_rows_action,
+    wire_select_all_rows,
+)
 
 
 class HighlightDelegate(QStyledItemDelegate):
@@ -214,12 +218,12 @@ class FileRenameWidget(QWidget):
         self._guidance_lbl.setWordWrap(True)
         data_layout.addWidget(self._guidance_lbl)
 
-        self._table = QTableView()
+        self._table = SelectAllTableView()
         self._table.setModel(self._proxy_model)
         self._table.setAlternatingRowColors(True)
         self._table.setShowGrid(False)
-        self._table.setSelectionBehavior(QTableView.SelectRows)
-        self._table.setSelectionMode(QTableView.ExtendedSelection)
+        self._table.setSelectionBehavior(SelectAllTableView.SelectRows)
+        self._table.setSelectionMode(SelectAllTableView.ExtendedSelection)
         self._table.verticalHeader().setVisible(False)
         self._table.verticalHeader().setDefaultSectionSize(28)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -238,6 +242,7 @@ class FileRenameWidget(QWidget):
             self._table.setItemDelegateForColumn(col, self._delegate)
 
         data_layout.addWidget(self._table, 1)
+        wire_select_all_rows(self._table, toolbar, owns_menu=False)
 
         self._stack.addWidget(data_page)
         layout.addWidget(self._stack, 1)
@@ -371,14 +376,14 @@ class FileRenameWidget(QWidget):
         return None
 
     def _show_context_menu(self, pos) -> None:
-        index = self._table.indexAt(pos)
-        if not index.isValid():
-            return
-        text = self._proxy_model.data(index, Qt.DisplayRole)
-        if not text:
-            return
         menu = QMenu(self)
-        copy_action = menu.addAction("Copy")
+        index = self._table.indexAt(pos)
+        copy_action = None
+        text = self._proxy_model.data(index, Qt.DisplayRole) if index.isValid() else None
+        if text:
+            copy_action = menu.addAction("Copy")
+            menu.addSeparator()
+        add_select_all_rows_action(menu, self._table)
         action = menu.exec(self._table.viewport().mapToGlobal(pos))
         if action == copy_action:
             QApplication.clipboard().setText(str(text))

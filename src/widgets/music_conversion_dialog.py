@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -29,6 +28,7 @@ from ..utils.music_conversion_planner import (
     actionable_candidates,
     plan_conversions_for_tracks,
 )
+from .table_select import SelectAllTableWidget, attach_select_all_rows_header
 
 
 class MusicConversionDialog(QDialog):
@@ -100,12 +100,11 @@ class MusicConversionDialog(QDialog):
         self._summary_label = QLabel()
         self._summary_label.setWordWrap(True)
         self._summary_label.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 13px;")
-        layout.addWidget(self._summary_label)
 
-        self._preview_table = QTableWidget(0, 4)
+        self._preview_table = SelectAllTableWidget(0, 4)
         self._preview_table.setHorizontalHeaderLabels(["File", "Status", "Issues", "Action"])
-        self._preview_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self._preview_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._preview_table.setSelectionBehavior(SelectAllTableWidget.SelectRows)
+        self._preview_table.setEditTriggers(SelectAllTableWidget.NoEditTriggers)
         self._preview_table.setAlternatingRowColors(True)
         self._preview_table.verticalHeader().setVisible(False)
         self._preview_table.setMinimumHeight(220)
@@ -117,6 +116,7 @@ class MusicConversionDialog(QDialog):
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.Stretch)
         header.setSectionResizeMode(3, QHeaderView.Stretch)
+        attach_select_all_rows_header(layout, self._preview_table, self._summary_label)
         layout.addWidget(self._preview_table, 1)
 
         warning = QLabel(
