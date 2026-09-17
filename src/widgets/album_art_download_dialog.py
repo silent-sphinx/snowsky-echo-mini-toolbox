@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -35,6 +34,7 @@ from ..utils.album_art_download_planner import (
     SkippedTrack,
     download_candidates,
 )
+from .table_select import SelectAllTableWidget, attach_select_all_rows_header
 
 # Outer size of the preview frame; the 1px stylesheet border eats into it.
 PREVIEW_FRAME = 222
@@ -237,23 +237,22 @@ class AlbumArtDownloadDialog(QDialog):
 
         self._summary_label = WrappedLabel()
         self._summary_label.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 13px;")
-        layout.addWidget(self._summary_label)
 
         splitter = QSplitter(Qt.Vertical)
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(8)
 
-        self._table = QTableWidget(0, 7)
+        self._table = SelectAllTableWidget(0, 7)
         self._table.setHorizontalHeaderLabels(
             ["Apply", "Album Artist", "Album", "Year", "Tracks", "Search Status", "Selected Release"]
         )
-        self._table.setSelectionBehavior(QTableWidget.SelectRows)
-        self._table.setSelectionMode(QTableWidget.SingleSelection)
-        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._table.setSelectionBehavior(SelectAllTableWidget.SelectRows)
+        self._table.setSelectionMode(SelectAllTableWidget.SingleSelection)
+        self._table.setEditTriggers(SelectAllTableWidget.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setVisible(False)
         self._table.setMinimumHeight(MIN_TABLE_HEIGHT)
-        self._table.setHorizontalScrollMode(QTableWidget.ScrollPerPixel)
+        self._table.setHorizontalScrollMode(SelectAllTableWidget.ScrollPerPixel)
         self._table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(self.COL_APPLY, QHeaderView.ResizeToContents)
@@ -268,6 +267,7 @@ class AlbumArtDownloadDialog(QDialog):
         self._table.setColumnWidth(self.COL_STATUS, 170)
         self._table.itemSelectionChanged.connect(self._on_row_selected)
         self._table.itemChanged.connect(self._on_item_changed)
+        attach_select_all_rows_header(layout, self._table, self._summary_label)
         splitter.addWidget(self._table)
 
         splitter.addWidget(self._build_detail_panel())

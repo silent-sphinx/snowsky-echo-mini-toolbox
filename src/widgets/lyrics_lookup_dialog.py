@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -27,6 +26,7 @@ from PySide6.QtWidgets import (
 from ..theme import Colours, colours_for_status
 from ..utils.lyrics_lookup import LyricsLookupResult
 from ..utils.lyrics_planner import lookup_candidates_from_results
+from .table_select import SelectAllTableWidget, attach_select_all_rows_header
 
 
 class LyricsLookupDialog(QDialog):
@@ -107,12 +107,11 @@ class LyricsLookupDialog(QDialog):
         self._summary_label = QLabel()
         self._summary_label.setWordWrap(True)
         self._summary_label.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 13px;")
-        layout.addWidget(self._summary_label)
 
-        self._table = QTableWidget(0, 5)
+        self._table = SelectAllTableWidget(0, 5)
         self._table.setHorizontalHeaderLabels(["Apply", "File", "Lookup", "Source", "Preview"])
-        self._table.setSelectionBehavior(QTableWidget.SelectRows)
-        self._table.setSelectionMode(QTableWidget.SingleSelection)
+        self._table.setSelectionBehavior(SelectAllTableWidget.SelectRows)
+        self._table.setSelectionMode(SelectAllTableWidget.SingleSelection)
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setVisible(False)
         self._table.setMinimumHeight(220)
@@ -124,6 +123,7 @@ class LyricsLookupDialog(QDialog):
         header.setSectionResizeMode(self.COL_PREVIEW, QHeaderView.Stretch)
         self._table.itemChanged.connect(self._on_item_changed)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
+        attach_select_all_rows_header(layout, self._table, self._summary_label)
         layout.addWidget(self._table, 2)
 
         preview_label = QLabel("Lyrics preview")

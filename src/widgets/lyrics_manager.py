@@ -5,7 +5,6 @@ from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
-    QTableView,
     QLabel,
     QStackedWidget,
     QLineEdit,
@@ -38,6 +37,11 @@ from .lyrics_preview_dialog import LyricsPreviewDialog
 from .page_chrome import bind_search_field, filter_toolbar, freeze_view, loading_page, page_header, PATH_COLUMN_WIDTH
 from .stat_card import StatCard
 from .grouped_header_view import GroupedHeaderView
+from .table_select import (
+    SelectAllTableView,
+    add_select_all_rows_action,
+    wire_select_all_rows,
+)
 
 
 class HighlightDelegate(QStyledItemDelegate):
@@ -176,12 +180,12 @@ class LyricsManagerWidget(QWidget):
         stats_layout.addWidget(self._stat_errors)
         data_layout.addLayout(stats_layout)
 
-        self._table = QTableView()
+        self._table = SelectAllTableView()
         self._table.setModel(self._proxy_model)
         self._table.setAlternatingRowColors(True)
         self._table.setShowGrid(False)
-        self._table.setSelectionBehavior(QTableView.SelectRows)
-        self._table.setSelectionMode(QTableView.ExtendedSelection)
+        self._table.setSelectionBehavior(SelectAllTableView.SelectRows)
+        self._table.setSelectionMode(SelectAllTableView.ExtendedSelection)
         self._table.verticalHeader().setVisible(False)
         self._table.verticalHeader().setDefaultSectionSize(28)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -200,6 +204,7 @@ class LyricsManagerWidget(QWidget):
             self._table.setItemDelegateForColumn(col, self._delegate)
 
         data_layout.addWidget(self._table, 1)
+        wire_select_all_rows(self._table, toolbar, owns_menu=False)
 
         self._stack.addWidget(data_page)
         layout.addWidget(self._stack, 1)
@@ -265,16 +270,16 @@ class LyricsManagerWidget(QWidget):
             self._show_preview_for_track(track)
 
     def _show_context_menu(self, pos) -> None:
-        index = self._table.indexAt(pos)
-        if not index.isValid():
-            return
-        track = self._track_at_proxy_row(index.row())
-        if track is None:
-            return
         menu = QMenu(self)
-        preview_action = menu.addAction("Preview Full Lyrics")
+        index = self._table.indexAt(pos)
+        preview_action = None
+        track = self._track_at_proxy_row(index.row()) if index.isValid() else None
+        if track is not None:
+            preview_action = menu.addAction("Preview Full Lyrics")
+            menu.addSeparator()
+        add_select_all_rows_action(menu, self._table)
         action = menu.exec(self._table.viewport().mapToGlobal(pos))
-        if action == preview_action:
+        if action == preview_action and track is not None:
             self._show_preview_for_track(track)
 
     def _open_convert_dialog(self) -> None:

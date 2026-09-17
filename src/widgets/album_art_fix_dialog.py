@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -31,6 +30,7 @@ from ..utils.album_art_planner import (
     plan_art_fixes_for_tracks,
 )
 from ..utils.album_art_validation import MAX_ART_DIMENSION
+from .table_select import SelectAllTableWidget, attach_select_all_rows_header
 
 
 class AlbumArtFixDialog(QDialog):
@@ -101,12 +101,11 @@ class AlbumArtFixDialog(QDialog):
         self._summary_label = QLabel()
         self._summary_label.setWordWrap(True)
         self._summary_label.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 13px;")
-        layout.addWidget(self._summary_label)
 
-        self._preview_table = QTableWidget(0, 4)
+        self._preview_table = SelectAllTableWidget(0, 4)
         self._preview_table.setHorizontalHeaderLabels(["File", "Status", "Issues", "Action"])
-        self._preview_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self._preview_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._preview_table.setSelectionBehavior(SelectAllTableWidget.SelectRows)
+        self._preview_table.setEditTriggers(SelectAllTableWidget.NoEditTriggers)
         self._preview_table.setAlternatingRowColors(True)
         self._preview_table.verticalHeader().setVisible(False)
         self._preview_table.setMinimumHeight(220)
@@ -118,6 +117,7 @@ class AlbumArtFixDialog(QDialog):
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.Stretch)
         header.setSectionResizeMode(3, QHeaderView.Stretch)
+        attach_select_all_rows_header(layout, self._preview_table, self._summary_label)
         layout.addWidget(self._preview_table, 1)
 
         warning = QLabel(

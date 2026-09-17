@@ -10,7 +10,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QTreeView,
     QTabWidget,
-    QTableWidget,
     QTableWidgetItem,
     QHeaderView,
     QLabel,
@@ -39,6 +38,7 @@ from ..utils.file_rename import paths_are_same_file
 from ..threads.bulk_metadata import BulkMetadataWorker
 from .bulk_metadata_dialog import BulkMetadataDialog
 from .page_chrome import freeze_view, keep_ui_alive
+from .table_select import SelectAllTableWidget, install_select_all_rows
 
 _NON_MUSIC_EXTENSIONS = {".lrc", ".cue"}
 
@@ -117,13 +117,15 @@ class StreamsDialog(QDialog):
         
         layout = QVBoxLayout(self)
         
-        self.table = QTableWidget()
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table = SelectAllTableWidget()
+        self.table.setEditTriggers(SelectAllTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
+        self.table.setSelectionBehavior(SelectAllTableWidget.SelectRows)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionsClickable(True)
         self.table.horizontalHeader().setSortIndicatorShown(True)
+        install_select_all_rows(self.table)
         layout.addWidget(self.table)
         
         try:
@@ -261,11 +263,12 @@ class MusicBrowserWidget(QWidget):
         props_lyt = QVBoxLayout(self._props_tab)
         props_lyt.setContentsMargins(8, 8, 8, 8)
         
-        self._props_table = QTableWidget(0, 2)
+        self._props_table = SelectAllTableWidget(0, 2)
         self._props_table.setHorizontalHeaderLabels(["Property", "Value"])
         self._props_table.verticalHeader().setVisible(False)
         self._props_table.setAlternatingRowColors(True)
-        self._props_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._props_table.setEditTriggers(SelectAllTableWidget.NoEditTriggers)
+        self._props_table.setSelectionBehavior(SelectAllTableWidget.SelectRows)
         self._props_table.setSortingEnabled(True)
         self._props_table.horizontalHeader().setStretchLastSection(True)
         self._props_table.horizontalHeader().setSectionsClickable(True)
@@ -276,6 +279,7 @@ class MusicBrowserWidget(QWidget):
         fm = self._props_table.horizontalHeader().fontMetrics()
         min_width = fm.horizontalAdvance("PROPERTY") + 40 # 40px padding buffer
         self._props_table.horizontalHeader().setMinimumSectionSize(min_width)
+        install_select_all_rows(self._props_table)
         
         props_lyt.addWidget(self._props_table)
         
@@ -284,13 +288,13 @@ class MusicBrowserWidget(QWidget):
         meta_lyt = QVBoxLayout(self._meta_tab)
         meta_lyt.setContentsMargins(8, 8, 8, 8)
         
-        self._meta_table = QTableWidget(0, 3)
+        self._meta_table = SelectAllTableWidget(0, 3)
         self._meta_table.setHorizontalHeaderLabels(["Tag", "Value", ""])
         self._meta_table.verticalHeader().setVisible(False)
         self._meta_table.setAlternatingRowColors(True)
-        self._meta_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._meta_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self._meta_table.setSelectionMode(QTableWidget.SingleSelection)
+        self._meta_table.setEditTriggers(SelectAllTableWidget.NoEditTriggers)
+        self._meta_table.setSelectionBehavior(SelectAllTableWidget.SelectRows)
+        self._meta_table.setSelectionMode(SelectAllTableWidget.ExtendedSelection)
         meta_header = self._meta_table.horizontalHeader()
         meta_header.setStretchLastSection(False)
         meta_header.setSectionResizeMode(0, QHeaderView.Interactive)
@@ -304,6 +308,7 @@ class MusicBrowserWidget(QWidget):
         
         self._meta_delegate = HighlightDelegate(self._meta_table)
         self._meta_table.setItemDelegate(self._meta_delegate)
+        install_select_all_rows(self._meta_table)
         
         meta_lyt.addWidget(self._meta_table)
         
@@ -335,16 +340,18 @@ class MusicBrowserWidget(QWidget):
         self._art_image_lbl.setStyleSheet(f"color: {Colours.TEXT_SECONDARY};")
         self._art_image_lbl.setMinimumHeight(250)
         
-        self._art_table = QTableWidget(0, 2)
+        self._art_table = SelectAllTableWidget(0, 2)
         self._art_table.setHorizontalHeaderLabels(["Property", "Value"])
         self._art_table.verticalHeader().setVisible(False)
         self._art_table.setAlternatingRowColors(True)
-        self._art_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._art_table.setEditTriggers(SelectAllTableWidget.NoEditTriggers)
+        self._art_table.setSelectionBehavior(SelectAllTableWidget.SelectRows)
         self._art_table.setSortingEnabled(True)
         self._art_table.horizontalHeader().setStretchLastSection(True)
         self._art_table.horizontalHeader().setSectionsClickable(True)
         self._art_table.horizontalHeader().setSortIndicatorShown(True)
         self._art_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        install_select_all_rows(self._art_table)
         
         art_lyt.addWidget(self._art_image_lbl, stretch=1)
         art_lyt.addWidget(self._art_table, stretch=0)
@@ -1094,7 +1101,7 @@ class MusicBrowserWidget(QWidget):
             self._lyrics_text.setPlainText("No embedded lyrics found.")
         self._lyrics_text.document().setModified(False)
             
-    def _fill_kv_table(self, table: QTableWidget, rows: list[tuple[str, str]]) -> None:
+    def _fill_kv_table(self, table: SelectAllTableWidget, rows: list[tuple[str, str]]) -> None:
         """Fill a two-column property table without scrambling rows under an active sort."""
         table.setSortingEnabled(False)
         table.setRowCount(len(rows))
