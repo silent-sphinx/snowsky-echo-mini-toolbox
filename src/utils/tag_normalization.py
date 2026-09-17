@@ -15,8 +15,6 @@ PLACEHOLDER_VALUES = {
     "unknown artist",
     "unknown album",
     "unknown album artist",
-    "untitled",
-    "various",
     "va",
     "n/a",
     "none",
