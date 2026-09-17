@@ -2,8 +2,8 @@ import os
 import subprocess
 import json
 from pathlib import Path
-from PySide6.QtCore import Qt, QThread, Slot, Signal
-from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush, QPixmap, QImage
+from PySide6.QtCore import Qt, QThread, Slot, Signal, QEvent, QRect
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush, QPixmap, QImage, QMouseEvent
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -183,6 +183,7 @@ class MusicBrowserWidget(QWidget):
         super().__init__(parent)
         self._data_model: DriveDataModel = None
         self._is_updating_checks = False
+        self._check_press_index = None
         self._multi_tracks: list[TrackMetadata] = []
         self._bulk_thread: QThread | None = None
         self._bulk_worker: BulkMetadataWorker | None = None
@@ -244,6 +245,7 @@ class MusicBrowserWidget(QWidget):
         self._tree.setModel(self._tree_model)
         self._tree.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self._tree_model.itemChanged.connect(self._on_item_changed)
+        self._tree.viewport().installEventFilter(self)
         
         tree_layout.addWidget(self._tree)
         
@@ -604,7 +606,7 @@ class MusicBrowserWidget(QWidget):
             key=lambda x: (x[1] is None, x[0].lower())
         )
         dir_icon = QApplication.style().standardIcon(QStyle.SP_DirIcon)
-        rows: list[QStandardItem] = []
+        created: list[tuple[QStandardItem, dict | None, str]] = []
         
         for name, sub_dict in sorted_items:
             full_path = os.path.join(current_path, name)
@@ -612,18 +614,24 @@ class MusicBrowserWidget(QWidget):
             item.setEditable(False)
             item.setData(full_path, Qt.UserRole)
             item.setCheckable(True)
-            
+            # Qt will not toggle a checkbox until CheckStateRole is actually set.
+            item.setCheckState(Qt.Unchecked)
             if sub_dict is not None:
                 item.setIcon(dir_icon)
+            created.append((item, sub_dict, full_path))
+
+        if created:
+            # Attach siblings to a parent that is already in the model, then
+            # recurse. Building children first leaves nested items with model=None,
+            # so checkbox clicks never emit dataChanged / itemChanged.
+            parent_item.appendRows([item for item, _, _ in created])
+
+        for item, sub_dict, full_path in created:
+            if sub_dict is not None:
                 self._build_tree(sub_dict, item, full_path)
-            
-            rows.append(item)
             self._tree_items_built += 1
             if self._tree_items_built % 150 == 0:
                 keep_ui_alive()
-
-        if rows:
-            parent_item.appendRows(rows)
 
     def _music_tracks(self, tracks: list[TrackMetadata]) -> list[TrackMetadata]:
         return [
@@ -631,17 +639,26 @@ class MusicBrowserWidget(QWidget):
             if track.extension.lower() not in _NON_MUSIC_EXTENSIONS
         ]
 
+    def _item_is_checked(self, item: QStandardItem) -> bool:
+        state = item.checkState()
+        return state in (Qt.Checked, Qt.CheckState.Checked, 2)
+
     def _tracks_from_item(self, item: QStandardItem, seen: set[str]) -> list[TrackMetadata]:
+        """This file, or every descendant file under a ticked folder."""
         if not item or not self._data_model:
             return []
+        results: list[TrackMetadata] = []
         filepath = item.data(Qt.UserRole)
-        if not filepath or filepath in seen:
-            return []
-        meta = self._data_model.get_track(filepath)
-        if not meta:
-            return []
-        seen.add(filepath)
-        return [meta]
+        if filepath and filepath not in seen:
+            meta = self._data_model.get_track(filepath)
+            if meta:
+                seen.add(filepath)
+                results.append(meta)
+        for row in range(item.rowCount()):
+            child = item.child(row)
+            if child:
+                results.extend(self._tracks_from_item(child, seen))
+        return results
 
     def _highlighted_file_tracks(self) -> list[TrackMetadata]:
         """Files in the tree highlight selection (click / Shift / Cmd)."""
@@ -673,25 +690,22 @@ class MusicBrowserWidget(QWidget):
                 item = parent.child(row)
                 if not item:
                     continue
-                if item.checkState() == Qt.Checked:
+                if self._item_is_checked(item):
                     tracks.extend(self._tracks_from_item(item, seen))
-                walk(item)
+                else:
+                    walk(item)
 
         walk(self._tree_model.invisibleRootItem())
         return tracks
 
     def _refresh_details_pane(self) -> None:
-        checked = self._checked_file_tracks()
-        highlighted = self._highlighted_file_tracks()
-        if len(checked) > 1:
-            self._show_multi_select(checked)
+        chosen = self._checked_file_tracks() or self._highlighted_file_tracks()
+        if len(chosen) > 1:
+            self._show_multi_select(chosen)
             return
-        if len(highlighted) > 1:
-            self._show_multi_select(highlighted)
-            return
-        if len(highlighted) == 1:
+        if len(chosen) == 1:
             self._details_stack.setCurrentIndex(1)
-            self._populate_details(highlighted[0])
+            self._populate_details(chosen[0])
             return
         self._show_blank_details()
 
@@ -892,24 +906,97 @@ class MusicBrowserWidget(QWidget):
         QMessageBox.critical(self, "Bulk edit failed", message)
 
     
+    def eventFilter(self, obj, event):
+        """Toggle tree checkboxes even when QSS misaligns the indicator hit-test rect."""
+        if obj is self._tree.viewport() and isinstance(event, QMouseEvent):
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                index = self._tree.indexAt(event.position().toPoint())
+                if index.isValid() and self._is_checkbox_click(index, event.position().toPoint()):
+                    self._check_press_index = index
+                else:
+                    self._check_press_index = None
+            elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                press_index = self._check_press_index
+                self._check_press_index = None
+                pos = event.position().toPoint()
+                index = self._tree.indexAt(pos)
+                if (
+                    press_index is not None
+                    and index.isValid()
+                    and index == press_index
+                    and self._is_checkbox_click(index, pos)
+                ):
+                    self._toggle_item_check(index)
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _is_checkbox_click(self, index, pos) -> bool:
+        item = self._tree_model.itemFromIndex(index)
+        if not item or not item.isCheckable():
+            return False
+        vr = self._tree.visualRect(index)
+        if not vr.isValid():
+            return False
+        # Wider than the 14px QSS box: stylesheet hit-testing is often empty/offset.
+        return QRect(vr.x(), vr.y(), 22, vr.height()).contains(pos)
+
+    def _toggle_item_check(self, index) -> None:
+        item = self._tree_model.itemFromIndex(index)
+        if not item or not item.isCheckable():
+            return
+        item.setCheckState(Qt.Unchecked if self._item_is_checked(item) else Qt.Checked)
+
     def _on_item_changed(self, item: QStandardItem) -> None:
         if self._is_updating_checks or not item.isCheckable():
             return
-            
+
+        state = item.checkState()
+        partial = state in (Qt.PartiallyChecked, Qt.CheckState.PartiallyChecked, 1)
         self._is_updating_checks = True
         try:
-            state = item.checkState()
-            self._set_check_state_recursive(item, state)
+            if not partial:
+                self._set_check_state_recursive(item, state)
+            self._update_ancestor_checks(item)
+            if self._item_is_checked(item) and item.rowCount() > 0:
+                self._tree.expand(item.index())
         finally:
             self._is_updating_checks = False
         self._refresh_details_pane()
-            
+
     def _set_check_state_recursive(self, item: QStandardItem, state: Qt.CheckState) -> None:
         for row in range(item.rowCount()):
             child = item.child(row)
             if child and child.isCheckable():
                 child.setCheckState(state)
                 self._set_check_state_recursive(child, state)
+
+    def _update_ancestor_checks(self, item: QStandardItem) -> None:
+        parent = item.parent()
+        while parent is not None:
+            if parent.isCheckable():
+                parent.setCheckState(self._aggregate_child_state(parent))
+            parent = parent.parent()
+
+    def _aggregate_child_state(self, item: QStandardItem) -> Qt.CheckState:
+        checked = 0
+        unchecked = 0
+        for row in range(item.rowCount()):
+            child = item.child(row)
+            if not child or not child.isCheckable():
+                continue
+            state = child.checkState()
+            if state in (Qt.Checked, Qt.CheckState.Checked, 2):
+                checked += 1
+            elif state in (Qt.Unchecked, Qt.CheckState.Unchecked, 0):
+                unchecked += 1
+            else:
+                return Qt.PartiallyChecked
+        total = checked + unchecked
+        if total == 0 or unchecked == total:
+            return Qt.Unchecked
+        if checked == total:
+            return Qt.Checked
+        return Qt.PartiallyChecked
                 
     def _populate_details(self, meta: TrackMetadata) -> None:
         self._clear_details()
