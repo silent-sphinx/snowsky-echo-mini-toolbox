@@ -156,15 +156,21 @@ class DriveSelectorPanel(QFrame):
         title.setStyleSheet(f"color: {Colours.TEXT_PRIMARY}; font-size: 22px; font-weight: 800; letter-spacing: -0.5px;")
         layout.addWidget(title)
 
+        copy = QVBoxLayout()
+        copy.setContentsMargins(0, 0, 0, 0)
+        copy.setSpacing(2)
+
         subtitle = QLabel("Choose a connected drive or folder to scan for metadata.")
         subtitle.setStyleSheet(f"color: {Colours.TEXT_SECONDARY}; font-size: 13px;")
         subtitle.setWordWrap(True)
-        layout.addWidget(subtitle)
+        copy.addWidget(subtitle)
 
-        tip = QLabel("Plug the SD card in directly to your pc, it's much faster than the Echo Mini.")
+        tip = QLabel("For faster scanning, insert the SD card into this computer instead of the Echo Mini.")
         tip.setStyleSheet(f"color: {Colours.TEXT_TERTIARY}; font-size: 12px;")
         tip.setWordWrap(True)
-        layout.addWidget(tip)
+        copy.addWidget(tip)
+
+        layout.addLayout(copy)
 
         # ── Stacked Widget (List vs Empty State) ────────────────
         self._stack = QStackedWidget()
