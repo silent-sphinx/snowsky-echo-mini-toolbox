@@ -161,6 +161,11 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
                 meta.album = coerce_tag_text(audio.tags.get("TALB", audio.get("album", [meta.album])[0]), meta.album)
             except Exception:
                 pass
+
+            try:
+                meta.track_num = coerce_tag_text(audio.tags.get("TRCK", ""))
+            except Exception:
+                pass
             
             # ID3 checks for art (lyrics are evaluated separately)
             if hasattr(audio.tags, "getall"):
