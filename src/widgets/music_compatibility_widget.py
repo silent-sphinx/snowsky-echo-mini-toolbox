@@ -169,10 +169,10 @@ class MusicCompatibilityWidget(QWidget):
         header_view.setStretchLastSection(True)
         self._table.setSortingEnabled(True)
         self._table.sortByColumn(-1, Qt.AscendingOrder)
-        header_view.add_group("Track Info", 1, 3)
-        header_view.add_group("Status", 4, 5)
-        header_view.add_group("Properties", 6, 14)
-        header_view.add_group("Validation", 15, 21)
+        header_view.add_group("Track Info", 1, 4)
+        header_view.add_group("Status", 5, 6)
+        header_view.add_group("Properties", 7, 15)
+        header_view.add_group("Validation", 16, 22)
 
         self._delegate = HighlightDelegate(self._table)
         for col in range(1, CompColumn.COUNT):
@@ -511,6 +511,7 @@ class MusicCompatibilityWidget(QWidget):
             CompColumn.TITLE: 200,
             CompColumn.ARTIST: 150,
             CompColumn.ALBUM: 150,
+            CompColumn.TRACK_NUM: 80,
             CompColumn.STATUS: 100,
             CompColumn.REASON: 300,
             CompColumn.EXTENSION: 80,

@@ -16,37 +16,38 @@ class CompColumn:
     TITLE = 1
     ARTIST = 2
     ALBUM = 3
+    TRACK_NUM = 4
     # Status
-    STATUS = 4
-    REASON = 5
+    STATUS = 5
+    REASON = 6
     # Properties
-    EXTENSION = 6
-    CODEC = 7
-    SAMPLE_RATE = 8
-    BIT_DEPTH = 9
-    CHANNELS = 10
-    DSD = 11
-    BLOCK_SIZE = 12
-    STREAMS = 13
-    EQ = 14
+    EXTENSION = 7
+    CODEC = 8
+    SAMPLE_RATE = 9
+    BIT_DEPTH = 10
+    CHANNELS = 11
+    DSD = 12
+    BLOCK_SIZE = 13
+    STREAMS = 14
+    EQ = 15
     # Validation
-    CHANNEL_COMPAT = 15
-    WAV_CODEC = 16
-    DSD_BITDEPTH = 17
-    TAG_ENCODING = 18
-    TAG_LENGTH = 19
-    FILENAME = 20
-    METADATA = 21
+    CHANNEL_COMPAT = 16
+    WAV_CODEC = 17
+    DSD_BITDEPTH = 18
+    TAG_ENCODING = 19
+    TAG_LENGTH = 20
+    FILENAME = 21
+    METADATA = 22
     # Location
-    FILE = 22
+    FILE = 23
     
-    COUNT = 23
+    COUNT = 24
     
     HEADERS = [
-        "", "Title", "Artist", "Album", 
-        "Status", "Reason", 
+        "", "Title", "Artist", "Album", "Track No",
+        "Status", "Reason",
         "Extension", "Codec", "Sample Rate", "Bit Depth", "Channels", "DSD", "Block Size", "Streams", "EQ",
-        "Ch. Compat", "WAV Codec", "DSD Bit Depth", "Tag Encoding", "Tag Length", "File Name", "Metadata", 
+        "Ch. Compat", "WAV Codec", "DSD Bit Depth", "Tag Encoding", "Tag Length", "File Name", "Metadata",
         "File Path"
     ]
 
@@ -80,6 +81,7 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
             self._root_path,
             track.comp_status,
             track.comp_reason,
+            track.track_num,
             track.comp_eq,
             track.comp_codec,
             track.comp_sample_rate,
@@ -179,6 +181,7 @@ class MusicCompatibilityTableModel(QAbstractTableModel):
             elif col == CompColumn.TITLE: return track.title
             elif col == CompColumn.ARTIST: return track.artist
             elif col == CompColumn.ALBUM: return track.album
+            elif col == CompColumn.TRACK_NUM: return track.track_num
             elif col == CompColumn.STATUS: return track.comp_status
             elif col == CompColumn.REASON: return track.comp_reason
             elif col == CompColumn.EQ: return track.comp_eq
