@@ -8,30 +8,53 @@ from typing import Mapping
 
 import mutagen
 from mutagen.easyid3 import EasyID3
+from mutagen.easymp4 import EasyMP4, EasyMP4Tags
 from mutagen.id3 import ID3, ID3NoHeaderError, TXXX, Encoding, Frames
+from mutagen.mp4 import MP4, MP4FreeForm
 
-# EasyID3 / Vorbis keys and the raw frames the scanner may have stored.
+# EasyID3 / Vorbis keys and the raw ID3 frames / MP4 atoms the scanner may have stored.
 TAG_KEY_ALIASES: dict[str, tuple[str, ...]] = {
-    "title": ("title", "tit2"),
-    "artist": ("artist", "tpe1"),
-    "album": ("album", "talb"),
-    "albumartist": ("albumartist", "album artist", "album_artist", "tpe2"),
-    "genre": ("genre", "tcon"),
-    "date": ("date", "year", "tdrc", "tyer"),
-    "tracknumber": ("tracknumber", "track", "trck"),
-    "discnumber": ("discnumber", "disc", "tpos"),
-    "composer": ("composer", "tcom"),
+    "title": ("title", "tit2", "\xa9nam"),
+    "artist": ("artist", "tpe1", "\xa9art"),
+    "album": ("album", "talb", "\xa9alb"),
+    "albumartist": ("albumartist", "album artist", "album_artist", "tpe2", "aart"),
+    "genre": ("genre", "tcon", "\xa9gen"),
+    "date": ("date", "year", "tdrc", "tyer", "\xa9day"),
+    "tracknumber": ("tracknumber", "track", "trck", "trkn"),
+    "discnumber": ("discnumber", "disc", "tpos", "disk"),
+    "composer": ("composer", "tcom", "\xa9wrt"),
 }
+
+_ID3_FRAME_FOR_KEY = {
+    "title": "TIT2",
+    "artist": "TPE1",
+    "album": "TALB",
+    "albumartist": "TPE2",
+    "genre": "TCON",
+    "date": "TDRC",
+    "tracknumber": "TRCK",
+    "discnumber": "TPOS",
+    "composer": "TCOM",
+}
+
+_MP4_FREEFORM_PREFIX = "----:com.apple.iTunes:"
+
+
+def _canonical_tag_key(key: str) -> str | None:
+    lowered = key.lower()
+    if lowered in TAG_KEY_ALIASES:
+        return lowered
+    for canonical, aliases in TAG_KEY_ALIASES.items():
+        if lowered in aliases:
+            return canonical
+    return None
 
 
 def aliases_for_tag_key(key: str) -> tuple[str, ...]:
-    lowered = key.lower()
-    if lowered in TAG_KEY_ALIASES:
-        return TAG_KEY_ALIASES[lowered]
-    for aliases in TAG_KEY_ALIASES.values():
-        if lowered in {alias.lower() for alias in aliases}:
-            return aliases
-    return (lowered,)
+    canonical = _canonical_tag_key(key)
+    if canonical is not None:
+        return TAG_KEY_ALIASES[canonical]
+    return (key.lower(),)
 
 
 def _easy_key_for_tag(key: str, valid_easy_keys) -> str | None:
@@ -91,11 +114,17 @@ def _apply_raw_id3_tags(filepath: str, tags: Mapping[str, str | None]) -> None:
             return
         id3 = ID3()
 
+    _apply_id3_frames(id3, tags)
+    id3.save(filepath, v2_version=3)
+
+
+def _apply_id3_frames(id3: ID3, tags: Mapping[str, str | None]) -> None:
     written_aliases: set[str] = set()
     for key, val in tags.items():
         if val is None:
             continue
-        _set_raw_id3_tag(id3, key, val)
+        frame_key = _ID3_FRAME_FOR_KEY.get(_canonical_tag_key(key) or "", key)
+        _set_raw_id3_tag(id3, frame_key, val)
         written_aliases.update(alias.lower() for alias in aliases_for_tag_key(key))
         written_aliases.add(f"txxx:{key.lower()}")
 
@@ -109,7 +138,45 @@ def _apply_raw_id3_tags(filepath: str, tags: Mapping[str, str | None]) -> None:
         _delete_tag_from_mapping(id3, key)
         _delete_tag_from_mapping(id3, f"TXXX:{key}")
 
-    id3.save(filepath, v2_version=3)
+
+def _apply_mp4_tags(filepath: str, tags: Mapping[str, str | None]) -> None:
+    """Write MP4 atoms via EasyMP4; keys it cannot map become iTunes freeform atoms."""
+    easy = EasyMP4(filepath)
+    if easy.tags is None:
+        easy.add_tags()
+    valid = EasyMP4Tags.Get.keys()
+    unmapped: dict[str, str | None] = {}
+    written: set[str] = set()
+
+    for key, val in tags.items():
+        easy_key = _easy_key_for_tag(key, valid)
+        if easy_key is None:
+            unmapped[key] = val
+        elif val is not None:
+            easy[easy_key] = [val]
+            written.add(easy_key)
+
+    for key, val in tags.items():
+        easy_key = _easy_key_for_tag(key, valid)
+        if val is None and easy_key is not None and easy_key not in written:
+            try:
+                del easy[easy_key]
+            except KeyError:
+                pass
+    easy.save()
+
+    if not unmapped:
+        return
+    mp4 = MP4(filepath)
+    if mp4.tags is None:
+        mp4.add_tags()
+    for key, val in unmapped.items():
+        atom = f"{_MP4_FREEFORM_PREFIX}{key}"
+        if val is None:
+            mp4.tags.pop(atom, None)
+        else:
+            mp4.tags[atom] = [MP4FreeForm(val.encode("utf-8"))]
+    mp4.save()
 
 
 def _apply_easy_id3(easy: EasyID3, tags: Mapping[str, str | None]) -> list[tuple[str, str | None]]:
@@ -194,11 +261,21 @@ def save_metadata(filepath: str, tags: Mapping[str, str | None]) -> tuple[bool, 
                     _apply_raw_id3_tags(filepath, dict(unmapped))
                 return True, ""
 
+        if isinstance(audio, MP4):
+            _apply_mp4_tags(filepath, tags)
+            return True, ""
+
         if audio.tags is None:
             if only_deletes:
                 return True, ""
             if not _ensure_tag_structure(audio):
                 return False, "No tag structure found in file."
+
+        # WAV, AIFF, DSF and similar containers carry an embedded ID3 tag.
+        if isinstance(audio.tags, ID3):
+            _apply_id3_frames(audio.tags, tags)
+            audio.save(v2_version=3)
+            return True, ""
 
         written_aliases: set[str] = set()
         for key, val in tags.items():
