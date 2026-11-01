@@ -169,19 +169,31 @@ class DriveDataModel:
 
     def move_track(self, old_path: str, new_path: str) -> Optional[TrackMetadata]:
         """Re-key a track after it was renamed on disk."""
-        track = self.tracks.pop(old_path, None)
-        if track is None:
-            return None
-        track.filepath = new_path
-        track.filename = os.path.basename(new_path)
-        _, ext = os.path.splitext(track.filename)
-        track.extension = ext.lower()
-        try:
-            track.size_bytes = os.path.getsize(new_path)
-        except OSError:
-            pass
-        self.tracks[new_path] = track
-        return track
+        return self.move_tracks([(old_path, new_path)]).get(new_path)
+
+    def move_tracks(self, moves: list[tuple[str, str]]) -> Dict[str, TrackMetadata]:
+        """Re-key several tracks at once so chained or swapped renames do not collide."""
+        popped: list[tuple[str, TrackMetadata]] = []
+        for old_path, new_path in moves:
+            track = self.tracks.pop(old_path, None)
+            if track is not None:
+                popped.append((new_path, track))
+
+        moved: Dict[str, TrackMetadata] = {}
+        for new_path, track in popped:
+            track.filepath = new_path
+            track.filename = os.path.basename(new_path)
+            _, ext = os.path.splitext(track.filename)
+            track.extension = ext.lower()
+            try:
+                new_size = os.path.getsize(new_path)
+                self.total_size_bytes = max(0, self.total_size_bytes + new_size - track.size_bytes)
+                track.size_bytes = new_size
+            except OSError:
+                pass
+            self.tracks[new_path] = track
+            moved[new_path] = track
+        return moved
 
     def remove_track(self, filepath: str) -> Optional[TrackMetadata]:
         """Drop a track after it was deleted on disk."""

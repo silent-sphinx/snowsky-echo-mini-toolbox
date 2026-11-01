@@ -518,17 +518,21 @@ class FileRenameWidget(QWidget):
         if self._data_model is None or not processed_paths:
             return
 
+        moves: list[tuple[str, str]] = []
         for entry in processed_paths:
-            old_path = entry.get("old_path", "")
-            new_path = entry.get("new_path", "")
-            if old_path and new_path and old_path != new_path:
-                self._data_model.move_track(old_path, new_path)
+            for old_key, new_key in (("old_path", "new_path"), ("old_lrc", "new_lrc")):
+                old = entry.get(old_key, "")
+                new = entry.get(new_key, "")
+                if old and new and old != new:
+                    moves.append((old, new))
+        moved = self._data_model.move_tracks(moves)
 
+        for entry in processed_paths:
+            new_path = entry.get("new_path", "")
             old_lrc = entry.get("old_lrc", "")
             new_lrc = entry.get("new_lrc", "")
             if old_lrc and new_lrc and old_lrc != new_lrc:
-                moved = self._data_model.move_track(old_lrc, new_lrc)
-                if moved is None:
+                if new_lrc not in moved:
                     lrc = Path(new_lrc)
                     if lrc.exists():
                         try:

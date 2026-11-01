@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, QTimer, QModelIndex, Slot
@@ -362,32 +361,17 @@ class MusicCompatibilityWidget(QWidget):
         root_path = Path(self._data_model.root_path)
         changed = False
 
-        for entry in processed_paths:
-            old_path = entry.get("old_path", "")
-            new_path = entry.get("new_path", "")
-            if not old_path or not new_path:
-                continue
+        pairs = [
+            (entry.get("old_path", ""), entry.get("new_path", ""))
+            for entry in processed_paths
+        ]
+        pairs = [(old, new) for old, new in pairs if old and new]
+        self._data_model.move_tracks([(old, new) for old, new in pairs if old != new])
 
-            old_key = old_path
-            track = self._data_model.tracks.get(old_key)
-            if track is None and old_path != new_path:
-                track = self._data_model.tracks.get(new_path)
-
+        for _, new_path in pairs:
+            track = self._data_model.tracks.get(new_path)
             if track is None:
                 continue
-
-            if old_path != new_path:
-                self._data_model.tracks.pop(old_key, None)
-                track.filepath = new_path
-                track.filename = os.path.basename(new_path)
-                _, ext = os.path.splitext(track.filename)
-                track.extension = ext.lower()
-                try:
-                    track.size_bytes = os.path.getsize(new_path)
-                except OSError:
-                    pass
-                self._data_model.tracks[new_path] = track
-                changed = True
 
             comp_result = evaluate_music_file(Path(new_path), root_path)
             apply_compatibility_result(track, comp_result)
