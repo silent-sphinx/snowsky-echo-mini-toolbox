@@ -396,7 +396,7 @@ class MusicConversionWorker(QObject):
                 if not should_convert:
                     converted += 1
                     self._processed_paths.append(
-                        {"old_path": str(source_path), "new_path": str(source_path)}
+                        {"old_path": str(source_input_path), "new_path": str(source_input_path)}
                     )
                     self.progress.emit(index, total, detail_label)
                     continue
@@ -459,8 +459,12 @@ class MusicConversionWorker(QObject):
                     if source_path.exists() and not paths_are_same_file(source_path, output_path):
                         source_path.unlink()
 
+                    # Report paths as the caller passed them so model keys still match.
                     self._processed_paths.append(
-                        {"old_path": str(source_path), "new_path": str(output_path)}
+                        {
+                            "old_path": str(source_input_path),
+                            "new_path": str(source_input_path.with_name(output_path.name)),
+                        }
                     )
                     converted += 1
                 except Exception as exc:
