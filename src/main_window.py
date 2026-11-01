@@ -143,6 +143,7 @@ class MainWindow(QMainWindow):
 
         # Index 2: Music Compatibility
         self._music_compatibility = MusicCompatibilityWidget()
+        self._music_compatibility.library_changed.connect(self._on_library_changed)
         self._tabs.addTab(self._music_compatibility, "Music Compatibility")
         
         # Index 3: Metadata Browser

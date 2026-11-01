@@ -1,6 +1,8 @@
+import logging
+import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QTimer, QModelIndex, Slot
+from PySide6.QtCore import Qt, QThread, QTimer, QModelIndex, Signal, Slot
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -25,15 +27,16 @@ from ..models.music_compatibility_model import (
     MusicCompatibilityFilterProxyModel,
     CompColumn,
 )
+from ..threads.drive_scanner import extract_metadata_worker
 from ..threads.music_conversion import MusicConversionWorker
-from ..utils.music_compatibility import _resolve_ffmpeg_executable, evaluate_music_file
-from ..utils.music_conversion_planner import apply_compatibility_result
+from ..utils.music_compatibility import _resolve_ffmpeg_executable
 from .music_conversion_dialog import MusicConversionDialog
 from .page_chrome import bind_search_field, filter_toolbar, freeze_view, loading_page, page_header, PATH_COLUMN_WIDTH
 from .stat_card import StatCard
 from .grouped_header_view import GroupedHeaderView
 from .table_select import SelectAllTableView, wire_select_all_rows
 
+logger = logging.getLogger(__name__)
 
 class HighlightDelegate(QStyledItemDelegate):
     """Custom delegate to enforce background colors over QSS/Alternating rows."""
@@ -47,6 +50,8 @@ class HighlightDelegate(QStyledItemDelegate):
 
 
 class MusicCompatibilityWidget(QWidget):
+    library_changed = Signal(object)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._data_model = None
@@ -358,30 +363,28 @@ class MusicCompatibilityWidget(QWidget):
         if self._data_model is None or not processed_paths:
             return
 
-        root_path = Path(self._data_model.root_path)
-        changed = False
-
+        root_path = self._data_model.root_path
         pairs = [
             (entry.get("old_path", ""), entry.get("new_path", ""))
             for entry in processed_paths
         ]
         pairs = [(old, new) for old, new in pairs if old and new]
-        self._data_model.move_tracks([(old, new) for old, new in pairs if old != new])
+        if not pairs:
+            return
 
+        # Pop every old key first so a new path never collides with a stale entry.
+        for old_path, _ in pairs:
+            self._data_model.remove_track(old_path)
         for _, new_path in pairs:
-            track = self._data_model.tracks.get(new_path)
-            if track is None:
+            if not os.path.isfile(new_path):
                 continue
+            try:
+                self._data_model.add_track(extract_metadata_worker(new_path, root_path))
+            except Exception:
+                logger.debug("Failed to refresh %s", new_path, exc_info=True)
 
-            comp_result = evaluate_music_file(Path(new_path), root_path)
-            apply_compatibility_result(track, comp_result)
-            track.is_checked = False
-            changed = True
-
-        if changed:
-            tracks = list(self._data_model.tracks.values())
-            self._source_model.update_data(tracks, self._data_model.root_path)
-            self._update_stats()
+        self._data_model.rebuild_tree()
+        self.library_changed.emit(self._data_model)
 
     @Slot(object)
     def _on_conversion_finished(self, payload_obj) -> None:
