@@ -19,6 +19,7 @@ from ..utils.album_art import (
     to_non_progressive_jpeg,
     write_embedded_album_art,
 )
+from ..utils.file_rename import paths_are_same_file
 from ..utils.metadata_sanitizer import MetadataSanitizer
 from ..utils.music_compatibility import (
     _ffprobe_audio_info,
@@ -341,7 +342,9 @@ class MusicConversionWorker(QObject):
                 needs_sanitize = bool(candidate.get("needs_sanitize", False))
                 will_modify = needs_sanitize or should_convert
 
-                output_path = source_path.with_suffix(".flac") if should_convert else source_path
+                output_path = source_path
+                if should_convert and source_path.suffix.lower() != ".flac":
+                    output_path = source_path.with_suffix(".flac")
                 if should_convert:
                     previous_owner = claimed_outputs.get(output_path)
                     if previous_owner is not None and previous_owner != source_path:
@@ -351,7 +354,7 @@ class MusicConversionWorker(QObject):
                         )
                         self.progress.emit(index, total, detail_label)
                         continue
-                    if output_path.exists() and output_path != source_path:
+                    if output_path.exists() and not paths_are_same_file(output_path, source_path):
                         failed += 1
                         failures.append(
                             f"{relative_file}: {output_path.name} already exists; refusing to overwrite"
@@ -453,7 +456,7 @@ class MusicConversionWorker(QObject):
                         except Exception as exc:
                             logger.debug("Exception re-embedding artwork for %s: %s", output_path, exc)
 
-                    if source_path != output_path and source_path.exists():
+                    if source_path.exists() and not paths_are_same_file(source_path, output_path):
                         source_path.unlink()
 
                     self._processed_paths.append(
