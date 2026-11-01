@@ -15,6 +15,7 @@ from ..models.workflow import Workflow, WorkflowStep, action_label, normalize_ta
 from ..threads.album_art_fix import AlbumArtFixWorker
 from ..threads.backup_restore import ZipBackupWorker, destination_is_within_source
 from ..threads.bulk_metadata import BulkMetadataWorker
+from ..threads.drive_scanner import extract_metadata_worker
 from ..threads.file_rename import FileRenameWorker
 from ..threads.lyrics_write import LyricsWriteWorker
 from ..threads.music_conversion import MusicConversionWorker
@@ -53,6 +54,7 @@ class WorkflowExecutionWorker(QObject):
         self.workflow = workflow
         self.target_path = target_path
         self.data_model = data_model
+        self._tracks: dict[str, TrackMetadata] | None = None
         self._cancel_requested = False
         self._active_worker = None
         self.review_mutex = QMutex()
@@ -93,6 +95,13 @@ class WorkflowExecutionWorker(QObject):
                 self.failed.emit("This workflow has no steps.")
                 return
 
+            if self.data_model is not None:
+                self._tracks = {
+                    path: track
+                    for path, track in self.data_model.tracks.items()
+                    if track.extension.lower() not in _SKIP_EXTENSIONS
+                }
+
             for index, step in enumerate(self.workflow.steps, start=1):
                 if self._cancel_requested:
                     self.cancelled.emit(self._payload(False, "Workflow cancelled."))
@@ -130,17 +139,46 @@ class WorkflowExecutionWorker(QObject):
         return handler(step)
 
     def _library_tracks(self) -> tuple[list[TrackMetadata] | None, str]:
-        if self.data_model is None:
+        if self._tracks is None:
             return None, "Wait for the library scan to finish before running this step."
-        tracks = [
-            track
-            for track in self.data_model.tracks.values()
-            if track.extension.lower() not in _SKIP_EXTENSIONS
-        ]
-        return tracks, ""
+        return list(self._tracks.values()), ""
+
+    def _refresh_tracks(self, moves: list[tuple[str, str]]) -> None:
+        """Re-read changed files from disk so later steps see current paths and tags."""
+        if self._tracks is None:
+            return
+        # Pop every old key first so chained or swapped renames do not collide.
+        for old_path, _ in moves:
+            self._tracks.pop(old_path, None)
+        for _, new_path in moves:
+            if os.path.splitext(new_path)[1].lower() in _SKIP_EXTENSIONS or not os.path.isfile(new_path):
+                continue
+            try:
+                self._tracks[new_path] = extract_metadata_worker(new_path, str(self.target_path))
+            except Exception:
+                logger.debug("Failed to refresh %s", new_path, exc_info=True)
+
+    def _refresh_from_payload(self, payload: dict) -> None:
+        moves: list[tuple[str, str]] = []
+        for entry in payload.get("processed_paths") or []:
+            old_path = str(entry.get("old_path") or entry.get("filepath") or "")
+            new_path = str(entry.get("new_path") or old_path)
+            if old_path:
+                moves.append((old_path, new_path))
+        moves.extend((path, path) for path in payload.get("updated_paths") or [])
+        self._refresh_tracks(moves)
+
+    def _drop_missing_tracks(self) -> None:
+        if self._tracks is None:
+            return
+        for path in [path for path in self._tracks if not os.path.isfile(path)]:
+            del self._tracks[path]
 
     def _run_nested_worker(self, worker) -> tuple[bool, str]:
-        box = {"failed": "", "cancelled": False}
+        box = {"failed": "", "cancelled": False, "payload": None}
+
+        def on_finished(payload) -> None:
+            box["payload"] = payload
 
         def on_failed(message: str) -> None:
             box["failed"] = message
@@ -149,6 +187,7 @@ class WorkflowExecutionWorker(QObject):
             box["cancelled"] = True
 
         worker.progress.connect(self.step_progress)
+        worker.finished.connect(on_finished)
         worker.failed.connect(on_failed)
         worker.cancelled.connect(on_cancelled)
         self._active_worker = worker
@@ -158,6 +197,7 @@ class WorkflowExecutionWorker(QObject):
             self._active_worker = None
             for signal, slot in (
                 (worker.progress, self.step_progress),
+                (worker.finished, on_finished),
                 (worker.failed, on_failed),
                 (worker.cancelled, on_cancelled),
             ):
@@ -170,6 +210,8 @@ class WorkflowExecutionWorker(QObject):
             return False, "Cancelled"
         if box["failed"]:
             return False, box["failed"]
+        if isinstance(box["payload"], dict):
+            self._refresh_from_payload(box["payload"])
         return True, ""
 
     def _step_backup(self, step: WorkflowStep) -> tuple[bool, str]:
@@ -234,6 +276,7 @@ class WorkflowExecutionWorker(QObject):
                 except Exception:
                     pass
 
+        self._drop_missing_tracks()
         return True, ""
 
     def _step_file_rename(self, _step: WorkflowStep) -> tuple[bool, str]:
@@ -344,6 +387,7 @@ class WorkflowExecutionWorker(QObject):
 
         # Write immediately for reviewed tracks so a later cancel still keeps accepted matches.
         write_failures: list[str] = []
+        written: list[str] = []
         for candidate in write_candidates:
             if self._cancel_requested:
                 return False, "Cancelled"
@@ -354,9 +398,11 @@ class WorkflowExecutionWorker(QObject):
                     str(candidate["lyrics_text"]),
                     relative_file=relative,
                 )
+                written.append(str(candidate["filepath"]))
             except Exception as exc:
                 logger.debug("Workflow lyrics write failed for %s", relative, exc_info=True)
                 write_failures.append(f"{relative}: {exc}")
+        self._refresh_tracks([(path, path) for path in written])
         if write_failures:
             preview = "; ".join(write_failures[:5])
             extra = f" (+{len(write_failures) - 5} more)" if len(write_failures) > 5 else ""
