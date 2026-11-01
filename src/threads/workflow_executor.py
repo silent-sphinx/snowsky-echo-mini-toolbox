@@ -36,6 +36,14 @@ _ART_QUALITY = 90
 _CONVERSION_LEVEL = 8
 
 
+def _failure_summary(prefix: str, count: int, failures: list[str]) -> str:
+    message = f"{prefix} {count} file(s)"
+    if failures:
+        extra = f" (+{len(failures) - 5} more)" if len(failures) > 5 else ""
+        message += f": {'; '.join(failures[:5])}{extra}"
+    return message
+
+
 class WorkflowExecutionWorker(QObject):
     progress = Signal(int, int, str)
     step_progress = Signal(int, int, str)
@@ -210,8 +218,17 @@ class WorkflowExecutionWorker(QObject):
             return False, "Cancelled"
         if box["failed"]:
             return False, box["failed"]
-        if isinstance(box["payload"], dict):
-            self._refresh_from_payload(box["payload"])
+        payload = box["payload"]
+        if not isinstance(payload, dict):
+            return True, ""
+        self._refresh_from_payload(payload)
+        failures = [str(item) for item in payload.get("failures") or payload.get("errors") or []]
+        failed_count = payload.get("failed")
+        if not isinstance(failed_count, int):
+            failed_count = 0
+        failed_count = max(failed_count, len(failures))
+        if failed_count:
+            return False, _failure_summary("Failed for", failed_count, failures)
         return True, ""
 
     def _step_backup(self, step: WorkflowStep) -> tuple[bool, str]:
@@ -253,14 +270,15 @@ class WorkflowExecutionWorker(QObject):
                     to_delete.append(file_path)
 
         total = len(to_delete)
+        delete_failures: list[str] = []
         for index, path in enumerate(to_delete, start=1):
             if self._cancel_requested:
                 return False, "Cancelled"
             self.step_progress.emit(index, max(total, 1), f"Deleting {path.name}")
             try:
                 path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            except Exception as exc:
+                delete_failures.append(f"{path.name}: {exc}")
 
         if clean_empty:
             for root, dir_names, file_names in os.walk(str(self.target_path), topdown=False):
@@ -277,6 +295,8 @@ class WorkflowExecutionWorker(QObject):
                     pass
 
         self._drop_missing_tracks()
+        if delete_failures:
+            return False, _failure_summary("Failed to delete", len(delete_failures), delete_failures)
         return True, ""
 
     def _step_file_rename(self, _step: WorkflowStep) -> tuple[bool, str]:
@@ -404,9 +424,9 @@ class WorkflowExecutionWorker(QObject):
                 write_failures.append(f"{relative}: {exc}")
         self._refresh_tracks([(path, path) for path in written])
         if write_failures:
-            preview = "; ".join(write_failures[:5])
-            extra = f" (+{len(write_failures) - 5} more)" if len(write_failures) > 5 else ""
-            return False, f"Failed to write {len(write_failures)} lyrics file(s): {preview}{extra}"
+            return False, _failure_summary(
+                "Failed to write lyrics for", len(write_failures), write_failures
+            )
         return True, ""
 
     def _step_fix_album_art(self, _step: WorkflowStep) -> tuple[bool, str]:
