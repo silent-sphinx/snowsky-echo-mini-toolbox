@@ -223,6 +223,10 @@ class MusicConversionWorker(QObject):
                         return False, f"ffmpeg conversion timed out after {self.CONVERSION_TIMEOUT} seconds"
                     continue
 
+            # request_cancel may have terminated ffmpeg while it was in wait().
+            if self._cancel_requested:
+                return True, "Cancelled by user"
+
             if process.returncode != 0:
                 drain_thread.join(timeout=5)
                 stderr_text = bytes(stderr_tail).decode(errors="replace").strip()
