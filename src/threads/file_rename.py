@@ -167,12 +167,18 @@ class FileRenameWorker(QObject):
                 ready.append(job)
 
             staged: list[tuple[_RenameJob, Path, Path | None]] = []
+            completed = False
             try:
                 for job in ready:
                     if self._cancel_requested:
                         break
-                    audio_temp = self._unique_temp_path(job.source)
-                    job.source.rename(audio_temp)
+                    try:
+                        audio_temp = self._unique_temp_path(job.source)
+                        job.source.rename(audio_temp)
+                    except Exception as stage_exc:
+                        failed += 1
+                        failures.append(f"{job.relative}: failed to stage rename: {stage_exc}")
+                        continue
                     lrc_temp: Path | None = None
                     if job.lrc_needed:
                         try:
@@ -236,8 +242,9 @@ class FileRenameWorker(QObject):
                             processed["new_lrc"] = str(job.lrc_target)
                         self._processed_paths.append(processed)
                         self.progress.emit(renamed + failed, total, job.label)
+                completed = True
             finally:
-                if self._cancel_requested:
+                if self._cancel_requested or not completed:
                     self._restore_staged(staged)
 
             if self._cancel_requested:
