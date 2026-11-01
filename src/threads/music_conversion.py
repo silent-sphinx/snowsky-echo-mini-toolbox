@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -26,6 +27,19 @@ from ..utils.music_compatibility import (
 )
 
 logger = logging.getLogger(__name__)
+
+_STDERR_TAIL_BYTES = 64 * 1024
+
+
+def _drain_stream(stream, tail: bytearray) -> None:
+    """Read a pipe to EOF so the child never blocks on a full buffer; keep the tail."""
+    try:
+        for chunk in iter(lambda: stream.read(4096), b""):
+            tail.extend(chunk)
+            if len(tail) > _STDERR_TAIL_BYTES:
+                del tail[:-_STDERR_TAIL_BYTES]
+    except Exception:
+        pass
 
 
 class MusicConversionWorker(QObject):
@@ -177,6 +191,11 @@ class MusicConversionWorker(QObject):
             return False, str(exc)
 
         self._active_process = process
+        stderr_tail = bytearray()
+        drain_thread = threading.Thread(
+            target=_drain_stream, args=(process.stderr, stderr_tail), daemon=True
+        )
+        drain_thread.start()
         start_time = time.time()
         try:
             while True:
@@ -204,13 +223,8 @@ class MusicConversionWorker(QObject):
                     continue
 
             if process.returncode != 0:
-                stderr_bytes = b""
-                try:
-                    if process.stderr is not None:
-                        stderr_bytes = process.stderr.read() or b""
-                except Exception:
-                    pass
-                stderr_text = stderr_bytes.decode(errors="replace").strip()
+                drain_thread.join(timeout=5)
+                stderr_text = bytes(stderr_tail).decode(errors="replace").strip()
                 logger.debug("ffmpeg stderr: %s", stderr_text)
                 short = stderr_text[:2000]
                 return False, f"ffmpeg conversion failed (exit code {process.returncode}): {short}"
@@ -218,6 +232,12 @@ class MusicConversionWorker(QObject):
             return False, ""
         finally:
             self._active_process = None
+            drain_thread.join(timeout=5)
+            if process.stderr is not None:
+                try:
+                    process.stderr.close()
+                except Exception:
+                    pass
 
     def _next_available_backup_path(self, base_path: Path) -> Path:
         if not base_path.exists():
