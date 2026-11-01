@@ -216,8 +216,10 @@ class MusicConversionWorker(QObject):
                     break
                 except subprocess.TimeoutExpired:
                     if time.time() - start_time > self.CONVERSION_TIMEOUT:
+                        # Wait for exit so the temp file is released before the caller deletes it.
                         try:
                             process.kill()
+                            process.wait(timeout=5)
                         except Exception:
                             pass
                         return False, f"ffmpeg conversion timed out after {self.CONVERSION_TIMEOUT} seconds"
