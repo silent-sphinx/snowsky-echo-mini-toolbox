@@ -184,7 +184,7 @@ class MainWindow(QMainWindow):
 
         # ── Overlay ─────────────────────────────────────────────
         self._overlay = QWidget(central)
-        self._overlay.setStyleSheet("background-color: rgba(20, 20, 20, 180);")
+        self._overlay.setStyleSheet("background-color: rgba(15, 16, 20, 190);")
         self._overlay.hide()
 
         # Eats clicks while tables are filling. A press must not land on a
@@ -319,7 +319,7 @@ class MainWindow(QMainWindow):
                 max-height: 2px;
             }}
             QProgressBar::chunk {{
-                background-color: #FFFFFF;
+                background-color: {Colours.ACCENT};
             }}
         """)
         prog_lyt.addWidget(self._global_progress)

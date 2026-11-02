@@ -2,7 +2,7 @@
 Centralised theme system for the Snowsky Echo Mini Toolbox.
 
 Provides colour palette, QPalette configuration, and global QSS stylesheet
-with a modern dark charcoal + teal accent aesthetic.
+with a cool dark slate + teal accent aesthetic.
 """
 
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
@@ -15,42 +15,42 @@ class Colours:
     """Central colour constants for the entire application."""
 
     # Backgrounds
-    BG_DARKEST = "#191919"
-    BG_DARK = "#1F1F1F"
-    BG_BASE = "#262626"
-    BG_SURFACE = "#2C2C2C"
-    BG_ELEVATED = "#333333"
-    BG_HOVER = "#404040"
+    BG_DARKEST = "#131418"
+    BG_DARK = "#18191E"
+    BG_BASE = "#1E1F25"
+    BG_SURFACE = "#24262D"
+    BG_ELEVATED = "#2B2D35"
+    BG_HOVER = "#353842"
 
     # Borders
-    BORDER_SUBTLE = "#3C3C3C"
-    BORDER_DEFAULT = "#4C4C4C"
-    BORDER_STRONG = "#5C5C5C"
+    BORDER_SUBTLE = "#2E3039"
+    BORDER_DEFAULT = "#3B3E49"
+    BORDER_STRONG = "#4D515E"
 
     # Text
-    TEXT_PRIMARY = "#EAEAF0"
-    TEXT_SECONDARY = "#A0A0B8"
-    TEXT_TERTIARY = "#6E6E88"
-    TEXT_DISABLED = "#4A4A5E"
+    TEXT_PRIMARY = "#ECEDF2"
+    TEXT_SECONDARY = "#A4A8B8"
+    TEXT_TERTIARY = "#737889"
+    TEXT_DISABLED = "#4C505D"
 
-    # Accent — charcoal theme accent
-    ACCENT = "#5C5C5C"
-    ACCENT_HOVER = "#6C6C6C"
-    ACCENT_MUTED = "#4A4A4A"
-    ACCENT_BG = "#333333"
+    # Accent
+    ACCENT = "#2DB8A6"
+    ACCENT_HOVER = "#139687"
+    ACCENT_MUTED = "#0F7A6E"
+    ACCENT_BG = "#173B3A"
 
-    # Status — one pair per semantic, reused for badges, cells, and stats
-    STATUS_SUPPORTED = "#2E7D32"
-    STATUS_SUPPORTED_TEXT = "#C8F7C8"
-    STATUS_UNSUPPORTED = "#C62828"
-    STATUS_UNSUPPORTED_TEXT = "#FFCDD2"
-    STATUS_LIMITED = "#E67C00"
-    STATUS_LIMITED_TEXT = "#FFF3E0"
-    STATUS_UNKNOWN = "#5C6BC0"
-    STATUS_UNKNOWN_TEXT = "#C5CAE9"
-    STATUS_MISSING = "#C2185B"
-    STATUS_MISSING_TEXT = "#F8BBD0"
-    STATUS_SKIPPED = BORDER_SUBTLE
+    # Status, one pair per semantic, reused for badges, cells, and stats
+    STATUS_SUPPORTED = "#2F7A55"
+    STATUS_SUPPORTED_TEXT = "#D4F5E3"
+    STATUS_UNSUPPORTED = "#A83A42"
+    STATUS_UNSUPPORTED_TEXT = "#FFDADD"
+    STATUS_LIMITED = "#A8650F"
+    STATUS_LIMITED_TEXT = "#FFEBCC"
+    STATUS_UNKNOWN = "#4F5DAE"
+    STATUS_UNKNOWN_TEXT = "#DDE1FF"
+    STATUS_MISSING = "#A3346B"
+    STATUS_MISSING_TEXT = "#FFD8EB"
+    STATUS_SKIPPED = BORDER_DEFAULT
     STATUS_SKIPPED_TEXT = TEXT_PRIMARY
 
     # Compatibility aliases — same palette, universal names
@@ -60,24 +60,24 @@ class Colours:
     STATUS_INCOMPATIBLE_TEXT = STATUS_UNSUPPORTED_TEXT
 
     # Stat card colours
-    STAT_TOTAL = "#757575"
+    STAT_TOTAL = TEXT_TERTIARY
     STAT_MISSING = STATUS_MISSING
     STAT_TITLE = STATUS_MISSING
     STAT_ARTIST = STATUS_MISSING
     STAT_ALBUM = STATUS_MISSING
 
     # Table
-    TABLE_ALT_ROW = "#222222"
-    TABLE_SELECTION = "#4A4A4A"
-    TABLE_SELECTION_BORDER = "#888888"
-    TABLE_HEADER_BG = "#191919"
-    TABLE_HEADER_BORDER = "#3C3C3C"
-    TABLE_GRIDLINE = "#333333"
+    TABLE_ALT_ROW = "#1C1D23"
+    TABLE_SELECTION = ACCENT_BG
+    TABLE_SELECTION_BORDER = ACCENT
+    TABLE_HEADER_BG = "#15161B"
+    TABLE_HEADER_BORDER = "#2A2C34"
+    TABLE_GRIDLINE = "#272930"
 
     # Scrollbar
-    SCROLLBAR_BG = "#1F1F1F"
-    SCROLLBAR_HANDLE = "#404040"
-    SCROLLBAR_HANDLE_HOVER = "#5C5C5C"
+    SCROLLBAR_BG = BG_DARK
+    SCROLLBAR_HANDLE = "#3A3D47"
+    SCROLLBAR_HANDLE_HOVER = "#535767"
 
 
 _STATUS_COLOURS: dict[str, tuple[str, str]] = {
@@ -182,7 +182,7 @@ def setup_fonts() -> QFont:
 # ── QPalette ────────────────────────────────────────────────────────────────
 
 def create_palette() -> QPalette:
-    """Create the dark charcoal QPalette."""
+    """Create the dark slate QPalette."""
     p = QPalette()
     p.setColor(QPalette.ColorRole.Window, QColor(Colours.BG_BASE))
     p.setColor(QPalette.ColorRole.WindowText, QColor(Colours.TEXT_PRIMARY))
@@ -198,6 +198,12 @@ def create_palette() -> QPalette:
     p.setColor(QPalette.ColorRole.Highlight, QColor(Colours.ACCENT_MUTED))
     p.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
     p.setColor(QPalette.ColorRole.PlaceholderText, QColor(Colours.TEXT_TERTIARY))
+    # Bevel roles used by Fusion for QFrame lines and borders
+    p.setColor(QPalette.ColorRole.Light, QColor(Colours.BORDER_SUBTLE))
+    p.setColor(QPalette.ColorRole.Midlight, QColor(Colours.BORDER_SUBTLE))
+    p.setColor(QPalette.ColorRole.Mid, QColor(Colours.BORDER_DEFAULT))
+    p.setColor(QPalette.ColorRole.Dark, QColor(Colours.BORDER_SUBTLE))
+    p.setColor(QPalette.ColorRole.Shadow, QColor(Colours.BG_DARKEST))
     return p
 
 
@@ -358,7 +364,7 @@ def global_stylesheet() -> str:
 
         QHeaderView::section {{
             background-color: {Colours.TABLE_HEADER_BG};
-            color: {Colours.TEXT_PRIMARY};
+            color: {Colours.TEXT_SECONDARY};
             border: none;
             border-bottom: 2px solid {Colours.BORDER_SUBTLE};
             border-right: 1px solid {Colours.TABLE_HEADER_BORDER};
@@ -431,12 +437,12 @@ def global_stylesheet() -> str:
 
         QPushButton#accentButton {{
             background-color: {Colours.ACCENT_MUTED};
-            border: 1px solid {Colours.ACCENT};
+            border: 1px solid {Colours.ACCENT_HOVER};
             color: #FFFFFF;
         }}
 
         QPushButton#accentButton:hover {{
-            background-color: {Colours.ACCENT};
+            background-color: {Colours.ACCENT_HOVER};
         }}
 
         QPushButton#accentButton:disabled {{
@@ -652,7 +658,7 @@ def global_stylesheet() -> str:
 
         QMenu::separator {{
             height: 1px;
-            background-color: {Colours.TEXT_TERTIARY};
+            background-color: {Colours.BORDER_DEFAULT};
             margin: 4px 8px;
         }}
 
@@ -726,6 +732,19 @@ def global_stylesheet() -> str:
         }}
 
         /* ── Frame separator ──────────────────────────────── */
+        QFrame[frameShape="4"], QFrame[frameShape="5"] {{
+            border: none;
+            background-color: {Colours.BORDER_SUBTLE};
+        }}
+
+        QFrame[frameShape="4"] {{
+            max-height: 1px;
+        }}
+
+        QFrame[frameShape="5"] {{
+            max-width: 1px;
+        }}
+
         QFrame#separator {{
             background-color: {Colours.BORDER_SUBTLE};
             max-height: 1px;

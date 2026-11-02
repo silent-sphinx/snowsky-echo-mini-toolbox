@@ -139,11 +139,11 @@ class StorageRingWidget(QWidget):
         # Foreground
         if self._percent > 0:
             if self._percent < 0.7:
-                c_s, c_e = QColor("#4A4A4A"), QColor("#8C8C8C")
+                c_s, c_e = QColor(Colours.ACCENT_MUTED), QColor(Colours.ACCENT)
             elif self._percent < 0.9:
-                c_s, c_e = QColor("#8B6914"), QColor(Colours.STATUS_LIMITED)
+                c_s, c_e = QColor("#6B4209"), QColor(Colours.STATUS_LIMITED)
             else:
-                c_s, c_e = QColor("#8B1A1A"), QColor(Colours.STATUS_UNSUPPORTED)
+                c_s, c_e = QColor("#6E232A"), QColor(Colours.STATUS_UNSUPPORTED)
 
             grad = QConicalGradient(dr.center(), 90)
             grad.setColorAt(0.0, c_s)
@@ -285,7 +285,7 @@ class DriveInfoWidget(QWidget):
         # ── Stat Card Row ──────────────────────────────────────
         stat_row = QHBoxLayout(); stat_row.setSpacing(10)
         self._sc_capacity = _make_stat_label("—", "Capacity", Colours.ACCENT, self)
-        self._sc_tracks   = _make_stat_label("—", "Tracks", "#757575", self)
+        self._sc_tracks   = _make_stat_label("—", "Tracks", Colours.STAT_TOTAL, self)
         self._sc_duration = _make_stat_label("—", "Total Duration", "#5C6BC0", self)
         self._sc_mediasize = _make_stat_label("—", "Media Size", "#42A5F5", self)
         self._sc_artists  = _make_stat_label("—", "Artists", "#AB47BC", self)

@@ -366,7 +366,7 @@ class MusicBrowserWidget(QWidget):
         self._lyrics_warning_block = QWidget()
         self._lyrics_warning_block.setStyleSheet(f"""
             QWidget {{
-                background-color: rgba(230, 124, 0, 0.1);
+                background-color: rgba(168, 101, 15, 0.12);
                 border: 1px solid {Colours.STATUS_LIMITED};
                 border-radius: 0px;
             }}
