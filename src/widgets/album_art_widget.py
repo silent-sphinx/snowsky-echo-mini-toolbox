@@ -59,10 +59,12 @@ class AlbumArtWidget(QWidget):
         self._fix_thread: QThread | None = None
         self._fix_worker: AlbumArtFixWorker | None = None
         self._fix_progress: QProgressDialog | None = None
+        self._fix_cancelling = False
         self._download_busy = False
         self._download_thread: QThread | None = None
         self._download_worker = None
         self._download_progress: QProgressDialog | None = None
+        self._download_cancelling = False
         self._lookup_client: AlbumArtLookupClient | None = None
         self._pending_skipped = []
         self._init_models()
@@ -326,6 +328,7 @@ class AlbumArtWidget(QWidget):
     def _cancel_fix(self) -> None:
         if self._fix_worker is not None:
             self._fix_worker.request_cancel()
+            self._fix_cancelling = True
         if self._fix_progress is not None:
             self._fix_progress.setLabelText("Cancelling conversion...")
 
@@ -344,7 +347,8 @@ class AlbumArtWidget(QWidget):
     @Slot(int, int, str)
     def _on_fix_progress(self, processed: int, total: int, detail: str) -> None:
         progress = self._fix_progress
-        if progress is None:
+        # Keep "Cancelling conversion..." visible instead of the worker's next step.
+        if progress is None or self._fix_cancelling:
             return
         try:
             progress.setRange(0, max(total, 1))
@@ -356,6 +360,7 @@ class AlbumArtWidget(QWidget):
 
     def _finish_fix_ui(self) -> None:
         self._fix_busy = False
+        self._fix_cancelling = False
         self._disconnect_fix_progress()
         progress = self._fix_progress
         self._fix_progress = None
@@ -526,13 +531,11 @@ class AlbumArtWidget(QWidget):
         self._download_worker = worker
         thread.start()
 
-    @Slot(object)
-    def _on_lookup_finished(self, payload_obj) -> None:
-        payload = payload_obj if isinstance(payload_obj, dict) else {}
+    @staticmethod
+    def _apply_lookup_updates(payload: dict) -> list:
+        """Copy worker search results onto their album groups."""
         groups = payload.get("groups") or []
         updates = payload.get("updates") or []
-        found = int(payload.get("found") or 0)
-
         for update in updates:
             if not isinstance(update, dict):
                 continue
@@ -548,6 +551,13 @@ class AlbumArtWidget(QWidget):
             group.query = str(update.get("query") or "")
             group.selected_index = int(update.get("selected_index") or 0)
             group.is_selected = bool(update.get("is_selected"))
+        return groups
+
+    @Slot(object)
+    def _on_lookup_finished(self, payload_obj) -> None:
+        payload = payload_obj if isinstance(payload_obj, dict) else {}
+        groups = self._apply_lookup_updates(payload)
+        found = int(payload.get("found") or 0)
 
         self._finish_download_ui()
 
@@ -566,8 +576,32 @@ class AlbumArtWidget(QWidget):
 
     @Slot(object)
     def _on_lookup_cancelled(self, payload_obj) -> None:
+        payload = payload_obj if isinstance(payload_obj, dict) else {}
+        groups = self._apply_lookup_updates(payload)
+        processed = int(payload.get("processed") or 0)
+        found = int(payload.get("found") or 0)
+
         self._finish_download_ui()
-        QMessageBox.information(self, "Search Cancelled", "Album cover search was cancelled.")
+
+        message = f"Album cover search was cancelled after {processed} of {len(groups)} album(s)."
+        if not found:
+            QMessageBox.information(self, "Search Cancelled", message)
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Search Cancelled",
+            f"{message}\n\nCovers were found for {found} album(s). Review them now?",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        searched = {update.get("index") for update in payload.get("updates") or []}
+        for index, group in enumerate(groups):
+            if index not in searched:
+                group.error = "Not searched (search was cancelled)"
+                group.is_selected = False
+        self._open_download_dialog(groups)
 
     def _open_download_dialog(self, groups) -> None:
         if self._data_model is None or self._lookup_client is None:
@@ -618,7 +652,7 @@ class AlbumArtWidget(QWidget):
             else f"Applying artwork to {total_files} file(s) across {len(candidates)} album(s)..."
         )
 
-        progress = QProgressDialog(title, "Cancel", 0, len(candidates), self)
+        progress = QProgressDialog(title, "Cancel", 0, max(total_files, 1), self)
         progress.setWindowTitle("Download Missing Artwork")
         progress.setWindowModality(Qt.ApplicationModal)
         progress.setMinimumDuration(0)
@@ -663,6 +697,7 @@ class AlbumArtWidget(QWidget):
     def _cancel_download(self) -> None:
         if self._download_worker is not None:
             self._download_worker.request_cancel()
+            self._download_cancelling = True
         if self._download_progress is not None:
             self._download_progress.setLabelText("Cancelling...")
 
@@ -681,7 +716,8 @@ class AlbumArtWidget(QWidget):
     @Slot(int, int, str)
     def _on_download_progress(self, processed: int, total: int, detail: str) -> None:
         progress = self._download_progress
-        if progress is None:
+        # Keep "Cancelling..." visible instead of the worker's next step.
+        if progress is None or self._download_cancelling:
             return
         try:
             progress.setRange(0, max(total, 1))
@@ -692,6 +728,7 @@ class AlbumArtWidget(QWidget):
 
     def _finish_download_ui(self) -> None:
         self._download_busy = False
+        self._download_cancelling = False
         worker = self._download_worker
         if worker is not None:
             try:

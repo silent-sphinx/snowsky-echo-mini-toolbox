@@ -6,11 +6,16 @@ thread-pool workers.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 from pathlib import Path
 
 import mutagen
-from mutagen.flac import FLAC
+from mutagen._vorbis import VComment
+from mutagen.apev2 import APEv2
+from mutagen.asf import ASFTags
+from mutagen.flac import FLAC, Picture
 from mutagen.mp4 import MP4, MP4Cover
 
 from .tag_normalization import first_easy_tag
@@ -21,6 +26,12 @@ MAX_ART_DIMENSION = 1000
 
 # Extensions that cannot carry embedded artwork.
 NON_ARTWORK_EXTENSIONS = {".lrc", ".cue"}
+
+VORBIS_PICTURE_KEY = "metadata_block_picture"
+VORBIS_LEGACY_KEYS = ("coverart", "coverartmime")
+# Matches the key string in the device firmware; APEv2 keys are case-insensitive.
+APE_COVER_KEY = "Cover Art (front)"
+ASF_PICTURE_KEY = "WM/Picture"
 
 _PROGRESSIVE_SOF_MARKERS = {0xC2, 0xC6, 0xCA, 0xCE}
 _BASELINE_SOF_MARKERS = {0xC0, 0xC1, 0xC3, 0xC5, 0xC7, 0xC9, 0xCB, 0xCD, 0xCF}
@@ -62,6 +73,104 @@ def jpeg_scan_type(data: bytes) -> str:
         index += segment_len
 
     return "Unknown"
+
+
+def sniff_image_mime(data: bytes) -> str:
+    """Identify an image by its leading bytes rather than its tag label."""
+    if not data:
+        return "image/unknown"
+    if data.startswith(b"\xFF\xD8"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data.startswith(b"BM"):
+        return "image/bmp"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/unknown"
+
+
+def parse_asf_picture(raw: bytes) -> tuple[bytes, str] | None:
+    """Decode a WM/Picture blob: type, size, UTF-16 mime, UTF-16 desc, data."""
+    if len(raw) < 5:
+        return None
+    size = int.from_bytes(raw[1:5], "little")
+    index = 5
+    strings = []
+    for _ in range(2):
+        end = index
+        while end + 1 < len(raw) and raw[end:end + 2] != b"\x00\x00":
+            end += 2
+        if end + 1 >= len(raw):
+            return None
+        strings.append(raw[index:end].decode("utf-16-le", errors="replace"))
+        index = end + 2
+    data = raw[index:index + size]
+    return (data, strings[0] or sniff_image_mime(data)) if data else None
+
+
+def build_asf_picture(data: bytes, mime: str = "image/jpeg", picture_type: int = 3) -> bytes:
+    """Encode a WM/Picture blob for ASF/WMA tags."""
+    return (
+        bytes([picture_type])
+        + len(data).to_bytes(4, "little")
+        + mime.encode("utf-16-le") + b"\x00\x00"
+        + b"\x00\x00"
+        + data
+    )
+
+
+def _vorbis_picture(tags) -> tuple[bytes, str] | None:
+    for encoded in tags.get(VORBIS_PICTURE_KEY) or []:
+        try:
+            picture = Picture(base64.b64decode(encoded))
+        except (binascii.Error, ValueError, TypeError, mutagen.MutagenError):
+            continue
+        if picture.data:
+            return bytes(picture.data), picture.mime or sniff_image_mime(picture.data)
+
+    for encoded in tags.get("coverart") or []:
+        try:
+            data = base64.b64decode(encoded)
+        except (binascii.Error, ValueError):
+            continue
+        if data:
+            mimes = tags.get("coverartmime") or []
+            return data, (mimes[0] if mimes else "") or sniff_image_mime(data)
+    return None
+
+
+def _ape_picture(tags) -> tuple[bytes, str] | None:
+    item = tags.get(APE_COVER_KEY)
+    if item is None:
+        return None
+    raw = bytes(getattr(item, "value", b"") or b"")
+    # The value is "<filename>\0<image bytes>".
+    _name, sep, data = raw.partition(b"\x00")
+    data = data if sep else raw
+    return (data, sniff_image_mime(data)) if data else None
+
+
+def _asf_picture(tags) -> tuple[bytes, str] | None:
+    for attribute in tags.get(ASF_PICTURE_KEY) or []:
+        parsed = parse_asf_picture(bytes(getattr(attribute, "value", b"") or b""))
+        if parsed:
+            return parsed
+    return None
+
+
+def _tag_picture(opened, tags) -> tuple[bytes, str] | None:
+    """Read artwork from Vorbis, APEv2 or ASF tag containers."""
+    # FLAC players read picture blocks, not pictures stored as Vorbis comments.
+    if isinstance(tags, VComment) and not isinstance(opened, FLAC):
+        return _vorbis_picture(tags)
+    if isinstance(tags, APEv2):
+        return _ape_picture(tags)
+    if isinstance(tags, ASFTags):
+        return _asf_picture(tags)
+    return None
 
 
 def image_size_from_bytes(data: bytes) -> tuple[int, int] | None:
@@ -147,6 +256,10 @@ def read_embedded_album_art(path: Path, audio=None) -> tuple[bytes | None, str]:
                     mime = "image/png"
             return bytes(cover), mime
 
+    found = _tag_picture(opened, tags)
+    if found:
+        return found
+
     return None, "No embedded art"
 
 
@@ -169,6 +282,13 @@ def _art_source(path: Path, audio=None) -> str:
 
     if isinstance(opened, MP4) and tags is not None and tags.get("covr"):
         return "MP4 covr"
+
+    if _tag_picture(opened, tags):
+        if isinstance(tags, VComment):
+            return "Vorbis Picture"
+        if isinstance(tags, APEv2):
+            return "APE Cover Art"
+        return "WM/Picture"
 
     return "-"
 
@@ -277,9 +397,16 @@ def evaluate_album_art(path: Path, audio=None) -> dict[str, str]:
 
     issues: list[str] = []
 
-    if mime == "image/jpeg":
+    actual_mime = sniff_image_mime(art_bytes)
+    if mime == "image/jpeg" and actual_mime == "image/jpeg":
         result["format_compatibility"] = "COMPATIBLE"
         result["format_compatibility_reason"] = "JPEG artwork"
+    elif mime == "image/jpeg":
+        result["format_compatibility"] = "INCOMPATIBLE"
+        result["format_compatibility_reason"] = (
+            f"Labelled image/jpeg but the data is {actual_mime}"
+        )
+        issues.append(f"Artwork data is {actual_mime}, not JPEG")
     else:
         result["format_compatibility"] = "INCOMPATIBLE"
         result["format_compatibility_reason"] = (

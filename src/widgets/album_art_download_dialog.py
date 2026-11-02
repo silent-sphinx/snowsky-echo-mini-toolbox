@@ -156,6 +156,7 @@ class AlbumArtDownloadDialog(QDialog):
         self._preview_loader: _PreviewLoader | None = None
         self._retry_thread: QThread | None = None
         self._retry_task: _RetryLookup | None = None
+        self._retry_group: AlbumGroup | None = None
         self._pending_preview_url = ""
         self._updating = False
 
@@ -747,27 +748,31 @@ class AlbumArtDownloadDialog(QDialog):
 
         self._retry_btn.setEnabled(False)
         self._retry_btn.setText("Searching...")
-        row = self._table.currentRow()
+        self._retry_group = group
 
         thread = QThread(self)
         task = _RetryLookup(self._client, group.artist, group.album, group.year)
         task.moveToThread(thread)
         thread.started.connect(task.run)
-        task.done.connect(lambda result: self._on_retry_done(row, result))
+        # A bound slot is queued to the GUI thread; a lambda would run in the worker.
+        task.done.connect(self._on_retry_done)
         task.done.connect(thread.quit)
         thread.finished.connect(self._clear_retry_thread)
         self._retry_thread = thread
         self._retry_task = task
         thread.start()
 
-    def _on_retry_done(self, row: int, result: object) -> None:
+    @Slot(object)
+    def _on_retry_done(self, result: object) -> None:
         self._retry_btn.setEnabled(True)
         self._retry_btn.setText("Retry Search")
 
-        if not (0 <= row < len(self._groups)) or result is None:
+        group = self._retry_group
+        self._retry_group = None
+        if group is None or result is None:
             return
 
-        group = self._groups[row]
+        row = next(i for i, g in enumerate(self._groups) if g is group)
         if isinstance(result, dict):
             group.candidates = []
             group.error = result.get("error", "Lookup failed")

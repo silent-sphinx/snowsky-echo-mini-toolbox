@@ -136,17 +136,17 @@ class AlbumArtFixWorker(QObject):
                     self.progress.emit(index, total, f"Would re-encode: {source_path.name}")
                     continue
 
-                ok, backup_error = self._backup_original_file(source_path)
-                if not ok:
-                    failed += 1
-                    failures.append(f"{relative_file}: {backup_error}")
-                    self.progress.emit(index, total, detail_label)
-                    continue
-
                 jpeg_data = to_non_progressive_jpeg(art_bytes, self.quality)
                 if not jpeg_data:
                     failed += 1
                     failures.append(f"{relative_file}: could not decode embedded artwork")
+                    self.progress.emit(index, total, detail_label)
+                    continue
+
+                ok, backup_error = self._backup_original_file(source_path)
+                if not ok:
+                    failed += 1
+                    failures.append(f"{relative_file}: {backup_error}")
                     self.progress.emit(index, total, detail_label)
                     continue
 
@@ -156,6 +156,9 @@ class AlbumArtFixWorker(QObject):
                     failures.append(f"{relative_file}: {write_message}")
                     self.progress.emit(index, total, detail_label)
                     continue
+
+                # The file changed on disk even if verification below fails.
+                self._processed_paths.append({"filepath": str(source_path)})
 
                 verified_art, verified_mime = read_embedded_album_art(source_path)
                 if not verified_art:
@@ -169,7 +172,6 @@ class AlbumArtFixWorker(QObject):
                     failures.append(f"{relative_file}: artwork is still a progressive JPEG")
                 else:
                     converted += 1
-                    self._processed_paths.append({"filepath": str(source_path)})
 
                 self.progress.emit(index, total, detail_label)
 

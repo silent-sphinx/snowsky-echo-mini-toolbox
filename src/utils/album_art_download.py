@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from ..constants import APP_VERSION
@@ -33,6 +34,8 @@ USER_AGENT = (
 MUSICBRAINZ_MIN_INTERVAL = 1.0
 REQUEST_TIMEOUT = 15.0
 MAX_RELEASES_INSPECTED = 6
+# Cover Art Archive has no published rate limit but is slow per request.
+MAX_PARALLEL_COVER_REQUESTS = 8
 MAX_SEARCH_RESULTS = 25
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_RETRIES = 3
@@ -116,6 +119,8 @@ class AlbumArtLookupClient:
         self._is_cancelled = is_cancelled or (lambda: False)
         self._ssl_context = _ssl_context()
         self._last_musicbrainz_call = 0.0
+        self._throttle_lock = threading.Lock()
+        self._cover_slots = threading.BoundedSemaphore(MAX_PARALLEL_COVER_REQUESTS)
         self._cache: dict[str, LookupResult] = {}
         self._image_cache: dict[str, bytes] = {}
         self._lock = threading.Lock()
@@ -154,9 +159,12 @@ class AlbumArtLookupClient:
             self._check_cancelled()
 
             if throttle:
-                elapsed = time.monotonic() - self._last_musicbrainz_call
-                if elapsed < MUSICBRAINZ_MIN_INTERVAL:
-                    self._sleep(MUSICBRAINZ_MIN_INTERVAL - elapsed)
+                # Space request starts across every thread sharing this client.
+                with self._throttle_lock:
+                    elapsed = time.monotonic() - self._last_musicbrainz_call
+                    if elapsed < MUSICBRAINZ_MIN_INTERVAL:
+                        self._sleep(MUSICBRAINZ_MIN_INTERVAL - elapsed)
+                    self._last_musicbrainz_call = time.monotonic()
 
             request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
             try:
@@ -189,9 +197,6 @@ class AlbumArtLookupClient:
                 self._sleep(backoff)
                 backoff *= 2
                 attempt += 1
-            finally:
-                if throttle:
-                    self._last_musicbrainz_call = time.monotonic()
 
     # ── search ──────────────────────────────────────────────────
 
@@ -202,8 +207,13 @@ class AlbumArtLookupClient:
         *,
         year: str = "",
         raw_query: str = "",
+        on_status=None,
     ) -> LookupResult:
-        """Find front covers for one album. Results are cached per session."""
+        """Find front covers for one album. Successful results are cached.
+
+        Failed lookups are not cached so a retry can recover from transient
+        network or server errors. ``on_status`` receives step descriptions.
+        """
         query = raw_query.strip() or build_query(artist, album)
         if not query:
             return LookupResult(error="No artist or album tag to search with")
@@ -214,14 +224,16 @@ class AlbumArtLookupClient:
         if cached is not None:
             return cached
 
-        result = self._search_uncached(artist, album, year, query)
-        with self._lock:
-            self._cache[cache_key] = result
+        result = self._search_uncached(artist, album, year, query, on_status or (lambda _: None))
+        if result.has_candidates:
+            with self._lock:
+                self._cache[cache_key] = result
         return result
 
     def _search_uncached(
-        self, artist: str, album: str, year: str, query: str
+        self, artist: str, album: str, year: str, query: str, on_status
     ) -> LookupResult:
+        on_status("Querying MusicBrainz")
         url = (
             f"{MUSICBRAINZ_URL}?query={urllib.parse.quote(query)}"
             f"&limit={MAX_SEARCH_RESULTS}&fmt=json"
@@ -248,33 +260,46 @@ class AlbumArtLookupClient:
             reverse=True,
         )
 
-        candidates: list[CoverCandidate] = []
-        seen_images: set[str] = set()
+        inspected = [rel for rel in ranked[:MAX_RELEASES_INSPECTED] if rel.get("id")]
+        images_by_release: dict[str, list[dict]] = {}
         last_error = ""
 
-        for release in ranked[:MAX_RELEASES_INSPECTED]:
-            self._check_cancelled()
-            release_id = release.get("id") or ""
-            if not release_id:
-                continue
+        on_status(f"Checking cover art 0/{len(inspected)}")
+        pool = ThreadPoolExecutor(max_workers=max(1, len(inspected)))
+        try:
+            futures = {
+                pool.submit(self._front_images, rel["id"]): rel["id"] for rel in inspected
+            }
+            for done, future in enumerate(as_completed(futures), start=1):
+                try:
+                    images_by_release[futures[future]] = future.result()
+                except LookupCancelled:
+                    raise
+                except Exception as exc:
+                    last_error = str(exc)
+                on_status(f"Checking cover art {done}/{len(inspected)}")
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
-            try:
-                images = self._front_images(release_id)
-            except LookupCancelled:
-                raise
-            except Exception as exc:
-                last_error = str(exc)
-                continue
+        candidates: list[CoverCandidate] = []
+        seen_images: set[str] = set()
 
+        # Rebuild in rank order; requests above finish in any order.
+        for release in inspected:
+            release_id = release["id"]
+            images = images_by_release.get(release_id) or []
             for image in images:
-                image_url = image.get("image") or ""
+                original_url = image.get("image") or ""
                 thumbnails = image.get("thumbnails") or {}
                 thumbnail_url = (
-                    thumbnails.get("250") or thumbnails.get("small") or image_url
+                    thumbnails.get("250") or thumbnails.get("small") or original_url
                 )
-                if not image_url or image_url in seen_images:
+                if not original_url or original_url in seen_images:
                     continue
-                seen_images.add(image_url)
+                seen_images.add(original_url)
+                # Embedded art is capped well below 1200px, so the full-size
+                # original (often tens of MB) is only a fallback.
+                image_url = thumbnails.get("1200") or original_url
                 candidates.append(
                     CoverCandidate(
                         release_id=release_id,
@@ -306,9 +331,9 @@ class AlbumArtLookupClient:
     def _front_images(self, release_id: str) -> list[dict]:
         url = COVERART_URL.format(mbid=release_id)
         try:
-            payload = json.loads(
-                self._request(url, throttle=False, max_bytes=2 * 1024 * 1024)
-            )
+            with self._cover_slots:
+                raw = self._request(url, throttle=False, max_bytes=2 * 1024 * 1024)
+            payload = json.loads(raw)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return []

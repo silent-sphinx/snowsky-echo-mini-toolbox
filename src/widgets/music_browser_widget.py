@@ -33,7 +33,9 @@ from ..theme import Colours
 from ..models.drive_data import DriveDataModel, TrackMetadata
 from ..utils.lyrics import atomic_write_text, decode_text_file_bytes
 from ..utils.metadata_writer import save_metadata
-from ..utils.album_art import extract_album_art
+from ..utils.album_art import extract_album_art, remove_embedded_album_art
+from ..utils.album_art_planner import apply_album_art_result
+from ..utils.album_art_validation import evaluate_album_art
 from ..utils.file_rename import paths_are_same_file
 from ..threads.bulk_metadata import BulkMetadataWorker
 from .bulk_metadata_dialog import BulkMetadataDialog
@@ -355,6 +357,16 @@ class MusicBrowserWidget(QWidget):
         
         art_lyt.addWidget(self._art_image_lbl, stretch=1)
         art_lyt.addWidget(self._art_table, stretch=0)
+
+        art_btns_lyt = QHBoxLayout()
+        art_btns_lyt.addStretch(1)
+        self._art_remove_btn = QPushButton("Remove Artwork")
+        self._art_remove_btn.setToolTip("Delete all embedded artwork from this file.")
+        self._art_remove_btn.setEnabled(False)
+        self._art_remove_btn.clicked.connect(self._on_remove_artwork_clicked)
+        art_btns_lyt.addWidget(self._art_remove_btn)
+        art_lyt.addLayout(art_btns_lyt)
+        self._art_filepath: str | None = None
         
         # 3. Lyrics Tab
         self._lyrics_tab = QWidget()
@@ -594,16 +606,18 @@ class MusicBrowserWidget(QWidget):
         """Populate the UI using the centralized data model."""
         self._data_model = data_model
         self._tree_items_built = 0
-        self._tree_model.blockSignals(True)
-        try:
-            with freeze_view(self._tree, restore_sorting=False):
+        with freeze_view(self._tree, restore_sorting=False):
+            self._tree_model.blockSignals(True)
+            try:
                 self._tree_model.clear()
                 root_item = self._tree_model.invisibleRootItem()
                 self._build_tree(data_model.tree, root_item, data_model.root_path)
-        finally:
-            self._tree_model.blockSignals(False)
-            self._tree.reset()
-            keep_ui_alive()
+            finally:
+                self._tree_model.blockSignals(False)
+                # The view missed the reset while signals were blocked; drop its
+                # cached rows before freeze_view lets any events run.
+                self._tree.reset()
+        keep_ui_alive()
         self._show_blank_details()
         
     def _build_tree(self, tree_dict: dict, parent_item: QStandardItem, current_path: str) -> None:
@@ -1064,6 +1078,8 @@ class MusicBrowserWidget(QWidget):
         # Album Art
         self._art_table.setRowCount(0)
         if meta.has_album_art:
+            self._art_filepath = meta.filepath
+            self._art_remove_btn.setEnabled(True)
             art_info = extract_album_art(meta.filepath)
             if art_info:
                 # Load Pixmap
@@ -1208,6 +1224,8 @@ class MusicBrowserWidget(QWidget):
         self._art_table.setRowCount(0)
         self._art_image_lbl.setPixmap(QPixmap())
         self._art_image_lbl.setText("No Album Art")
+        self._art_filepath = None
+        self._art_remove_btn.setEnabled(False)
         self._lyrics_text.setPlainText("")
         self._set_lyrics_editable(False)
         
@@ -1273,6 +1291,38 @@ class MusicBrowserWidget(QWidget):
                 except OSError:
                     pass
         QMessageBox.information(self, "Success", "LRC file saved successfully.")
+
+    def _on_remove_artwork_clicked(self) -> None:
+        filepath = self._art_filepath
+        if not filepath:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Remove Artwork",
+            f"Remove all embedded artwork from '{os.path.basename(filepath)}'?\n"
+            "This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        success, msg = remove_embedded_album_art(Path(filepath))
+        if not success:
+            QMessageBox.critical(self, "Error", f"Failed to remove artwork:\n{msg}")
+            return
+
+        track = self._data_model.get_track(filepath) if self._data_model else None
+        if track is not None:
+            apply_album_art_result(track, evaluate_album_art(Path(filepath)))
+            try:
+                track.size_bytes = os.path.getsize(filepath)
+            except OSError:
+                pass
+        self._refresh_details_pane()
+        if self._data_model is not None:
+            self.library_changed.emit(self._data_model)
 
     def _on_discard_metadata_clicked(self) -> None:
         # Reload the metadata for the current selection from the cache
