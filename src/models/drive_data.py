@@ -3,6 +3,18 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
+# Canonical tag key -> (TrackMetadata attribute, value when the tag is absent).
+_TRACK_FIELD_FOR_TAG = {
+    "title": ("title", "Unknown Title"),
+    "artist": ("artist", "Unknown Artist"),
+    "album": ("album", "Unknown Album"),
+    "albumartist": ("album_artist", ""),
+    "genre": ("genre", ""),
+    "date": ("year", ""),
+    "tracknumber": ("track_num", ""),
+}
+
+
 @dataclass
 class TrackMetadata:
     """Represents extracted metadata for a single media file."""
@@ -211,7 +223,7 @@ class DriveDataModel:
         
     def update_metadata(self, filepath: str, new_tags: dict) -> None:
         """Update the in-memory metadata for a specific track after it's saved."""
-        from ..utils.metadata_writer import aliases_for_tag_key
+        from ..utils.metadata_writer import TAG_KEY_ALIASES, aliases_for_tag_key
 
         track = self.get_track(filepath)
         if not track:
@@ -236,18 +248,18 @@ class DriveDataModel:
             for existing in [key for key in track.all_tags if key.lower() in aliases]:
                 del track.all_tags[existing]
 
-        def _get_case_insensitive(tags_dict: dict, keys: list) -> str:
-            for k in tags_dict:
-                if k.lower() in keys:
-                    return tags_dict[k]
-            return ""
+        # Only refresh fields that were edited; untouched fields may live under
+        # keys (MP4 atoms, ASF names) that all_tags lookups cannot resolve.
+        edited_aliases: set[str] = set()
+        for k in new_tags:
+            edited_aliases.update(alias.lower() for alias in aliases_for_tag_key(k))
 
-        track.title = _get_case_insensitive(track.all_tags, ["title", "tit2"]) or "Unknown Title"
-        track.artist = _get_case_insensitive(track.all_tags, ["artist", "tpe1"]) or "Unknown Artist"
-        track.album = _get_case_insensitive(track.all_tags, ["album", "talb"]) or "Unknown Album"
-        track.album_artist = _get_case_insensitive(
-            track.all_tags, ["albumartist", "album artist", "album_artist", "tpe2"]
-        )
-        track.genre = _get_case_insensitive(track.all_tags, ["genre", "tcon"])
-        track.year = _get_case_insensitive(track.all_tags, ["year", "date", "tdrc"])
-        track.track_num = _get_case_insensitive(track.all_tags, ["tracknumber", "track", "trck"])
+        for canonical, (attr, default) in _TRACK_FIELD_FOR_TAG.items():
+            aliases = {alias.lower() for alias in TAG_KEY_ALIASES[canonical]}
+            if not aliases & edited_aliases:
+                continue
+            value = next(
+                (val for key, val in track.all_tags.items() if key.lower() in aliases),
+                "",
+            )
+            setattr(track, attr, value or default)
