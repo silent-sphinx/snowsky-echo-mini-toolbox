@@ -59,7 +59,7 @@ class FileCleanupScanWorker(QObject):
                             continue
                         file_size = file_path.stat().st_size
                     except OSError:
-                        file_size = 0
+                        continue
 
                     key, label, category, extension, description = classify_file(file_path)
                     row = stats_by_key.get(key)
