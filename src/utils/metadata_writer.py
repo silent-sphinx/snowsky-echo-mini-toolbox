@@ -7,6 +7,8 @@ from __future__ import annotations
 from typing import Mapping
 
 import mutagen
+from mutagen._vorbis import VCommentDict
+from mutagen.apev2 import APEv2
 from mutagen.asf import ASF
 from mutagen.easyid3 import EasyID3
 from mutagen.easymp4 import EasyMP4, EasyMP4Tags
@@ -50,7 +52,19 @@ _ASF_NAME_FOR_KEY = {
     "composer": "WM/Composer",
 }
 
-_MP4_FREEFORM_PREFIX = "----:com.apple.iTunes:"
+_APE_NAME_FOR_KEY = {
+    "title": "Title",
+    "artist": "Artist",
+    "album": "Album",
+    "albumartist": "Album Artist",
+    "genre": "Genre",
+    "date": "Year",
+    "tracknumber": "Track",
+    "discnumber": "Disc",
+    "composer": "Composer",
+}
+
+_MP4_FREEFORM_PREFIX ="----:com.apple.iTunes:"
 
 
 def _canonical_tag_key(key: str) -> str | None:
@@ -319,11 +333,23 @@ def save_metadata(filepath: str, tags: Mapping[str, str | None]) -> tuple[bool, 
             audio.save(v2_version=3)
             return True, ""
 
+        # Vorbis and APEv2 have standard field names, so drop other spellings
+        # of the same field rather than leaving a stale duplicate behind.
+        standard_names = None
+        if isinstance(audio.tags, VCommentDict):
+            standard_names = {key: key for key in TAG_KEY_ALIASES}
+        elif isinstance(audio.tags, APEv2):
+            standard_names = _APE_NAME_FOR_KEY
+
         written_aliases: set[str] = set()
         for key, val in tags.items():
             if val is None:
                 continue
-            audio.tags[key] = [val]
+            name = key
+            if standard_names is not None:
+                _delete_tag_from_mapping(audio.tags, key)
+                name = standard_names.get(_canonical_tag_key(key) or "", key)
+            audio.tags[name] = [val]
             written_aliases.update(alias.lower() for alias in aliases_for_tag_key(key))
 
         for key, val in tags.items():
