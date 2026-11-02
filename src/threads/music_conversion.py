@@ -284,6 +284,13 @@ class MusicConversionWorker(QObject):
         except Exception as exc:
             return False, f"backup failed: {exc}"
 
+    def _record_sanitized_only(self, sanitized: bool, source_input_path: Path) -> None:
+        """Report a file whose tags were rewritten even though conversion did not finish."""
+        if sanitized:
+            self._processed_paths.append(
+                {"old_path": str(source_input_path), "new_path": str(source_input_path)}
+            )
+
     def _resolve_source_path(self, candidate: dict[str, object]) -> tuple[Path, str]:
         filepath = str(candidate.get("filepath") or "")
         relative_file = str(candidate.get("relative_file") or "")
@@ -393,8 +400,8 @@ class MusicConversionWorker(QObject):
                         self.progress.emit(index, total, detail_label)
                         continue
 
+                sanitized_ok = False
                 if needs_sanitize:
-                    sanitized_ok = False
                     try:
                         sanitizer = MetadataSanitizer()
                         sanitized_ok = bool(
@@ -445,6 +452,7 @@ class MusicConversionWorker(QObject):
                             temp_output_path.unlink()
                     except Exception:
                         pass
+                    self._record_sanitized_only(sanitized_ok, source_input_path)
                     self.cancelled.emit(self._payload(converted, failed, planned, total, failures))
                     return
 
@@ -456,6 +464,7 @@ class MusicConversionWorker(QObject):
                             temp_output_path.unlink()
                     except Exception:
                         pass
+                    self._record_sanitized_only(sanitized_ok, source_input_path)
                     self.progress.emit(index, total, detail_label)
                     continue
 
@@ -492,6 +501,8 @@ class MusicConversionWorker(QObject):
                             temp_output_path.unlink()
                     except Exception:
                         pass
+                    if source_path.exists():
+                        self._record_sanitized_only(sanitized_ok, source_input_path)
 
                 self.progress.emit(index, total, detail_label)
 
