@@ -293,31 +293,41 @@ def apply_rename_evaluations(
         key = str(target_path).lower()
         target_counts[key] = target_counts.get(key, 0) + 1
 
-    vacating_keys = {
-        str(Path(track.filepath)).lower()
-        for track, target_path in candidates
-        if str(target_path).lower() != str(Path(track.filepath)).lower()
-    }
-
     # One listdir per folder beats thousands of exists() calls on USB/FAT.
     dir_names = _directory_name_index(target_path.parent for _, target_path in candidates)
 
-    for track, target_path in candidates:
-        key = str(target_path).lower()
-        conflict_reason = ""
-        parent_key = str(target_path.parent)
-        name_exists = target_path.name.lower() in dir_names.get(parent_key, set())
-        if target_counts.get(key, 0) > 1:
-            conflict_reason = REASON_DUPLICATE
-        elif name_exists:
-            source_path = Path(track.filepath)
-            if not paths_are_same_file(target_path, source_path) and key not in vacating_keys:
-                conflict_reason = REASON_EXISTS
+    # A conflicted track keeps its name, which can in turn block a rename that
+    # relied on it moving, so repeat until no new conflicts appear.
+    pending = list(candidates)
+    while pending:
+        vacating_keys = {
+            str(Path(track.filepath)).lower()
+            for track, target_path in pending
+            if str(target_path).lower() != str(Path(track.filepath)).lower()
+        }
+        still_pending: list[tuple[TrackMetadata, Path]] = []
+        for track, target_path in pending:
+            key = str(target_path).lower()
+            conflict_reason = ""
+            parent_key = str(target_path.parent)
+            name_exists = target_path.name.lower() in dir_names.get(parent_key, set())
+            if target_counts.get(key, 0) > 1:
+                conflict_reason = REASON_DUPLICATE
+            elif name_exists:
+                source_path = Path(track.filepath)
+                if not paths_are_same_file(target_path, source_path) and key not in vacating_keys:
+                    conflict_reason = REASON_EXISTS
 
-        if conflict_reason:
-            track.rename_status = "CONFLICT"
-            track.rename_reason = conflict_reason
-            track.rename_is_checked = False
+            if conflict_reason:
+                track.rename_status = "CONFLICT"
+                track.rename_reason = conflict_reason
+                track.rename_is_checked = False
+            else:
+                still_pending.append((track, target_path))
+
+        if len(still_pending) == len(pending):
+            break
+        pending = still_pending
 
 
 def _directory_name_index(parents: Iterable[Path]) -> dict[str, set[str]]:
