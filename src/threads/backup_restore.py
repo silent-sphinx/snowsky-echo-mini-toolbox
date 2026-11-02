@@ -72,11 +72,20 @@ class ZipBackupWorker(QObject):
     def _cancel_requested_fn(self) -> bool:
         return self._cancel_requested
 
+    def _discard_temp(self, temp_path: Path | None) -> None:
+        if temp_path is None:
+            return
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     @Slot()
     def run(self) -> None:
         processed = 0
         total_files = 0
         skipped = 0
+        temp_path: Path | None = None
         try:
             source = self.source_path
             zip_path = self.zip_path
@@ -100,8 +109,11 @@ class ZipBackupWorker(QObject):
             zip_path.parent.mkdir(parents=True, exist_ok=True)
             root_name = source.name.strip() or "backup"
 
+            # Build into a temp file so an existing zip survives cancel or failure.
+            temp_path = zip_path.with_name(f".{zip_path.name}.partial")
+
             with zipfile.ZipFile(
-                str(zip_path),
+                str(temp_path),
                 mode="w",
                 compression=zipfile.ZIP_DEFLATED,
                 allowZip64=True,
@@ -121,6 +133,9 @@ class ZipBackupWorker(QObject):
                     processed += 1
                     self.progress.emit(processed, max(total_files, 1), rel_file)
 
+            os.replace(str(temp_path), str(zip_path))
+            temp_path = None
+
             self.finished.emit(
                 {
                     "zip_path": str(zip_path),
@@ -130,25 +145,16 @@ class ZipBackupWorker(QObject):
                 }
             )
         except InterruptedError:
-            try:
-                if self.zip_path.exists():
-                    self.zip_path.unlink()
-            except Exception:
-                pass
+            self._discard_temp(temp_path)
             self.cancelled.emit(
                 {
                     "processed": processed,
                     "total": total_files,
-                    "partial_zip": str(self.zip_path),
                 }
             )
         except Exception as exc:
             logger.exception("Zip backup failed")
-            try:
-                if self.zip_path.exists():
-                    self.zip_path.unlink()
-            except Exception:
-                pass
+            self._discard_temp(temp_path)
             self.failed.emit(str(exc))
 
 
