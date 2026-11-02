@@ -56,6 +56,9 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
     if filepath.lower().endswith(".lrc"):
         meta.format_name = "LRC Lyrics File"
         return meta
+    if filepath.lower().endswith(".cue"):
+        meta.format_name = "CUE Sheet"
+        return meta
         
     audio = None
     try:

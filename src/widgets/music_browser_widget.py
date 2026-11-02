@@ -550,7 +550,7 @@ class MusicBrowserWidget(QWidget):
             
         menu = QMenu()
         
-        is_music_file = not filepath.lower().endswith(".lrc")
+        is_music_file = Path(filepath).suffix.lower() not in _NON_MUSIC_EXTENSIONS
         
         debug_action = None
         streams_action = None
@@ -1105,17 +1105,25 @@ class MusicBrowserWidget(QWidget):
         self._preferred_tab = index
 
     def _populate_details(self, meta: TrackMetadata) -> None:
-        is_lrc = meta.filepath.lower().endswith(".lrc")
+        ext = Path(meta.filepath).suffix.lower()
+        is_lrc = ext == ".lrc"
+        is_cue = ext == ".cue"
+        is_music = not (is_lrc or is_cue)
 
         # Hiding tabs moves the current one, so keep the user's choice intact.
         self._restoring_tabs = True
         try:
             self._clear_details()
             self._tabs.setTabVisible(0, not is_lrc) # Properties
-            self._tabs.setTabVisible(1, not is_lrc) # Music Metadata
-            self._tabs.setTabVisible(2, not is_lrc) # Album Art
-            self._tabs.setTabVisible(3, True)       # Lyrics (either file contents or disclaimer)
-            self._tabs.setCurrentIndex(3 if is_lrc else self._preferred_tab)
+            self._tabs.setTabVisible(1, is_music)   # Music Metadata
+            self._tabs.setTabVisible(2, is_music)   # Album Art
+            self._tabs.setTabVisible(3, not is_cue) # Lyrics (either file contents or disclaimer)
+            if is_lrc:
+                self._tabs.setCurrentIndex(3)
+            elif is_cue:
+                self._tabs.setCurrentIndex(0)
+            else:
+                self._tabs.setCurrentIndex(self._preferred_tab)
         finally:
             self._restoring_tabs = False
 
@@ -1124,8 +1132,16 @@ class MusicBrowserWidget(QWidget):
             self._load_lrc_editor(meta.filepath)
             return
             
+        if is_cue:
+            self._fill_kv_table(self._props_table, [
+                ("File", meta.filename),
+                ("Format", meta.format_name or "CUE Sheet"),
+                ("Size", meta.display_size),
+            ])
+            return
+
         self._lyrics_warning_block.show()
-        
+
         # Properties — sorting must be off while inserting or values attach to the wrong labels
         props = [
             ("File", meta.filename),

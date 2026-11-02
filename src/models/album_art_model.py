@@ -58,7 +58,7 @@ class AlbumArtTableModel(QAbstractTableModel):
 
     def update_data(self, tracks: list[TrackMetadata], root_path: str) -> None:
         self.beginResetModel()
-        self._tracks = [t for t in tracks if t.extension.lower() != ".lrc"]
+        self._tracks = [t for t in tracks if t.extension.lower() not in {".lrc", ".cue"}]
         self._root_path = root_path
         self._tracks.sort(key=lambda t: t.filepath)
         self._haystacks = [self._haystack_for(track) for track in self._tracks]
