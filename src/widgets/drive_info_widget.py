@@ -563,9 +563,9 @@ class DriveInfoWidget(QWidget):
             w = QWidget(); w.setStyleSheet("background: transparent; border: none;"); w.setLayout(row)
             self._legend_lyt.addWidget(w)
 
-        # ── Compatibility summary (audio only, exclude .lrc) ────
+        # ── Compatibility summary (audio only, exclude .lrc and .cue) ────
         self._clear_layout(self._compat_lyt)
-        audio_tracks = [t for t in tracks if t.extension.lower() != ".lrc"]
+        audio_tracks = [t for t in tracks if t.extension.lower() not in {".lrc", ".cue"}]
         audio_count = len(audio_tracks)
         status_counts = Counter(t.comp_status for t in audio_tracks)
         status_config = [
