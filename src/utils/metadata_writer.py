@@ -7,22 +7,23 @@ from __future__ import annotations
 from typing import Mapping
 
 import mutagen
+from mutagen.asf import ASF
 from mutagen.easyid3 import EasyID3
 from mutagen.easymp4 import EasyMP4, EasyMP4Tags
 from mutagen.id3 import ID3, ID3NoHeaderError, TXXX, Encoding, Frames
 from mutagen.mp4 import MP4, MP4FreeForm
 
-# EasyID3 / Vorbis keys and the raw ID3 frames / MP4 atoms the scanner may have stored.
+# EasyID3 / Vorbis keys and the raw ID3 frames / MP4 atoms / ASF names the scanner may have stored.
 TAG_KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "title": ("title", "tit2", "\xa9nam"),
-    "artist": ("artist", "tpe1", "\xa9art"),
-    "album": ("album", "talb", "\xa9alb"),
-    "albumartist": ("albumartist", "album artist", "album_artist", "tpe2", "aart"),
-    "genre": ("genre", "tcon", "\xa9gen"),
-    "date": ("date", "year", "tdrc", "tyer", "\xa9day"),
-    "tracknumber": ("tracknumber", "track", "trck", "trkn"),
-    "discnumber": ("discnumber", "disc", "tpos", "disk"),
-    "composer": ("composer", "tcom", "\xa9wrt"),
+    "artist": ("artist", "tpe1", "\xa9art", "author"),
+    "album": ("album", "talb", "\xa9alb", "wm/albumtitle"),
+    "albumartist": ("albumartist", "album artist", "album_artist", "tpe2", "aart", "wm/albumartist"),
+    "genre": ("genre", "tcon", "\xa9gen", "wm/genre"),
+    "date": ("date", "year", "tdrc", "tyer", "\xa9day", "wm/year"),
+    "tracknumber": ("tracknumber", "track", "trck", "trkn", "wm/tracknumber"),
+    "discnumber": ("discnumber", "disc", "tpos", "disk", "wm/partofset"),
+    "composer": ("composer", "tcom", "\xa9wrt", "wm/composer"),
 }
 
 _ID3_FRAME_FOR_KEY = {
@@ -35,6 +36,18 @@ _ID3_FRAME_FOR_KEY = {
     "tracknumber": "TRCK",
     "discnumber": "TPOS",
     "composer": "TCOM",
+}
+
+_ASF_NAME_FOR_KEY = {
+    "title": "Title",
+    "artist": "Author",
+    "album": "WM/AlbumTitle",
+    "albumartist": "WM/AlbumArtist",
+    "genre": "WM/Genre",
+    "date": "WM/Year",
+    "tracknumber": "WM/TrackNumber",
+    "discnumber": "WM/PartOfSet",
+    "composer": "WM/Composer",
 }
 
 _MP4_FREEFORM_PREFIX = "----:com.apple.iTunes:"
@@ -179,6 +192,27 @@ def _apply_mp4_tags(filepath: str, tags: Mapping[str, str | None]) -> None:
     mp4.save()
 
 
+def _apply_asf_tags(audio: ASF, tags: Mapping[str, str | None]) -> None:
+    """Write WMA attributes under the names Windows Media players read."""
+    written_aliases: set[str] = set()
+    for key, val in tags.items():
+        if val is None:
+            continue
+        name = _ASF_NAME_FOR_KEY.get(_canonical_tag_key(key) or "", key)
+        _delete_tag_from_mapping(audio.tags, key)
+        audio.tags[name] = [val]
+        written_aliases.update(alias.lower() for alias in aliases_for_tag_key(key))
+
+    for key, val in tags.items():
+        if val is not None:
+            continue
+        aliases = {alias.lower() for alias in aliases_for_tag_key(key)}
+        if aliases & written_aliases:
+            continue
+        _delete_tag_from_mapping(audio.tags, key)
+    audio.save()
+
+
 def _apply_easy_id3(easy: EasyID3, tags: Mapping[str, str | None]) -> list[tuple[str, str | None]]:
     """Apply EasyID3-known tags. Return pairs EasyID3 cannot store."""
     valid = easy.valid_keys.keys()
@@ -263,6 +297,14 @@ def save_metadata(filepath: str, tags: Mapping[str, str | None]) -> tuple[bool, 
 
         if isinstance(audio, MP4):
             _apply_mp4_tags(filepath, tags)
+            return True, ""
+
+        if isinstance(audio, ASF):
+            if audio.tags is None:
+                if only_deletes:
+                    return True, ""
+                audio.add_tags()
+            _apply_asf_tags(audio, tags)
             return True, ""
 
         if audio.tags is None:

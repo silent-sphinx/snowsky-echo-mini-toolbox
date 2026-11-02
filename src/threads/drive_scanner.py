@@ -1,5 +1,6 @@
 import os
 import mutagen
+from mutagen.asf import ASF
 from mutagen.flac import FLAC
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, SYLT, USLT, TXXX
@@ -144,6 +145,19 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
 
             if audio.tags and audio.tags.get("covr"):
                 meta.has_album_art = True
+
+        elif isinstance(audio, ASF):
+            def _asf_tag(name: str) -> str:
+                values = audio.tags.get(name) if audio.tags else None
+                return coerce_tag_text(values[0]) if values else ""
+
+            meta.title = _asf_tag("Title") or meta.title
+            meta.artist = _asf_tag("Author") or meta.artist
+            meta.album = _asf_tag("WM/AlbumTitle") or meta.album
+            meta.album_artist = _asf_tag("WM/AlbumArtist")
+            meta.genre = _asf_tag("WM/Genre")
+            meta.year = _asf_tag("WM/Year")
+            meta.track_num = _asf_tag("WM/TrackNumber")
 
         elif audio.tags:
             # Try generic dict access
