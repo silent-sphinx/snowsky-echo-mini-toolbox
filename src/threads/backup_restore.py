@@ -27,6 +27,14 @@ def destination_is_within_source(source: Path, destination: Path) -> bool:
     return source_resolved in destination_resolved.parents
 
 
+def is_within_system_folder(path: Path, root: Path) -> bool:
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+    return any(part.lower() in SYSTEM_FOLDERS for part in parts)
+
+
 def collect_backup_files(source: Path, cancel_requested) -> tuple[list[Path], int]:
     """Return (files, skipped symlink count). Raises InterruptedError if cancelled."""
     source_files: list[Path] = []
@@ -224,6 +232,8 @@ class FileTransferWorker(QObject):
                         pass
 
                 for current_dir, _dir_names, _file_names in os.walk(str(source), topdown=False):
+                    if is_within_system_folder(Path(current_dir), source):
+                        continue
                     try:
                         Path(current_dir).rmdir()
                     except Exception:

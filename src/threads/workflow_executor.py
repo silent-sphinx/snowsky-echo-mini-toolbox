@@ -13,7 +13,11 @@ from ..constants import SYSTEM_FOLDERS
 from ..models.drive_data import DriveDataModel, TrackMetadata
 from ..models.workflow import Workflow, WorkflowStep, action_label, normalize_tag_key, resolve_rename_preset_id
 from ..threads.album_art_fix import AlbumArtFixWorker
-from ..threads.backup_restore import ZipBackupWorker, destination_is_within_source
+from ..threads.backup_restore import (
+    ZipBackupWorker,
+    destination_is_within_source,
+    is_within_system_folder,
+)
 from ..threads.bulk_metadata import BulkMetadataWorker
 from ..threads.drive_scanner import extract_metadata_worker
 from ..threads.file_rename import FileRenameWorker
@@ -259,7 +263,7 @@ class WorkflowExecutionWorker(QObject):
         clean_empty = bool(step.config.get("clean_empty", True))
         to_delete: list[Path] = []
 
-        for root, dir_names, file_names in os.walk(str(self.target_path), topdown=False):
+        for root, dir_names, file_names in os.walk(str(self.target_path)):
             if self._cancel_requested:
                 return False, "Cancelled"
             dir_names[:] = [name for name in dir_names if name.lower() not in SYSTEM_FOLDERS]
@@ -284,12 +288,12 @@ class WorkflowExecutionWorker(QObject):
                 delete_failures.append(f"{path.name}: {exc}")
 
         if clean_empty:
-            for root, dir_names, file_names in os.walk(str(self.target_path), topdown=False):
+            # Bottom-up walks ignore dir_names pruning, so skip system folders by path.
+            for root, _dir_names, _file_names in os.walk(str(self.target_path), topdown=False):
                 if self._cancel_requested:
                     return False, "Cancelled"
-                dir_names[:] = [name for name in dir_names if name.lower() not in SYSTEM_FOLDERS]
                 dir_path = Path(root)
-                if dir_path == self.target_path:
+                if dir_path == self.target_path or is_within_system_folder(dir_path, self.target_path):
                     continue
                 try:
                     if not any(dir_path.iterdir()):
