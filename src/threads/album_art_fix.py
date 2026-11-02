@@ -43,6 +43,11 @@ class AlbumArtFixWorker(QObject):
         self._cancel_requested = False
         self._processed_paths: list[dict[str, str]] = []
 
+    @property
+    def processed_paths(self) -> list[dict[str, str]]:
+        """Files already changed on disk, available even after ``failed``."""
+        return list(self._processed_paths)
+
     def request_cancel(self) -> None:
         self._cancel_requested = True
 
