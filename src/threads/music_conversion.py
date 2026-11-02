@@ -344,7 +344,12 @@ class MusicConversionWorker(QObject):
                     self.progress.emit(index, total, detail_label)
                     continue
 
-                if self.make_eq_compatible and sample_rate is None:
+                should_convert = bool(candidate.get("should_convert", True))
+                needs_sanitize = bool(candidate.get("needs_sanitize", False))
+                will_modify = needs_sanitize or should_convert
+
+                # Sanitize-only files keep their audio, so the sample rate is irrelevant.
+                if should_convert and self.make_eq_compatible and sample_rate is None:
                     sample_rate = self._resolve_sample_rate_for_eq_conversion(source_path)
                     if sample_rate is None:
                         failed += 1
@@ -353,10 +358,6 @@ class MusicConversionWorker(QObject):
                         )
                         self.progress.emit(index, total, detail_label)
                         continue
-
-                should_convert = bool(candidate.get("should_convert", True))
-                needs_sanitize = bool(candidate.get("needs_sanitize", False))
-                will_modify = needs_sanitize or should_convert
 
                 output_path = source_path
                 if should_convert and source_path.suffix.lower() != ".flac":
