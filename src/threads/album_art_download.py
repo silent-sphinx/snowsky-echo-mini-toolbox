@@ -158,14 +158,19 @@ class AlbumArtApplyWorker(QObject):
             counter += 1
         return base_path.with_name(f"{stem}.bak-{int(time.time())}{suffix}")
 
-    def _backup_original_file(self, source_path: Path, relative_file: str) -> tuple[bool, str]:
+    def _backup_original_file(self, source_path: Path) -> tuple[bool, str]:
         if self.backup_root is None:
             return True, ""
 
-        backup_target = self.backup_root / Path(relative_file)
-        backup_target.parent.mkdir(parents=True, exist_ok=True)
-        backup_target = self._next_available_backup_path(backup_target)
+        # Derive from the resolved path so the backup always lands under backup_root.
         try:
+            relative = source_path.resolve().relative_to(self.target_path.resolve())
+        except (ValueError, OSError):
+            relative = Path(source_path.name)
+        backup_target = self.backup_root / relative
+        try:
+            backup_target.parent.mkdir(parents=True, exist_ok=True)
+            backup_target = self._next_available_backup_path(backup_target)
             shutil.copy2(str(source_path), str(backup_target))
             return True, ""
         except Exception as exc:
@@ -264,7 +269,7 @@ class AlbumArtApplyWorker(QObject):
                         failures.append(f"{relative_file}: file no longer exists")
                         continue
 
-                    ok, backup_error = self._backup_original_file(source_path, relative_file)
+                    ok, backup_error = self._backup_original_file(source_path)
                     if not ok:
                         failed += 1
                         failures.append(f"{relative_file}: {backup_error}")
