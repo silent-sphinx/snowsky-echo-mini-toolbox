@@ -166,9 +166,10 @@ def _apply_id3_frames(id3: ID3, tags: Mapping[str, str | None]) -> None:
         _delete_tag_from_mapping(id3, f"TXXX:{key}")
 
 
-def _apply_mp4_tags(filepath: str, tags: Mapping[str, str | None]) -> None:
+def _apply_mp4_tags(
+    easy: EasyMP4, filepath: str, tags: Mapping[str, str | None]
+) -> None:
     """Write MP4 atoms via EasyMP4; keys it cannot map become iTunes freeform atoms."""
-    easy = EasyMP4(filepath)
     if easy.tags is None:
         easy.add_tags()
     valid = EasyMP4Tags.Get.keys()
@@ -283,34 +284,26 @@ def save_metadata(filepath: str, tags: Mapping[str, str | None]) -> tuple[bool, 
         (success: bool, error_message: str)
     """
     try:
-        audio = mutagen.File(filepath, easy=False)
+        # Easy mode only swaps MP3, TrueAudio and MP4 classes, so one open suffices.
+        audio = mutagen.File(filepath, easy=True)
         if audio is None:
             return False, "Unsupported or corrupt audio file."
 
         only_deletes = all(val is None for val in tags.values())
-        is_mp3 = filepath.lower().endswith(".mp3")
 
-        if is_mp3:
-            easy = None
-            try:
-                easy = EasyID3(filepath)
-            except ID3NoHeaderError:
+        if getattr(audio, "ID3", None) is EasyID3:
+            if audio.tags is None:
                 if only_deletes:
                     return True, ""
-                ID3().save(filepath, v2_version=3)
-                easy = EasyID3(filepath)
-            except Exception:
-                easy = None
+                audio.add_tags()
+            unmapped = _apply_easy_id3(audio.tags, tags)
+            audio.save(v2_version=3)
+            if unmapped:
+                _apply_raw_id3_tags(filepath, dict(unmapped))
+            return True, ""
 
-            if easy is not None:
-                unmapped = _apply_easy_id3(easy, tags)
-                easy.save(filepath, v2_version=3)
-                if unmapped:
-                    _apply_raw_id3_tags(filepath, dict(unmapped))
-                return True, ""
-
-        if isinstance(audio, MP4):
-            _apply_mp4_tags(filepath, tags)
+        if isinstance(audio, EasyMP4):
+            _apply_mp4_tags(audio, filepath, tags)
             return True, ""
 
         if isinstance(audio, ASF):

@@ -388,10 +388,12 @@ class MetadataManager(QWidget):
                 f"Updated {updated} of {total} songs.\n\n{preview}{extra}",
             )
         else:
+            skipped = payload.get("skipped", 0)
+            note = f"\n{skipped} already up to date." if skipped else ""
             QMessageBox.information(
                 self,
                 "Bulk edit complete",
-                f"Updated metadata on {updated} song{'s' if updated != 1 else ''}.",
+                f"Updated metadata on {updated} song{'s' if updated != 1 else ''}.{note}",
             )
 
     @Slot(object)
