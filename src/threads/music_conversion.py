@@ -150,7 +150,7 @@ class MusicConversionWorker(QObject):
             "-i",
             str(source_file),
             "-map",
-            f"0:a:{audio_stream_index if audio_stream_index is not None else 0}",
+            f"0:{audio_stream_index}" if audio_stream_index is not None else "0:a:0",
             "-map_metadata",
             "0",
             "-c:a",
