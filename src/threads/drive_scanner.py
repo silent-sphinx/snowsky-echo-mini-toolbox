@@ -359,7 +359,12 @@ class DriveScannerThread(QThread):
                         print(f"Error parsing {filepath}: {e}")
                         filename = os.path.basename(filepath)
                         _, ext = os.path.splitext(filename)
-                        size = os.path.getsize(filepath)
+                        try:
+                            size = os.path.getsize(filepath)
+                        except OSError:
+                            if not os.path.exists(filepath):
+                                continue
+                            size = 0
                         meta = TrackMetadata(
                             filepath=filepath,
                             filename=filename,
