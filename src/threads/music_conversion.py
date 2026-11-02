@@ -305,7 +305,8 @@ class MusicConversionWorker(QObject):
         planned = 0
         failures: list[str] = []
         total = len(self.candidates)
-        claimed_outputs: dict[Path, Path] = {}
+        # Keyed case-insensitively: FAT/exFAT targets treat Song.flac and song.flac as one file.
+        claimed_outputs: dict[str, Path] = {}
 
         try:
             if self.backup_root is not None:
@@ -370,7 +371,8 @@ class MusicConversionWorker(QObject):
                 if should_convert and source_path.suffix.lower() != ".flac":
                     output_path = source_path.with_suffix(".flac")
                 if should_convert:
-                    previous_owner = claimed_outputs.get(output_path)
+                    output_key = str(output_path).casefold()
+                    previous_owner = claimed_outputs.get(output_key)
                     if previous_owner is not None and previous_owner != source_path:
                         failed += 1
                         failures.append(
@@ -385,7 +387,7 @@ class MusicConversionWorker(QObject):
                         )
                         self.progress.emit(index, total, detail_label)
                         continue
-                    claimed_outputs[output_path] = source_path
+                    claimed_outputs[output_key] = source_path
 
                 if self.dry_run:
                     planned += 1
