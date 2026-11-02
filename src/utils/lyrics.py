@@ -334,6 +334,9 @@ def backup_existing_lrc(
         return
 
     relative_lrc = Path(relative_file).with_suffix(".lrc")
+    # An anchored or ".." path would escape backup_root when joined.
+    if relative_lrc.anchor or ".." in relative_lrc.parts:
+        relative_lrc = Path(relative_lrc.name)
     backup_target = backup_root / relative_lrc
     backup_target.parent.mkdir(parents=True, exist_ok=True)
     backup_target = _next_available_backup_path(backup_target)

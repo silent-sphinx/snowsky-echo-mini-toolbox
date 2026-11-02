@@ -117,6 +117,14 @@ class LyricsWriteWorker(QObject):
                     continue
                 claimed[lrc_path] = source_path
 
+                # Derive from the resolved path so the backup always lands under backup_root.
+                try:
+                    backup_relative = str(
+                        source_path.resolve().relative_to(self.target_path.resolve())
+                    )
+                except (ValueError, OSError):
+                    backup_relative = source_path.name
+
                 planned += 1
                 try:
                     write_lrc_sidecar(
@@ -124,7 +132,7 @@ class LyricsWriteWorker(QObject):
                         lyrics_text,
                         dry_run=self.dry_run,
                         backup_root=self.backup_root,
-                        relative_file=relative_file,
+                        relative_file=backup_relative,
                     )
                 except Exception as exc:
                     failed += 1
