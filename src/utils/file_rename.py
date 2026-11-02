@@ -60,6 +60,8 @@ REASON_CASE = "Metadata Title uses different name"
 REASON_MATCHING = "Already matches preset"
 REASON_DUPLICATE = "Duplicate suggested target name"
 REASON_EXISTS = "Target name already exists"
+REASON_LRC_DUPLICATE = "Duplicate suggested .lrc name"
+REASON_LRC_EXISTS = "Matching .lrc target already exists"
 
 _UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _DIGITS = re.compile(r"\d+")
@@ -296,6 +298,18 @@ def apply_rename_evaluations(
     # One listdir per folder beats thousands of exists() calls on USB/FAT.
     dir_names = _directory_name_index(target_path.parent for _, target_path in candidates)
 
+    # Mirror FileRenameWorker: a sidecar .lrc moves with its audio file.
+    lrc_moves: dict[str, tuple[Path, Path]] = {}
+    lrc_target_counts: dict[str, int] = {}
+    for track, target_path in candidates:
+        source_lrc = Path(track.filepath).with_suffix(".lrc")
+        target_lrc = target_path.with_suffix(".lrc")
+        has_lrc = source_lrc.name.lower() in dir_names.get(str(source_lrc.parent), set())
+        if has_lrc and target_lrc != source_lrc:
+            lrc_moves[track.filepath] = (source_lrc, target_lrc)
+            lrc_key = str(target_lrc).lower()
+            lrc_target_counts[lrc_key] = lrc_target_counts.get(lrc_key, 0) + 1
+
     # A conflicted track keeps its name, which can in turn block a rename that
     # relied on it moving, so repeat until no new conflicts appear.
     pending = list(candidates)
@@ -305,18 +319,36 @@ def apply_rename_evaluations(
             for track, target_path in pending
             if str(target_path).lower() != str(Path(track.filepath)).lower()
         }
+        vacating_keys.update(
+            str(lrc_moves[track.filepath][0]).lower()
+            for track, _ in pending
+            if track.filepath in lrc_moves
+        )
         still_pending: list[tuple[TrackMetadata, Path]] = []
         for track, target_path in pending:
             key = str(target_path).lower()
             conflict_reason = ""
             parent_key = str(target_path.parent)
-            name_exists = target_path.name.lower() in dir_names.get(parent_key, set())
+            parent_names = dir_names.get(parent_key, set())
+            name_exists = target_path.name.lower() in parent_names
             if target_counts.get(key, 0) > 1:
                 conflict_reason = REASON_DUPLICATE
             elif name_exists:
                 source_path = Path(track.filepath)
                 if not paths_are_same_file(target_path, source_path) and key not in vacating_keys:
                     conflict_reason = REASON_EXISTS
+
+            if not conflict_reason and track.filepath in lrc_moves:
+                source_lrc, target_lrc = lrc_moves[track.filepath]
+                lrc_key = str(target_lrc).lower()
+                if lrc_target_counts.get(lrc_key, 0) > 1:
+                    conflict_reason = REASON_LRC_DUPLICATE
+                elif (
+                    target_lrc.name.lower() in parent_names
+                    and not paths_are_same_file(target_lrc, source_lrc)
+                    and lrc_key not in vacating_keys
+                ):
+                    conflict_reason = REASON_LRC_EXISTS
 
             if conflict_reason:
                 track.rename_status = "CONFLICT"
