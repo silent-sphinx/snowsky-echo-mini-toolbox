@@ -162,11 +162,24 @@ def extract_metadata_worker(filepath: str, root_path: str) -> TrackMetadata:
             except Exception:
                 pass
 
-            try:
-                meta.track_num = coerce_tag_text(audio.tags.get("TRCK", ""))
-            except Exception:
-                pass
-            
+            # ID3 frame first, then Vorbis/APE keys (APEv2 lookups are case-insensitive).
+            def _generic_tag(frame_id: str, *keys: str) -> str:
+                try:
+                    value = audio.tags.get(frame_id)
+                    for key in keys:
+                        if value is not None:
+                            break
+                        values = audio.get(key)
+                        if values:
+                            value = values[0] if isinstance(values, list) else values
+                except Exception:
+                    return ""
+                return coerce_tag_text(value)
+
+            meta.track_num = _generic_tag("TRCK", "tracknumber", "track")
+            meta.genre = _generic_tag("TCON", "genre")
+            meta.year = _generic_tag("TDRC", "date", "year")
+
             # ID3 checks for art (lyrics are evaluated separately)
             if hasattr(audio.tags, "getall"):
                 if audio.tags.getall("APIC"):
