@@ -217,6 +217,9 @@ class WorkflowExecutionWorker(QObject):
         if self._cancel_requested or box["cancelled"]:
             return False, "Cancelled"
         if box["failed"]:
+            self._refresh_from_payload(
+                {"processed_paths": getattr(worker, "processed_paths", None)}
+            )
             return False, box["failed"]
         payload = box["payload"]
         if not isinstance(payload, dict):

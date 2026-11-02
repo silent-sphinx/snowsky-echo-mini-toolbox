@@ -448,7 +448,10 @@ class MusicCompatibilityWidget(QWidget):
 
     @Slot(str)
     def _on_conversion_failed(self, error: str) -> None:
+        worker = self._conversion_worker
+        processed_paths = worker.processed_paths if worker is not None else []
         self._finish_conversion_ui()
+        self._refresh_processed_tracks(processed_paths)
         QMessageBox.warning(self, "Conversion Failed", error)
 
     def _on_table_clicked(self, index: QModelIndex) -> None:

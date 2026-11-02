@@ -73,6 +73,11 @@ class MusicConversionWorker(QObject):
         self.CONVERSION_TIMEOUT = 600
         self._processed_paths: list[dict[str, str]] = []
 
+    @property
+    def processed_paths(self) -> list[dict[str, str]]:
+        """Files already changed on disk, available even after ``failed``."""
+        return list(self._processed_paths)
+
     def request_cancel(self) -> None:
         self._cancel_requested = True
         process = self._active_process
@@ -266,9 +271,9 @@ class MusicConversionWorker(QObject):
             return True, ""
 
         backup_target = self.backup_root / Path(relative_file)
-        backup_target.parent.mkdir(parents=True, exist_ok=True)
-        backup_target = self._next_available_backup_path(backup_target)
         try:
+            backup_target.parent.mkdir(parents=True, exist_ok=True)
+            backup_target = self._next_available_backup_path(backup_target)
             shutil.copy2(str(source_path), str(backup_target))
             return True, ""
         except Exception as exc:
