@@ -77,6 +77,11 @@ def _canonical_tag_key(key: str) -> str | None:
     return None
 
 
+def canonical_tag_key(key: str) -> str | None:
+    """Map a raw frame / atom / field name onto its format-neutral key."""
+    return _canonical_tag_key(key)
+
+
 def aliases_for_tag_key(key: str) -> tuple[str, ...]:
     canonical = _canonical_tag_key(key)
     if canonical is not None:

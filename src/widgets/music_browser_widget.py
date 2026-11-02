@@ -2,7 +2,7 @@ import os
 import subprocess
 import json
 from pathlib import Path
-from PySide6.QtCore import Qt, QThread, Slot, Signal, QEvent, QRect
+from PySide6.QtCore import Qt, QThread, Slot, Signal, QEvent, QRect, QItemSelectionModel
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush, QPixmap, QImage, QMouseEvent
 from PySide6.QtWidgets import (
     QWidget,
@@ -32,7 +32,7 @@ from PySide6.QtGui import QBrush
 from ..theme import Colours
 from ..models.drive_data import DriveDataModel, TrackMetadata
 from ..utils.lyrics import atomic_write_text, decode_text_file_bytes
-from ..utils.metadata_writer import save_metadata
+from ..utils.metadata_writer import canonical_tag_key, save_metadata
 from ..utils.album_art import extract_album_art, remove_embedded_album_art
 from ..utils.album_art_planner import apply_album_art_result
 from ..utils.album_art_validation import evaluate_album_art
@@ -51,7 +51,38 @@ _RECOGNIZED_TAGS = {
     "tpe2", "trck", "tpos", "tcon",
 }
 
+# Format-neutral keys; save_metadata maps each onto the file's own field name.
+_TAG_PRESETS = (
+    ("title", "Title"),
+    ("artist", "Artist"),
+    ("album", "Album"),
+    ("albumartist", "Album Artist"),
+    ("genre", "Genre"),
+    ("date", "Year"),
+    ("tracknumber", "Track Number"),
+    ("discnumber", "Disc Number"),
+    ("composer", "Composer"),
+)
+_TAG_PRESET_LABELS = dict(_TAG_PRESETS)
+
 _META_LINE_EDIT_STYLE = "QLineEdit { border: none; background: transparent; padding: 4px 8px; }"
+# Qt requires forward slashes even on Windows for QSS URLs
+_MENU_ARROW_PATH = (
+    Path(__file__).resolve().parent.parent / "assets" / "menu_arrow.svg"
+).as_posix()
+_META_ADD_BTN_STYLE = f"""
+    QPushButton {{
+        padding-right: 30px;
+    }}
+    QPushButton::menu-indicator {{
+        image: url({_MENU_ARROW_PATH});
+        subcontrol-origin: padding;
+        subcontrol-position: center right;
+        right: 10px;
+        width: 12px;
+        height: 12px;
+    }}
+"""
 _META_DELETE_BTN_STYLE = f"""
     QPushButton {{
         padding: 2px 8px;
@@ -189,6 +220,12 @@ class MusicBrowserWidget(QWidget):
         self._is_updating_checks = False
         self._check_press_index = None
         self._multi_tracks: list[TrackMetadata] = []
+        self._preferred_tab = 0
+        self._current_tab = 0
+        self._restoring_tabs = False
+        self._reverting_selection = False
+        self._meta_track: TrackMetadata | None = None
+        self._meta_snapshot: list[tuple[str, str]] = []
         self._bulk_thread: QThread | None = None
         self._bulk_worker: BulkMetadataWorker | None = None
         self._bulk_progress: QProgressDialog | None = None
@@ -316,8 +353,18 @@ class MusicBrowserWidget(QWidget):
         
         meta_btns_lyt = QHBoxLayout()
         self._meta_add_btn = QPushButton("Add Tag")
-        self._meta_add_btn.setToolTip("Add a tag that is not already on this file.")
-        self._meta_add_btn.clicked.connect(self._on_add_tag_clicked)
+        self._meta_add_btn.setToolTip(
+            "Add a common tag, or a custom one by name. Common tags are saved "
+            "under the correct field name for this file's format."
+        )
+        add_menu = QMenu(self._meta_add_btn)
+        for key, label in _TAG_PRESETS:
+            action = add_menu.addAction(label)
+            action.triggered.connect(lambda _checked=False, k=key: self._on_add_preset_tag(k))
+        add_menu.addSeparator()
+        add_menu.addAction("Custom Tag...").triggered.connect(self._on_add_tag_clicked)
+        self._meta_add_btn.setMenu(add_menu)
+        self._meta_add_btn.setStyleSheet(_META_ADD_BTN_STYLE)
         meta_btns_lyt.addWidget(self._meta_add_btn)
         meta_btns_lyt.addStretch(1)
 
@@ -331,6 +378,7 @@ class MusicBrowserWidget(QWidget):
         meta_btns_lyt.addWidget(self._meta_save_btn)
         
         meta_lyt.addLayout(meta_btns_lyt)
+        self._update_meta_buttons()
         
         # 3. Album Art Tab
         self._art_tab = QWidget()
@@ -427,6 +475,7 @@ class MusicBrowserWidget(QWidget):
         self._tabs.addTab(self._meta_tab, "Music Metadata")
         self._tabs.addTab(self._art_tab, "Album Art")
         self._tabs.addTab(self._lyrics_tab, "Lyrics")
+        self._tabs.currentChanged.connect(self._on_tab_changed)
 
         multi_page = QWidget()
         multi_outer = QVBoxLayout(multi_page)
@@ -731,11 +780,28 @@ class MusicBrowserWidget(QWidget):
         self._show_blank_details()
 
     def _on_selection_changed(self, selected, deselected) -> None:
+        if self._reverting_selection:
+            return
+        if not self._confirm_leave_meta_edits():
+            self._reverting_selection = True
+            try:
+                model = self._tree.selectionModel()
+                model.select(selected, QItemSelectionModel.Deselect)
+                model.select(deselected, QItemSelectionModel.Select)
+                if deselected.indexes():
+                    model.setCurrentIndex(deselected.indexes()[0], QItemSelectionModel.NoUpdate)
+            finally:
+                self._reverting_selection = False
+            return
         self._refresh_details_pane()
 
     def _show_blank_details(self) -> None:
         self._multi_tracks = []
-        self._clear_details()
+        self._restoring_tabs = True
+        try:
+            self._clear_details()
+        finally:
+            self._restoring_tabs = False
         self._details_stack.setCurrentIndex(0)
 
     def _show_multi_select(self, tracks: list[TrackMetadata]) -> None:
@@ -967,6 +1033,8 @@ class MusicBrowserWidget(QWidget):
         item = self._tree_model.itemFromIndex(index)
         if not item or not item.isCheckable():
             return
+        if not self._confirm_leave_meta_edits():
+            return
         item.setCheckState(Qt.Unchecked if self._item_is_checked(item) else Qt.Checked)
 
     def _on_item_changed(self, item: QStandardItem) -> None:
@@ -1021,19 +1089,37 @@ class MusicBrowserWidget(QWidget):
             return Qt.Checked
         return Qt.PartiallyChecked
                 
+    def _on_tab_changed(self, index: int) -> None:
+        previous = self._current_tab
+        self._current_tab = index
+        if self._restoring_tabs or index < 0:
+            return
+        if previous == 1 and index != 1 and not self._confirm_leave_meta_edits():
+            self._restoring_tabs = True
+            try:
+                self._tabs.setCurrentIndex(1)
+            finally:
+                self._restoring_tabs = False
+            self._current_tab = 1
+            return
+        self._preferred_tab = index
+
     def _populate_details(self, meta: TrackMetadata) -> None:
-        self._clear_details()
-        
         is_lrc = meta.filepath.lower().endswith(".lrc")
-        
-        # Toggle tab visibility
-        self._tabs.setTabVisible(0, not is_lrc) # Properties
-        self._tabs.setTabVisible(1, not is_lrc) # Music Metadata
-        self._tabs.setTabVisible(2, not is_lrc) # Album Art
-        self._tabs.setTabVisible(3, True)       # Lyrics (either file contents or disclaimer)
-        
+
+        # Hiding tabs moves the current one, so keep the user's choice intact.
+        self._restoring_tabs = True
+        try:
+            self._clear_details()
+            self._tabs.setTabVisible(0, not is_lrc) # Properties
+            self._tabs.setTabVisible(1, not is_lrc) # Music Metadata
+            self._tabs.setTabVisible(2, not is_lrc) # Album Art
+            self._tabs.setTabVisible(3, True)       # Lyrics (either file contents or disclaimer)
+            self._tabs.setCurrentIndex(3 if is_lrc else self._preferred_tab)
+        finally:
+            self._restoring_tabs = False
+
         if is_lrc:
-            self._tabs.setCurrentIndex(3)
             self._lyrics_warning_block.hide()
             self._load_lrc_editor(meta.filepath)
             return
@@ -1052,33 +1138,9 @@ class MusicBrowserWidget(QWidget):
         ]
         self._fill_kv_table(self._props_table, props)
             
-        # Metadata
-        self._meta_table.setRowCount(0)
-        self._original_meta_keys = list(meta.all_tags.keys()) if meta.all_tags else []
-        
-        if meta.all_tags:
-            tags = list(meta.all_tags.items())
-            # Sort tags alphabetically by key for cleaner display
-            tags.sort(key=lambda x: x[0])
-        else:
-            # Fallback to standard attributes if mutagen extraction completely failed
-            tags = [
-                ("Title", meta.title),
-                ("Artist", meta.artist),
-                ("Album", meta.album),
-                ("Genre", meta.genre),
-                ("Track", str(meta.track_num)),
-                ("Year", str(meta.year)),
-            ]
+        self._fill_meta_table(meta)
             
-        for k, v in tags:
-            self._insert_meta_row(k, str(v))
-            
-        # Ensure rows are tall enough to display the QLineEdits
-        self._meta_table.resizeRowsToContents()
-            
-        # Album Art
-        self._art_table.setRowCount(0)
+        # Album Art        self._art_table.setRowCount(0)
         if meta.has_album_art:
             self._art_filepath = meta.filepath
             self._art_remove_btn.setEnabled(True)
@@ -1119,6 +1181,70 @@ class MusicBrowserWidget(QWidget):
             self._lyrics_text.setPlainText("No embedded lyrics found.")
         self._lyrics_text.document().setModified(False)
             
+    def _fill_meta_table(self, meta: TrackMetadata) -> None:
+        self._meta_track = meta
+        self._meta_table.setRowCount(0)
+        self._original_meta_keys = list(meta.all_tags.keys()) if meta.all_tags else []
+
+        if meta.all_tags:
+            tags = list(meta.all_tags.items())
+            # Sort tags alphabetically by key for cleaner display
+            tags.sort(key=lambda x: x[0])
+        else:
+            # Fallback to standard attributes if mutagen extraction completely failed
+            tags = [
+                ("Title", meta.title),
+                ("Artist", meta.artist),
+                ("Album", meta.album),
+                ("Genre", meta.genre),
+                ("Track", str(meta.track_num)),
+                ("Year", str(meta.year)),
+            ]
+            
+        for k, v in tags:
+            self._insert_meta_row(k, str(v))
+            
+        # Ensure rows are tall enough to display the QLineEdits
+        self._meta_table.resizeRowsToContents()
+        self._meta_snapshot = self._meta_rows()
+        self._update_meta_buttons()
+
+    def _meta_rows(self) -> list[tuple[str, str]]:
+        rows = []
+        for row in range(self._meta_table.rowCount()):
+            key_edit = self._meta_table.cellWidget(row, 0)
+            val_edit = self._meta_table.cellWidget(row, 1)
+            if isinstance(key_edit, QLineEdit) and isinstance(val_edit, QLineEdit):
+                rows.append((key_edit.text(), val_edit.text()))
+        return rows
+
+    def _meta_is_dirty(self) -> bool:
+        return self._meta_track is not None and self._meta_rows() != self._meta_snapshot
+
+    def _update_meta_buttons(self, *_args) -> None:
+        dirty = self._meta_is_dirty()
+        self._meta_discard_btn.setVisible(dirty)
+        self._meta_save_btn.setVisible(dirty)
+
+    def _confirm_leave_meta_edits(self) -> bool:
+        """Ask before unsaved metadata edits are lost. Return True to proceed."""
+        if not self._meta_is_dirty():
+            return True
+        reply = QMessageBox.question(
+            self,
+            "Unsaved Metadata Changes",
+            "You have unsaved metadata changes. Leaving now will discard them.\n\n"
+            "Do you want to save them first?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if reply == QMessageBox.Save:
+            return self._save_meta_edits(notify=False)
+        if reply == QMessageBox.Discard:
+            self._fill_meta_table(self._meta_track)
+            return True
+        return False
+
     def _fill_kv_table(self, table: SelectAllTableWidget, rows: list[tuple[str, str]]) -> None:
         """Fill a two-column property table without scrambling rows under an active sort."""
         table.setSortingEnabled(False)
@@ -1141,6 +1267,7 @@ class MusicBrowserWidget(QWidget):
         val_edit = QLineEdit(value)
         val_edit.setStyleSheet(_META_LINE_EDIT_STYLE)
         val_edit.setPlaceholderText("Value")
+        val_edit.textChanged.connect(self._update_meta_buttons)
         self._meta_table.setCellWidget(row, 1, val_edit)
 
         delete_btn = QPushButton("Delete")
@@ -1163,7 +1290,8 @@ class MusicBrowserWidget(QWidget):
         for row in range(self._meta_table.rowCount()):
             if self._meta_table.cellWidget(row, 0) is edit:
                 self._refresh_meta_row_highlight(row)
-                return
+                break
+        self._update_meta_buttons()
 
     def _refresh_meta_row_highlight(self, row: int) -> None:
         if row < 0 or row >= self._meta_table.rowCount():
@@ -1173,7 +1301,13 @@ class MusicBrowserWidget(QWidget):
         key = key_edit.text().strip() if isinstance(key_edit, QLineEdit) else ""
         recognized = key.lower() in _RECOGNIZED_TAGS
         brush = QBrush(QColor(40, 80, 40)) if recognized else QBrush()
-        tooltip = "Tag Recognised by Snowsky" if recognized else ""
+        tooltips = []
+        label = _TAG_PRESET_LABELS.get(canonical_tag_key(key) or "")
+        if label and label.lower() != key.lower():
+            tooltips.append(f"{label} ({key})")
+        if recognized:
+            tooltips.append("Tag Recognised by Snowsky")
+        tooltip = "\n".join(tooltips)
         for col in range(3):
             item = self._meta_table.item(row, col)
             if item is not None:
@@ -1182,6 +1316,23 @@ class MusicBrowserWidget(QWidget):
             key_edit.setToolTip(tooltip)
         if isinstance(val_edit, QLineEdit):
             val_edit.setToolTip(tooltip)
+
+    def _on_add_preset_tag(self, key: str) -> None:
+        for row in range(self._meta_table.rowCount()):
+            key_edit = self._meta_table.cellWidget(row, 0)
+            if isinstance(key_edit, QLineEdit) and canonical_tag_key(key_edit.text().strip()) == key:
+                break
+        else:
+            row = self._insert_meta_row(key, "")
+            self._meta_table.resizeRowToContents(row)
+        item = self._meta_table.item(row, 0)
+        if item is not None:
+            self._meta_table.scrollToItem(item)
+        val_edit = self._meta_table.cellWidget(row, 1)
+        if isinstance(val_edit, QLineEdit):
+            val_edit.setFocus()
+            val_edit.selectAll()
+        self._update_meta_buttons()
 
     def _on_add_tag_clicked(self) -> None:
         row = self._insert_meta_row("", "")
@@ -1192,13 +1343,15 @@ class MusicBrowserWidget(QWidget):
         key_edit = self._meta_table.cellWidget(row, 0)
         if isinstance(key_edit, QLineEdit):
             key_edit.setFocus()
+        self._update_meta_buttons()
 
     def _on_delete_tag_clicked(self, _checked: bool = False) -> None:
         button = self.sender()
         for row in range(self._meta_table.rowCount()):
             if self._meta_table.cellWidget(row, 2) is button:
                 self._meta_table.removeRow(row)
-                return
+                break
+        self._update_meta_buttons()
 
     def _tags_from_meta_table(self) -> dict[str, str | None]:
         current: dict[str, str] = {}
@@ -1221,8 +1374,11 @@ class MusicBrowserWidget(QWidget):
 
     def _clear_details(self) -> None:
         self._original_meta_keys = []
+        self._meta_track = None
+        self._meta_snapshot = []
         self._props_table.setRowCount(0)
         self._meta_table.setRowCount(0)
+        self._update_meta_buttons()
         self._art_table.setRowCount(0)
         self._art_image_lbl.setPixmap(QPixmap())
         self._art_image_lbl.setText("No Album Art")
@@ -1327,24 +1483,18 @@ class MusicBrowserWidget(QWidget):
             self.library_changed.emit(self._data_model)
 
     def _on_discard_metadata_clicked(self) -> None:
-        # Reload the metadata for the current selection from the cache
-        indexes = self._tree.selectionModel().selectedIndexes()
-        if indexes:
-            # Trigger standard selection changed logic to rebuild the details panel
-            self._on_selection_changed(self._tree.selectionModel().selection(), None)
-            
+        if self._meta_track is not None:
+            self._fill_meta_table(self._meta_track)
+
     def _on_save_metadata_clicked(self) -> None:
-        if not self._data_model:
-            return
-            
-        indexes = self._tree.selectionModel().selectedIndexes()
-        if not indexes:
-            return
-            
-        index = indexes[0]
-        item = self._tree_model.itemFromIndex(index)
-        filepath = item.data(Qt.UserRole)
-        
+        self._save_meta_edits(notify=True)
+
+    def _save_meta_edits(self, notify: bool) -> bool:
+        """Write the metadata table to the loaded file. Return True on success."""
+        if not self._data_model or self._meta_track is None:
+            return False
+        filepath = self._meta_track.filepath
+
         new_tags = self._tags_from_meta_table()
         if not new_tags:
             QMessageBox.information(
@@ -1352,7 +1502,7 @@ class MusicBrowserWidget(QWidget):
                 "No metadata changes",
                 "Add a tag or keep at least one existing tag before saving.",
             )
-            return
+            return False
 
         self._meta_save_btn.setText("Saving...")
         QApplication.processEvents()
@@ -1365,6 +1515,10 @@ class MusicBrowserWidget(QWidget):
             self._original_meta_keys = [
                 key for key, value in new_tags.items() if value is not None
             ]
-            QMessageBox.information(self, "Success", "Metadata saved successfully.")
-        else:
-            QMessageBox.critical(self, "Error", f"Failed to save metadata:\n{msg}")
+            self._meta_snapshot = self._meta_rows()
+            self._update_meta_buttons()
+            if notify:
+                QMessageBox.information(self, "Success", "Metadata saved successfully.")
+            return True
+        QMessageBox.critical(self, "Error", f"Failed to save metadata:\n{msg}")
+        return False
