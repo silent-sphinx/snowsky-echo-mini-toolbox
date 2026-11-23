@@ -61,6 +61,7 @@ From there, work through the tabs that flag problems. Each one shows you what it
 - **Workflows**: chain backup, conversion, artwork, lyrics, metadata, rename, and cleanup into one saved run.
 - **File cleanup**: group files by type so unwanted categories can be removed safely.
 - **Backup & restore**: create ZIP backups, or copy and move your library elsewhere.
+- **Misc tools**: small library clean-ups. Currently Various Artists normalisation, which rewrites tags like "Various", "VA" or "Multiple Artists" to one value you choose.
 
 Artwork and lyrics lookups are the only features that use the network, and only when you start them.
 
@@ -80,6 +81,7 @@ The `v2` rewrite is being rebuilt tab by tab. Everything below already ships in 
 | File cleanup | Implemented |
 | Backup & restore | Implemented |
 | Workflows | Implemented |
+| Misc tools (Various Artists) | Implemented |
 
 ## Device compatibility
 

@@ -31,6 +31,7 @@ from .widgets.backup_restore_widget import BackupRestoreWidget
 from .widgets.file_rename_widget import FileRenameWidget
 from .widgets.file_cleanup_widget import FileCleanupWidget
 from .widgets.workflow_widget import WorkflowWidget
+from .widgets.misc_tools_widget import MiscToolsWidget
 from .widgets.music_browser_widget import MusicBrowserWidget
 from .widgets.music_compatibility_widget import MusicCompatibilityWidget
 from .threads.drive_scanner import DriveScannerThread
@@ -177,6 +178,11 @@ class MainWindow(QMainWindow):
         self._workflows = WorkflowWidget()
         self._workflows.needs_rescan.connect(self._rescan_current_target)
         self._tabs.addTab(self._workflows, "Workflows")
+
+        # Index 10: Misc Tools
+        self._misc_tools = MiscToolsWidget()
+        self._misc_tools.library_changed.connect(self._on_library_changed)
+        self._tabs.addTab(self._misc_tools, "Misc Tools")
         self._tabs.currentChanged.connect(self._on_library_tab_changed)
         
         tab_layout.addWidget(self._tabs)
@@ -223,6 +229,7 @@ class MainWindow(QMainWindow):
             app.removeEventFilter(self)
         for widget in (
             getattr(self, "_workflows", None),
+            getattr(self, "_misc_tools", None),
             getattr(self, "_file_cleanup", None),
             getattr(self, "_music_compatibility", None),
             getattr(self, "_music_browser", None),
@@ -508,6 +515,7 @@ class MainWindow(QMainWindow):
                 ("File Cleanup", self._file_cleanup, lambda: self._file_cleanup.populate_data(data_model)),
                 ("Backup / Restore", self._backup_restore, lambda: self._backup_restore.populate_data(data_model)),
                 ("Workflows", self._workflows, lambda: self._workflows.populate_data(data_model)),
+                ("Misc Tools", self._misc_tools, lambda: self._misc_tools.populate_data(data_model)),
             ]
         )
         return jobs
@@ -590,6 +598,7 @@ class MainWindow(QMainWindow):
             self._file_cleanup,
             self._backup_restore,
             self._workflows,
+            self._misc_tools,
         ):
             widget.set_processing_state(False)
             keep_ui_alive()
@@ -635,6 +644,7 @@ class MainWindow(QMainWindow):
         self._file_cleanup.set_processing_state(is_processing)
         self._backup_restore.set_processing_state(is_processing)
         self._workflows.set_processing_state(is_processing)
+        self._misc_tools.set_processing_state(is_processing)
 
         if not is_processing:
             QTimer.singleShot(0, self._unlock_input_after_populate)
