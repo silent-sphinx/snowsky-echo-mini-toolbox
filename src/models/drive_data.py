@@ -121,6 +121,9 @@ class TrackMetadata:
     rename_title: str = ""
     rename_is_checked: bool = False
 
+    # Misc Tools: Various Artists normalisation
+    va_is_checked: bool = False
+
     @property
     def display_size(self) -> str:
         if self.size_bytes < 1024 * 1024:

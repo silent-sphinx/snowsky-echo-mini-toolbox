@@ -5,8 +5,8 @@ Provides a minimal tabbed interface that houses the Metadata Manager
 and serves as the foundation for the full app rewrite.
 """
 
-from PySide6.QtCore import Qt, QEvent, QTimer, QStorageInfo
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtCore import Qt, QEvent, QSettings, QTimer, QStorageInfo, QUrl
+from PySide6.QtGui import QAction, QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -31,13 +31,19 @@ from .widgets.backup_restore_widget import BackupRestoreWidget
 from .widgets.file_rename_widget import FileRenameWidget
 from .widgets.file_cleanup_widget import FileCleanupWidget
 from .widgets.workflow_widget import WorkflowWidget
+from .widgets.misc_tools_widget import MiscToolsWidget
 from .widgets.music_browser_widget import MusicBrowserWidget
 from .widgets.music_compatibility_widget import MusicCompatibilityWidget
 from .threads.drive_scanner import DriveScannerThread
+from .threads.update_check import UpdateCheckThread
 from .theme import Colours
 from .constants import APP_VERSION
+from .models.workflow import SETTINGS_APP, SETTINGS_ORG
 from .utils.volume import eject_volume, removable_volume_for_path
 from .widgets.page_chrome import keep_ui_alive
+
+
+UPDATE_NOTIFICATIONS_OFF_KEY = "updates/notifications_disabled"
 
 
 class MainWindow(QMainWindow):
@@ -57,6 +63,7 @@ class MainWindow(QMainWindow):
         self._populate_done = 0
         self._populate_status_prefix = "Loading tables"
         self._input_locked = False
+        self._update_thread: UpdateCheckThread | None = None
         self._init_ui()
         app = QApplication.instance()
         if app is not None:
@@ -73,6 +80,32 @@ class MainWindow(QMainWindow):
                 handle.devicePixelRatio()
             # Wait until the first expose has finished before showing the overlay.
             QTimer.singleShot(100, self._show_drive_selector)
+            self._start_update_check()
+
+    def _start_update_check(self) -> None:
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        if settings.value(UPDATE_NOTIFICATIONS_OFF_KEY, False, type=bool):
+            return
+        self._update_thread = UpdateCheckThread(self)
+        self._update_thread.update_available.connect(self._show_update_prompt)
+        self._update_thread.start()
+
+    def _show_update_prompt(self, version: str, url: str) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("Update available")
+        box.setText(f"Version {version} of Snowsky Echo Mini Toolbox is available.")
+        box.setInformativeText(f"You are running {APP_VERSION}.")
+        open_button = box.addButton("Take me to the page", QMessageBox.AcceptRole)
+        box.addButton("Do later", QMessageBox.RejectRole)
+        disable_button = box.addButton("Turn off these notifications", QMessageBox.DestructiveRole)
+        box.setDefaultButton(open_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is open_button:
+            QDesktopServices.openUrl(QUrl(url))
+        elif clicked is disable_button:
+            QSettings(SETTINGS_ORG, SETTINGS_APP).setValue(UPDATE_NOTIFICATIONS_OFF_KEY, True)
 
     def eventFilter(self, obj, event) -> bool:
         """Drop input while tables are being filled so a click cannot land on a widget that is about to be rebuilt."""
@@ -177,6 +210,11 @@ class MainWindow(QMainWindow):
         self._workflows = WorkflowWidget()
         self._workflows.needs_rescan.connect(self._rescan_current_target)
         self._tabs.addTab(self._workflows, "Workflows")
+
+        # Index 10: Misc Tools
+        self._misc_tools = MiscToolsWidget()
+        self._misc_tools.library_changed.connect(self._on_library_changed)
+        self._tabs.addTab(self._misc_tools, "Misc Tools")
         self._tabs.currentChanged.connect(self._on_library_tab_changed)
         
         tab_layout.addWidget(self._tabs)
@@ -223,6 +261,7 @@ class MainWindow(QMainWindow):
             app.removeEventFilter(self)
         for widget in (
             getattr(self, "_workflows", None),
+            getattr(self, "_misc_tools", None),
             getattr(self, "_file_cleanup", None),
             getattr(self, "_music_compatibility", None),
             getattr(self, "_music_browser", None),
@@ -234,6 +273,8 @@ class MainWindow(QMainWindow):
         ):
             if widget is not None and hasattr(widget, "cancel_running_job"):
                 widget.cancel_running_job()
+        if self._update_thread is not None and self._update_thread.isRunning():
+            self._update_thread.wait(2000)
         if hasattr(self, '_scanner_thread') and self._scanner_thread.isRunning():
             self._scanner_thread.cancel()
             self._scanner_thread.wait()
@@ -508,6 +549,7 @@ class MainWindow(QMainWindow):
                 ("File Cleanup", self._file_cleanup, lambda: self._file_cleanup.populate_data(data_model)),
                 ("Backup / Restore", self._backup_restore, lambda: self._backup_restore.populate_data(data_model)),
                 ("Workflows", self._workflows, lambda: self._workflows.populate_data(data_model)),
+                ("Misc Tools", self._misc_tools, lambda: self._misc_tools.populate_data(data_model)),
             ]
         )
         return jobs
@@ -590,6 +632,7 @@ class MainWindow(QMainWindow):
             self._file_cleanup,
             self._backup_restore,
             self._workflows,
+            self._misc_tools,
         ):
             widget.set_processing_state(False)
             keep_ui_alive()
@@ -635,6 +678,7 @@ class MainWindow(QMainWindow):
         self._file_cleanup.set_processing_state(is_processing)
         self._backup_restore.set_processing_state(is_processing)
         self._workflows.set_processing_state(is_processing)
+        self._misc_tools.set_processing_state(is_processing)
 
         if not is_processing:
             QTimer.singleShot(0, self._unlock_input_after_populate)

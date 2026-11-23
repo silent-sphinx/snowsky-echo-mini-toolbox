@@ -25,7 +25,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QDialog,
     QInputDialog,
-    QProgressDialog
+    QProgressDialog,
+    QFileDialog,
 )
 from PySide6.QtGui import QBrush
 
@@ -33,10 +34,17 @@ from ..theme import Colours
 from ..models.drive_data import DriveDataModel, TrackMetadata
 from ..utils.lyrics import atomic_write_text, decode_text_file_bytes
 from ..utils.metadata_writer import canonical_tag_key, save_metadata
-from ..utils.album_art import extract_album_art, remove_embedded_album_art
+from ..utils.album_art import (
+    extract_album_art,
+    remove_embedded_album_art,
+    supports_artwork_write,
+    to_non_progressive_jpeg,
+    write_embedded_album_art,
+)
 from ..utils.album_art_planner import apply_album_art_result
 from ..utils.album_art_validation import evaluate_album_art
 from ..utils.file_rename import paths_are_same_file
+from ..threads.bulk_album_art import BulkAlbumArtWorker
 from ..threads.bulk_metadata import BulkMetadataWorker
 from .bulk_metadata_dialog import BulkMetadataDialog
 from .page_chrome import freeze_view, keep_ui_alive
@@ -227,7 +235,7 @@ class MusicBrowserWidget(QWidget):
         self._meta_track: TrackMetadata | None = None
         self._meta_snapshot: list[tuple[str, str]] = []
         self._bulk_thread: QThread | None = None
-        self._bulk_worker: BulkMetadataWorker | None = None
+        self._bulk_worker: BulkMetadataWorker | BulkAlbumArtWorker | None = None
         self._bulk_progress: QProgressDialog | None = None
         self._bulk_tags: dict[str, str | None] = {}
         self._editing_lrc_path: str | None = None
@@ -408,6 +416,13 @@ class MusicBrowserWidget(QWidget):
 
         art_btns_lyt = QHBoxLayout()
         art_btns_lyt.addStretch(1)
+        self._art_upload_btn = QPushButton("Upload Artwork...")
+        self._art_upload_btn.setToolTip(
+            "Embed a custom image as this file's album art, replacing any existing artwork."
+        )
+        self._art_upload_btn.setEnabled(False)
+        self._art_upload_btn.clicked.connect(self._on_upload_artwork_clicked)
+        art_btns_lyt.addWidget(self._art_upload_btn)
         self._art_remove_btn = QPushButton("Remove Artwork")
         self._art_remove_btn.setToolTip("Delete all embedded artwork from this file.")
         self._art_remove_btn.setEnabled(False)
@@ -504,6 +519,19 @@ class MusicBrowserWidget(QWidget):
         self._bulk_edit_btn.setMinimumHeight(34)
         self._bulk_edit_btn.clicked.connect(self._on_bulk_edit_metadata)
 
+        self._bulk_art_btn = QPushButton("Bulk Change Album Art")
+        self._bulk_art_btn.setObjectName("accentButton")
+        self._bulk_art_btn.setMinimumHeight(34)
+        self._bulk_art_btn.setToolTip(
+            "Embed one image as the album art of every selected song, replacing existing artwork."
+        )
+        self._bulk_art_btn.clicked.connect(self._on_bulk_change_album_art)
+
+        self._bulk_art_remove_btn = QPushButton("Bulk Remove Album Art")
+        self._bulk_art_remove_btn.setMinimumHeight(34)
+        self._bulk_art_remove_btn.setToolTip("Delete all embedded artwork from every selected song.")
+        self._bulk_art_remove_btn.clicked.connect(self._on_bulk_remove_album_art)
+
         self._unselect_all_btn = QPushButton("Unselect All")
         self._unselect_all_btn.setMinimumHeight(34)
         self._unselect_all_btn.clicked.connect(self._on_unselect_all)
@@ -512,6 +540,8 @@ class MusicBrowserWidget(QWidget):
         multi_lyt.addWidget(self._multi_prompt_lbl)
         multi_lyt.addSpacing(8)
         multi_lyt.addWidget(self._bulk_edit_btn)
+        multi_lyt.addWidget(self._bulk_art_btn)
+        multi_lyt.addWidget(self._bulk_art_remove_btn)
         multi_lyt.addWidget(self._unselect_all_btn)
 
         multi_outer.addWidget(multi_column, 0, Qt.AlignHCenter)
@@ -655,6 +685,7 @@ class MusicBrowserWidget(QWidget):
         """Populate the UI using the centralized data model."""
         self._data_model = data_model
         self._tree_items_built = 0
+        view_state = self._capture_tree_view_state()
         with freeze_view(self._tree, restore_sorting=False):
             self._tree_model.blockSignals(True)
             try:
@@ -667,8 +698,57 @@ class MusicBrowserWidget(QWidget):
                 # cached rows before freeze_view lets any events run.
                 self._tree.reset()
         keep_ui_alive()
-        self._show_blank_details()
-        
+        if not self._restore_tree_view_state(view_state):
+            self._show_blank_details()
+
+    def _capture_tree_view_state(self) -> tuple[set[str], list[str], int]:
+        """Remember expansion, selection and scroll so a rescan doesn't move the user."""
+        expanded: set[str] = set()
+
+        def walk(parent: QStandardItem) -> None:
+            for row in range(parent.rowCount()):
+                child = parent.child(row)
+                if child.rowCount() and self._tree.isExpanded(child.index()):
+                    expanded.add(child.data(Qt.UserRole))
+                walk(child)
+
+        walk(self._tree_model.invisibleRootItem())
+        selected = [
+            index.data(Qt.UserRole)
+            for index in self._tree.selectionModel().selectedRows()
+        ]
+        return expanded, selected, self._tree.verticalScrollBar().value()
+
+    def _restore_tree_view_state(self, state: tuple[set[str], list[str], int]) -> bool:
+        """Reapply captured state; return True if any selection was restored."""
+        expanded, selected, scroll = state
+        selected_paths = set(selected)
+        to_select: list[QStandardItem] = []
+
+        def walk(parent: QStandardItem) -> None:
+            for row in range(parent.rowCount()):
+                child = parent.child(row)
+                path = child.data(Qt.UserRole)
+                if path in expanded:
+                    self._tree.setExpanded(child.index(), True)
+                if path in selected_paths:
+                    to_select.append(child)
+                walk(child)
+
+        walk(self._tree_model.invisibleRootItem())
+        self._tree.verticalScrollBar().setValue(scroll)
+        if not to_select:
+            return False
+        selection_model = self._tree.selectionModel()
+        for item in to_select:
+            selection_model.select(
+                item.index(),
+                QItemSelectionModel.Select | QItemSelectionModel.Rows,
+            )
+        selection_model.setCurrentIndex(to_select[0].index(), QItemSelectionModel.NoUpdate)
+        self._refresh_details_pane()
+        return True
+
     def _build_tree(self, tree_dict: dict, parent_item: QStandardItem, current_path: str) -> None:
         # Sort items: folders first (sub_dict is not None), then A-Z
         sorted_items = sorted(
@@ -813,6 +893,11 @@ class MusicBrowserWidget(QWidget):
         song_label = "Song" if song_count == 1 else "Songs"
         self._bulk_edit_btn.setText(f"Bulk Edit Metadata ({song_count} {song_label})")
         self._bulk_edit_btn.setEnabled(song_count >= 2)
+        self._bulk_art_btn.setText(f"Bulk Change Album Art ({song_count} {song_label})")
+        self._bulk_art_btn.setEnabled(song_count >= 2)
+        art_count = sum(1 for track in songs if track.has_album_art)
+        self._bulk_art_remove_btn.setText(f"Bulk Remove Album Art ({art_count} with art)")
+        self._bulk_art_remove_btn.setEnabled(art_count >= 1)
         self._details_stack.setCurrentIndex(2)
 
     def _on_unselect_all(self) -> None:
@@ -863,15 +948,17 @@ class MusicBrowserWidget(QWidget):
         self, tracks: list[TrackMetadata], tags: dict[str, str | None]
     ) -> None:
         self._bulk_tags = tags
-
-        progress = QProgressDialog(
-            f"Updating {len(tracks)} songs...",
-            "Cancel",
-            0,
+        self._start_bulk_job(
+            "Bulk Edit Metadata",
             len(tracks),
-            self,
+            BulkMetadataWorker(tracks, tags),
+            self._on_bulk_finished,
+            self._on_bulk_cancelled,
         )
-        progress.setWindowTitle("Bulk Edit Metadata")
+
+    def _start_bulk_job(self, title: str, count: int, worker, on_finished, on_cancelled) -> None:
+        progress = QProgressDialog(f"Updating {count} songs...", "Cancel", 0, count, self)
+        progress.setWindowTitle(title)
         progress.setWindowModality(Qt.ApplicationModal)
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
@@ -882,21 +969,23 @@ class MusicBrowserWidget(QWidget):
 
         self._bulk_progress = progress
         self._bulk_edit_btn.setEnabled(False)
+        self._bulk_art_btn.setEnabled(False)
+        self._bulk_art_remove_btn.setEnabled(False)
 
         self._bulk_thread = QThread(self)
-        self._bulk_worker = BulkMetadataWorker(tracks, tags)
-        self._bulk_worker.moveToThread(self._bulk_thread)
+        self._bulk_worker = worker
+        worker.moveToThread(self._bulk_thread)
 
-        self._bulk_thread.started.connect(self._bulk_worker.run)
-        self._bulk_worker.progress.connect(self._on_bulk_progress)
-        self._bulk_worker.finished.connect(self._on_bulk_finished)
-        self._bulk_worker.cancelled.connect(self._on_bulk_cancelled)
-        self._bulk_worker.failed.connect(self._on_bulk_failed)
+        self._bulk_thread.started.connect(worker.run)
+        worker.progress.connect(self._on_bulk_progress)
+        worker.finished.connect(on_finished)
+        worker.cancelled.connect(on_cancelled)
+        worker.failed.connect(self._on_bulk_failed)
 
-        self._bulk_worker.finished.connect(self._bulk_thread.quit)
-        self._bulk_worker.cancelled.connect(self._bulk_thread.quit)
-        self._bulk_worker.failed.connect(self._bulk_thread.quit)
-        self._bulk_thread.finished.connect(self._bulk_worker.deleteLater)
+        worker.finished.connect(self._bulk_thread.quit)
+        worker.cancelled.connect(self._bulk_thread.quit)
+        worker.failed.connect(self._bulk_thread.quit)
+        self._bulk_thread.finished.connect(worker.deleteLater)
         self._bulk_thread.finished.connect(self._bulk_thread.deleteLater)
         self._bulk_thread.finished.connect(self._clear_bulk_refs)
 
@@ -946,6 +1035,8 @@ class MusicBrowserWidget(QWidget):
             progress.close()
 
         self._bulk_edit_btn.setEnabled(True)
+        self._bulk_art_btn.setEnabled(True)
+        self._bulk_art_remove_btn.setEnabled(True)
 
     def _apply_bulk_results(self, payload: dict) -> tuple[int, list[str]]:
         updated_paths = payload.get("updated_paths", [])
@@ -977,6 +1068,138 @@ class MusicBrowserWidget(QWidget):
                 "Bulk edit complete",
                 f"Updated metadata on {updated} song{'s' if updated != 1 else ''}.{note}",
             )
+
+    def _on_bulk_change_album_art(self) -> None:
+        if self._bulk_thread is not None:
+            return
+
+        tracks = [
+            track
+            for track in self._music_tracks(
+                self._multi_tracks or self._checked_file_tracks() or self._highlighted_file_tracks()
+            )
+            if supports_artwork_write(Path(track.filepath))
+        ]
+        if len(tracks) < 2:
+            QMessageBox.information(
+                self,
+                "Bulk Change Album Art",
+                "Fewer than two of the selected files can store album art.",
+            )
+            return
+
+        image_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Album Art",
+            "",
+            "Images (*.jpg *.jpeg *.png *.bmp *.gif *.webp *.tif *.tiff);;All Files (*)",
+        )
+        if not image_path:
+            return
+
+        try:
+            raw_image = Path(image_path).read_bytes()
+        except OSError as exc:
+            QMessageBox.critical(self, "Error", f"Could not read the image:\n{exc}")
+            return
+        jpeg_data = to_non_progressive_jpeg(raw_image)
+        if not jpeg_data:
+            QMessageBox.critical(self, "Error", "The selected file is not a readable image.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Bulk Change Album Art",
+            f"Replace the album art of {len(tracks)} songs with '{os.path.basename(image_path)}'?\n"
+            "Existing artwork is overwritten and this cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._start_bulk_job(
+            "Bulk Change Album Art",
+            len(tracks),
+            BulkAlbumArtWorker(tracks, jpeg_data),
+            self._on_bulk_art_finished,
+            self._on_bulk_art_cancelled,
+        )
+
+    def _on_bulk_remove_album_art(self) -> None:
+        if self._bulk_thread is not None:
+            return
+
+        tracks = [
+            track
+            for track in self._music_tracks(
+                self._multi_tracks or self._checked_file_tracks() or self._highlighted_file_tracks()
+            )
+            if track.has_album_art
+        ]
+        if not tracks:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Bulk Remove Album Art",
+            f"Remove all embedded artwork from {len(tracks)} songs?\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._start_bulk_job(
+            "Bulk Remove Album Art",
+            len(tracks),
+            BulkAlbumArtWorker(tracks, None),
+            self._on_bulk_art_finished,
+            self._on_bulk_art_cancelled,
+        )
+
+    def _apply_bulk_art_results(self, payload: dict) -> tuple[int, list[str]]:
+        results = payload.get("results", {})
+        if self._data_model:
+            for filepath, (art_result, size) in results.items():
+                track = self._data_model.get_track(filepath)
+                if track is not None:
+                    apply_album_art_result(track, art_result)
+                    track.size_bytes = size
+        self._refresh_details_pane()
+        if results and self._data_model is not None:
+            self.library_changed.emit(self._data_model)
+        return len(results), payload.get("errors", [])
+
+    @Slot(object)
+    def _on_bulk_art_finished(self, payload: dict) -> None:
+        self._close_bulk_progress()
+        updated, errors = self._apply_bulk_art_results(payload)
+        total = payload.get("total", updated)
+        if errors:
+            preview = "\n".join(errors[:8])
+            extra = f"\n...and {len(errors) - 8} more." if len(errors) > 8 else ""
+            QMessageBox.warning(
+                self,
+                "Bulk album art finished with errors",
+                f"Updated {updated} of {total} songs.\n\n{preview}{extra}",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Bulk album art complete",
+                f"Updated album art on {updated} song{'s' if updated != 1 else ''}.",
+            )
+
+    @Slot(object)
+    def _on_bulk_art_cancelled(self, payload: dict) -> None:
+        self._close_bulk_progress()
+        updated, _ = self._apply_bulk_art_results(payload)
+        QMessageBox.information(
+            self,
+            "Bulk album art cancelled",
+            f"Cancelled after updating {updated} of {payload.get('total', 0)} songs.",
+        )
 
     @Slot(object)
     def _on_bulk_cancelled(self, payload: dict) -> None:
@@ -1157,9 +1380,10 @@ class MusicBrowserWidget(QWidget):
         self._fill_meta_table(meta)
             
         # Album Art        self._art_table.setRowCount(0)
+        self._art_filepath = meta.filepath
+        self._art_upload_btn.setEnabled(supports_artwork_write(Path(meta.filepath)))
+        self._art_remove_btn.setEnabled(meta.has_album_art)
         if meta.has_album_art:
-            self._art_filepath = meta.filepath
-            self._art_remove_btn.setEnabled(True)
             art_info = extract_album_art(meta.filepath)
             if art_info:
                 # Load Pixmap
@@ -1399,6 +1623,7 @@ class MusicBrowserWidget(QWidget):
         self._art_image_lbl.setPixmap(QPixmap())
         self._art_image_lbl.setText("No Album Art")
         self._art_filepath = None
+        self._art_upload_btn.setEnabled(False)
         self._art_remove_btn.setEnabled(False)
         self._lyrics_text.setPlainText("")
         self._set_lyrics_editable(False)
@@ -1465,6 +1690,47 @@ class MusicBrowserWidget(QWidget):
                 except OSError:
                     pass
         QMessageBox.information(self, "Success", "LRC file saved successfully.")
+
+    def _on_upload_artwork_clicked(self) -> None:
+        filepath = self._art_filepath
+        if not filepath:
+            return
+
+        image_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Album Art",
+            "",
+            "Images (*.jpg *.jpeg *.png *.bmp *.gif *.webp *.tif *.tiff);;All Files (*)",
+        )
+        if not image_path:
+            return
+
+        try:
+            raw_image = Path(image_path).read_bytes()
+        except OSError as exc:
+            QMessageBox.critical(self, "Error", f"Could not read the image:\n{exc}")
+            return
+
+        jpeg_data = to_non_progressive_jpeg(raw_image)
+        if not jpeg_data:
+            QMessageBox.critical(self, "Error", "The selected file is not a readable image.")
+            return
+
+        success, msg = write_embedded_album_art(Path(filepath), jpeg_data)
+        if not success:
+            QMessageBox.critical(self, "Error", f"Failed to write artwork:\n{msg}")
+            return
+
+        track = self._data_model.get_track(filepath) if self._data_model else None
+        if track is not None:
+            apply_album_art_result(track, evaluate_album_art(Path(filepath)))
+            try:
+                track.size_bytes = os.path.getsize(filepath)
+            except OSError:
+                pass
+        self._refresh_details_pane()
+        if self._data_model is not None:
+            self.library_changed.emit(self._data_model)
 
     def _on_remove_artwork_clicked(self) -> None:
         filepath = self._art_filepath

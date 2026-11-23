@@ -9,7 +9,7 @@
 [![Build](https://img.shields.io/github/actions/workflow/status/silent-sphinx/snowsky-echo-mini-toolbox/release.yml?label=build)](https://github.com/silent-sphinx/snowsky-echo-mini-toolbox/actions/workflows/release.yml)
 [![Open issues](https://img.shields.io/github/issues/silent-sphinx/snowsky-echo-mini-toolbox?color=orange)](https://github.com/silent-sphinx/snowsky-echo-mini-toolbox/issues)
 
-[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Python 3.12](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PySide6](https://img.shields.io/badge/UI-PySide6-41CD52?logo=qt&logoColor=white)](https://doc.qt.io/qtforpython-6/)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-0A7E07)](#2-download-the-app)
 [![Unofficial](https://img.shields.io/badge/status-unofficial%20community%20tool-8957e5)](#about-this-project)
@@ -61,25 +61,9 @@ From there, work through the tabs that flag problems. Each one shows you what it
 - **Workflows**: chain backup, conversion, artwork, lyrics, metadata, rename, and cleanup into one saved run.
 - **File cleanup**: group files by type so unwanted categories can be removed safely.
 - **Backup & restore**: create ZIP backups, or copy and move your library elsewhere.
+- **Misc tools**: small library clean-ups. Currently Various Artists normalisation, which rewrites tags like "Various", "VA" or "Multiple Artists" to one value you choose.
 
 Artwork and lyrics lookups are the only features that use the network, and only when you start them.
-
-### Rewrite status
-
-The `v2` rewrite is being rebuilt tab by tab. Everything below already ships in the current release; this table tracks the rewrite itself.
-
-| Area | `v2` status |
-| --- | --- |
-| Drive information | Implemented |
-| Music compatibility & conversion | Implemented |
-| File browser | Implemented |
-| Metadata browser | Implemented |
-| Album art (fix & download) | Implemented |
-| Lyrics manager | Implemented |
-| File rename | Implemented |
-| File cleanup | Implemented |
-| Backup & restore | Implemented |
-| Workflows | Implemented |
 
 ## Device compatibility
 
@@ -127,7 +111,7 @@ Useful if you are developing, or if Smart App Control is blocking the Windows in
 
 **Requirements**
 
-- Python 3.12 or newer (3.12 recommended)
+- **Python 3.12** (requirements.txt pins `PySide6==6.7.0`, which has no wheel for 3.13 so use no newer than Python 3.12)
 - `ffmpeg` and `ffprobe` available on your `PATH`. Release builds bundle these, source checkouts do not.
 
 Install ffmpeg with `winget install -e --id Gyan.FFmpeg` on Windows, `brew install ffmpeg` on macOS, or `sudo apt-get install -y ffmpeg` on Debian/Ubuntu.

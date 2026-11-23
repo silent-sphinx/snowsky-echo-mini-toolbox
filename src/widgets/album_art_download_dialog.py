@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..theme import Colours
-from ..utils.album_art_download import AlbumArtLookupClient, LookupCancelled
+from ..utils.album_art_download import AlbumArtLookupClient, ImagePrefetcher, LookupCancelled
 from ..utils.album_art_download_planner import (
     AlbumGroup,
     SkippedTrack,
@@ -159,6 +159,7 @@ class AlbumArtDownloadDialog(QDialog):
         self._retry_group: AlbumGroup | None = None
         self._pending_preview_url = ""
         self._updating = False
+        self._prefetcher: ImagePrefetcher | None = None
 
         self.setObjectName("albumArtDownloadDialog")
         self.setWindowTitle("Download Missing Artwork")
@@ -203,6 +204,10 @@ class AlbumArtDownloadDialog(QDialog):
         if self._groups:
             self._table.selectRow(0)
         self._apply_size_bounds()
+        self._prefetcher = ImagePrefetcher(
+            self._client,
+            [g.selected_candidate.thumbnail_url for g in self._groups if g.selected_candidate],
+        )
 
     def _apply_size_bounds(self) -> None:
         """Pin the dialog so no pane can be resized out of existence."""
@@ -832,6 +837,12 @@ class AlbumArtDownloadDialog(QDialog):
         self._dry_run = self._dry_run_checkbox.isChecked()
         self._quality = self._quality_spin.value()
         self.accept()
+
+    def done(self, result: int) -> None:
+        if self._prefetcher is not None:
+            self._prefetcher.stop()
+            self._prefetcher = None
+        super().done(result)
 
     def closeEvent(self, event) -> None:
         for thread in (self._preview_thread, self._retry_thread):
