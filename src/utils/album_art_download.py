@@ -5,6 +5,7 @@ Kept free of Qt imports: only the apply stage needs Qt to re-encode the image.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import re
@@ -13,7 +14,6 @@ import threading
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
@@ -34,11 +34,17 @@ USER_AGENT = (
 MUSICBRAINZ_MIN_INTERVAL = 1.0
 REQUEST_TIMEOUT = 15.0
 MAX_RELEASES_INSPECTED = 6
+# Top-ranked releases are checked first; the rest only if none has a cover.
+INITIAL_RELEASES_INSPECTED = 3
 # Cover Art Archive has no published rate limit but is slow per request.
 MAX_PARALLEL_COVER_REQUESTS = 8
 MAX_SEARCH_RESULTS = 25
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_RETRIES = 3
+MAX_REDIRECTS = 5
+MAX_IDLE_CONNECTIONS_PER_HOST = MAX_PARALLEL_COVER_REQUESTS
+MAX_ERROR_BODY_BYTES = 64 * 1024
+PREFETCH_WORKERS = 4
 INITIAL_BACKOFF = 2.0
 
 _LUCENE_SPECIAL = re.compile(r'([+\-&|!(){}\[\]^"~*?:\\/])')
@@ -112,18 +118,62 @@ def _ssl_context() -> ssl.SSLContext:
         return ssl.create_default_context()
 
 
+class _ConnectionPool:
+    """Keeps idle keep-alive connections so repeat requests skip the TLS handshake."""
+
+    def __init__(self, ssl_context: ssl.SSLContext):
+        self._ssl_context = ssl_context
+        self._idle: dict[tuple[str, str, int], list[http.client.HTTPConnection]] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, key: tuple[str, str, int], *, fresh: bool = False):
+        """Return (connection, reused). ``fresh`` skips the idle connections."""
+        if not fresh:
+            with self._lock:
+                idle = self._idle.get(key)
+                if idle:
+                    return idle.pop(), True
+        scheme, host, port = key
+        if scheme == "https":
+            conn = http.client.HTTPSConnection(
+                host, port, timeout=REQUEST_TIMEOUT, context=self._ssl_context
+            )
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=REQUEST_TIMEOUT)
+        return conn, False
+
+    def release(self, key: tuple[str, str, int], conn: http.client.HTTPConnection) -> None:
+        with self._lock:
+            idle = self._idle.setdefault(key, [])
+            if len(idle) < MAX_IDLE_CONNECTIONS_PER_HOST:
+                idle.append(conn)
+                return
+        conn.close()
+
+    def close(self) -> None:
+        with self._lock:
+            idle, self._idle = self._idle, {}
+        for conns in idle.values():
+            for conn in conns:
+                conn.close()
+
+
 class AlbumArtLookupClient:
     """Rate-limited MusicBrainz + Cover Art Archive client with session cache."""
 
     def __init__(self, is_cancelled=None):
         self._is_cancelled = is_cancelled or (lambda: False)
-        self._ssl_context = _ssl_context()
+        self._pool = _ConnectionPool(_ssl_context())
         self._last_musicbrainz_call = 0.0
         self._throttle_lock = threading.Lock()
         self._cover_slots = threading.BoundedSemaphore(MAX_PARALLEL_COVER_REQUESTS)
         self._cache: dict[str, LookupResult] = {}
         self._image_cache: dict[str, bytes] = {}
         self._lock = threading.Lock()
+
+    def close(self) -> None:
+        """Close idle pooled connections."""
+        self._pool.close()
 
     # ── cancellation ────────────────────────────────────────────
 
@@ -166,15 +216,8 @@ class AlbumArtLookupClient:
                         self._sleep(MUSICBRAINZ_MIN_INTERVAL - elapsed)
                     self._last_musicbrainz_call = time.monotonic()
 
-            request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
             try:
-                with urllib.request.urlopen(
-                    request, timeout=REQUEST_TIMEOUT, context=self._ssl_context
-                ) as response:
-                    data = response.read(max_bytes + 1)
-                if len(data) > max_bytes:
-                    raise ValueError(f"response exceeds {max_bytes} bytes")
-                return data
+                return self._get(url, max_bytes)
             except urllib.error.HTTPError as exc:
                 if exc.code == 404:
                     raise
@@ -191,12 +234,85 @@ class AlbumArtLookupClient:
                 self._sleep(wait)
                 backoff *= 2
                 attempt += 1
-            except (urllib.error.URLError, TimeoutError, OSError):
+            except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError):
                 if attempt >= MAX_RETRIES - 1:
                     raise
                 self._sleep(backoff)
                 backoff *= 2
                 attempt += 1
+
+    def _get(self, url: str, max_bytes: int) -> bytes:
+        """GET ``url`` over a pooled connection, following redirects.
+
+        Raises ``urllib.error.HTTPError`` for 4xx/5xx so callers keep one error type.
+        """
+        for _ in range(MAX_REDIRECTS + 1):
+            parts = urllib.parse.urlsplit(url)
+            if parts.scheme not in ("http", "https") or not parts.hostname:
+                raise ValueError(f"unsupported URL: {url}")
+            port = parts.port or (443 if parts.scheme == "https" else 80)
+            key = (parts.scheme, parts.hostname, port)
+            target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+
+            conn, reused = self._pool.acquire(key)
+            try:
+                response = self._send(conn, target)
+            except (http.client.HTTPException, OSError):
+                conn.close()
+                if not reused:
+                    raise
+                # An idle connection the server already closed; retry on a new one.
+                conn, _ = self._pool.acquire(key, fresh=True)
+                try:
+                    response = self._send(conn, target)
+                except BaseException:
+                    conn.close()
+                    raise
+
+            # The connection goes back to the pool (or is closed) exactly once.
+            owned = True
+            try:
+                status = response.status
+                if status in (301, 302, 303, 307, 308):
+                    location = response.getheader("Location")
+                    owned = False
+                    self._finish(key, conn, response, MAX_ERROR_BODY_BYTES)
+                    if not location:
+                        raise urllib.error.HTTPError(
+                            url, status, "redirect without Location", response.msg, None
+                        )
+                    url = urllib.parse.urljoin(url, location)
+                    continue
+                if status >= 400:
+                    reason, headers = response.reason, response.msg
+                    owned = False
+                    self._finish(key, conn, response, MAX_ERROR_BODY_BYTES)
+                    raise urllib.error.HTTPError(url, status, reason, headers, None)
+                data = response.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    raise ValueError(f"response exceeds {max_bytes} bytes")
+                owned = False
+                self._finish(key, conn, response, 0)
+                return data
+            finally:
+                if owned:
+                    conn.close()
+        raise urllib.error.HTTPError(url, 310, "too many redirects", None, None)
+
+    @staticmethod
+    def _send(conn: http.client.HTTPConnection, target: str) -> http.client.HTTPResponse:
+        conn.request("GET", target, headers={"User-Agent": USER_AGENT})
+        return conn.getresponse()
+
+    def _finish(self, key, conn, response, drain_limit: int) -> None:
+        """Return the connection to the pool if the response was fully consumed."""
+        reusable = not response.will_close
+        if reusable and drain_limit:
+            reusable = len(response.read(drain_limit + 1)) <= drain_limit
+        if reusable and response.isclosed():
+            self._pool.release(key, conn)
+        else:
+            conn.close()
 
     # ── search ──────────────────────────────────────────────────
 
@@ -261,14 +377,41 @@ class AlbumArtLookupClient:
         )
 
         inspected = [rel for rel in ranked[:MAX_RELEASES_INSPECTED] if rel.get("id")]
-        images_by_release: dict[str, list[dict]] = {}
-        last_error = ""
+        last_errors: list[str] = []
+        candidates: list[CoverCandidate] = []
 
-        on_status(f"Checking cover art 0/{len(inspected)}")
-        pool = ThreadPoolExecutor(max_workers=max(1, len(inspected)))
+        # Most albums match on the first few releases, so the remainder is
+        # only fetched when those have no front cover.
+        for batch in (
+            inspected[:INITIAL_RELEASES_INSPECTED],
+            inspected[INITIAL_RELEASES_INSPECTED:],
+        ):
+            if not batch:
+                continue
+            candidates = self._candidates_for(batch, last_errors, on_status)
+            if candidates:
+                break
+        last_error = last_errors[-1] if last_errors else ""
+
+        if not candidates:
+            message = "No cover art available for the matching releases"
+            if last_error:
+                message = f"{message} ({last_error})"
+            return LookupResult(error=message, query=query)
+
+        return LookupResult(candidates=candidates, query=query)
+
+    def _candidates_for(
+        self, releases: list[dict], errors: list[str], on_status
+    ) -> list[CoverCandidate]:
+        """Fetch front covers for ``releases`` in parallel, keeping rank order."""
+        images_by_release: dict[str, list[dict]] = {}
+
+        on_status(f"Checking cover art 0/{len(releases)}")
+        pool = ThreadPoolExecutor(max_workers=len(releases))
         try:
             futures = {
-                pool.submit(self._front_images, rel["id"]): rel["id"] for rel in inspected
+                pool.submit(self._front_images, rel["id"]): rel["id"] for rel in releases
             }
             for done, future in enumerate(as_completed(futures), start=1):
                 try:
@@ -276,8 +419,8 @@ class AlbumArtLookupClient:
                 except LookupCancelled:
                     raise
                 except Exception as exc:
-                    last_error = str(exc)
-                on_status(f"Checking cover art {done}/{len(inspected)}")
+                    errors.append(str(exc))
+                on_status(f"Checking cover art {done}/{len(releases)}")
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
 
@@ -285,10 +428,9 @@ class AlbumArtLookupClient:
         seen_images: set[str] = set()
 
         # Rebuild in rank order; requests above finish in any order.
-        for release in inspected:
+        for release in releases:
             release_id = release["id"]
-            images = images_by_release.get(release_id) or []
-            for image in images:
+            for image in images_by_release.get(release_id) or []:
                 original_url = image.get("image") or ""
                 thumbnails = image.get("thumbnails") or {}
                 thumbnail_url = (
@@ -319,14 +461,7 @@ class AlbumArtLookupClient:
                     )
                 )
                 break  # one front cover per release is enough
-
-        if not candidates:
-            message = "No cover art available for the matching releases"
-            if last_error:
-                message = f"{message} ({last_error})"
-            return LookupResult(error=message, query=query)
-
-        return LookupResult(candidates=candidates, query=query)
+        return candidates
 
     def _front_images(self, release_id: str) -> list[dict]:
         url = COVERART_URL.format(mbid=release_id)
@@ -391,6 +526,32 @@ class AlbumArtLookupClient:
         with self._lock:
             self._image_cache[url] = data
         return data
+
+
+class ImagePrefetcher:
+    """Warms the client's image cache in the background so previews open instantly."""
+
+    def __init__(self, client: AlbumArtLookupClient, urls: list[str]):
+        self._client = client
+        self._stopped = threading.Event()
+        self._pool = ThreadPoolExecutor(
+            max_workers=PREFETCH_WORKERS, thread_name_prefix="cover-prefetch"
+        )
+        for url in dict.fromkeys(url for url in urls if url):
+            self._pool.submit(self._fetch, url)
+
+    def _fetch(self, url: str) -> None:
+        if self._stopped.is_set():
+            return
+        try:
+            self._client.fetch_image(url)
+        except Exception:
+            # The preview pane retries on demand and shows its own error.
+            logger.debug("Prefetch failed for %s", url, exc_info=True)
+
+    def stop(self) -> None:
+        self._stopped.set()
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _artist_credit(release: dict) -> str:

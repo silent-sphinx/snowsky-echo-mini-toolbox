@@ -6,7 +6,7 @@ import logging
 import shutil
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Slot
@@ -28,6 +28,9 @@ MAX_LABEL_CHARS = 70
 
 # Albums searched at once; MusicBrainz calls stay throttled across all of them.
 ALBUM_LOOKUP_WORKERS = 4
+
+# Tag writes and backups are latency-bound on removable drives and shares.
+FILE_WRITE_WORKERS = 4
 
 
 def _elide(text: str, limit: int = MAX_LABEL_CHARS) -> str:
@@ -176,6 +179,7 @@ class AlbumArtApplyWorker(QObject):
         self.client = client or AlbumArtLookupClient()
         self.client.set_cancel_check(lambda: self._cancel_requested)
         self._processed_paths: list[dict[str, str]] = []
+        self._processed_lock = threading.Lock()
 
     def request_cancel(self) -> None:
         self._cancel_requested = True
@@ -234,86 +238,106 @@ class AlbumArtApplyWorker(QObject):
             if self.backup_root is not None and not self.dry_run:
                 self.backup_root.mkdir(parents=True, exist_ok=True)
 
-            for index, candidate in enumerate(self.candidates, start=1):
-                if self._cancel_requested:
-                    cancel()
-                    return
+            # One worker downloads and re-encodes the next cover while the
+            # current album's files are being written.
+            with ThreadPoolExecutor(max_workers=1) as prefetch_pool, ThreadPoolExecutor(
+                max_workers=FILE_WRITE_WORKERS
+            ) as write_pool:
+                prepared: dict[int, Future] = {}
 
-                album = str(candidate.get("album") or "")
-                artist = str(candidate.get("artist") or "")
-                filepaths = list(candidate.get("filepaths") or [])
-                relative_files = list(candidate.get("relative_files") or [])
-                image_url = str(candidate.get("image_url") or "")
-                label = _elide(f"Album {index}/{total_albums}: {artist} - {album}")
+                def prefetch(position: int) -> None:
+                    if self.dry_run or position >= total_albums or position in prepared:
+                        return
+                    image_url = str(self.candidates[position].get("image_url") or "")
+                    if image_url:
+                        prepared[position] = prefetch_pool.submit(self._prepare_cover, image_url)
 
-                if self.dry_run:
-                    planned += len(filepaths)
-                    files_done += len(filepaths)
-                    albums_done += 1
-                    self.progress.emit(
-                        files_done, total_files,
-                        f"{label}\nWould apply to {len(filepaths)} file(s)",
-                    )
-                    continue
-
-                if not image_url:
-                    failed += len(filepaths)
-                    failures.append(f"{album}: no cover selected")
-                    files_done += len(filepaths)
-                    albums_done += 1
-                    self.progress.emit(files_done, total_files, f"{label}\nNo cover selected")
-                    continue
-
-                self.progress.emit(files_done, total_files, f"{label}\nDownloading cover")
-
-                # One download per album, reused across every member track.
-                try:
-                    raw_image = self.client.fetch_image(image_url)
-                except LookupCancelled:
-                    cancel()
-                    return
-                except Exception as exc:
-                    failed += len(filepaths)
-                    failures.append(f"{album}: download failed ({exc})")
-                    files_done += len(filepaths)
-                    albums_done += 1
-                    self.progress.emit(files_done, total_files, f"{label}\nDownload failed")
-                    continue
-
-                jpeg_data = to_non_progressive_jpeg(raw_image, self.quality)
-                if not jpeg_data:
-                    failed += len(filepaths)
-                    failures.append(f"{album}: downloaded cover could not be decoded")
-                    files_done += len(filepaths)
-                    albums_done += 1
-                    self.progress.emit(files_done, total_files, f"{label}\nCover could not be decoded")
-                    continue
-
-                for position, filepath in enumerate(filepaths):
+                prefetch(0)
+                for position, candidate in enumerate(self.candidates):
                     if self._cancel_requested:
                         cancel()
                         return
 
-                    source_path = Path(filepath)
-                    relative_file = (
-                        relative_files[position]
-                        if position < len(relative_files)
-                        else source_path.name
-                    )
-                    self.progress.emit(
-                        files_done, total_files,
-                        f"{label}\n" + _elide(f"Writing {position + 1}/{len(filepaths)}: {relative_file}"),
-                    )
-                    error = self._apply_to_file(source_path, jpeg_data)
-                    if error:
-                        failed += 1
-                        failures.append(f"{relative_file}: {error}")
-                    else:
-                        written += 1
-                    files_done += 1
+                    prefetch(position + 1)
+                    index = position + 1
+                    album = str(candidate.get("album") or "")
+                    artist = str(candidate.get("artist") or "")
+                    filepaths = list(candidate.get("filepaths") or [])
+                    relative_files = list(candidate.get("relative_files") or [])
+                    image_url = str(candidate.get("image_url") or "")
+                    label = _elide(f"Album {index}/{total_albums}: {artist} - {album}")
 
-                albums_done += 1
-                self.progress.emit(files_done, total_files, f"{label}\nDone")
+                    if self.dry_run:
+                        planned += len(filepaths)
+                        files_done += len(filepaths)
+                        albums_done += 1
+                        self.progress.emit(
+                            files_done, total_files,
+                            f"{label}\nWould apply to {len(filepaths)} file(s)",
+                        )
+                        continue
+
+                    if not image_url:
+                        failed += len(filepaths)
+                        failures.append(f"{album}: no cover selected")
+                        files_done += len(filepaths)
+                        albums_done += 1
+                        self.progress.emit(files_done, total_files, f"{label}\nNo cover selected")
+                        continue
+
+                    self.progress.emit(files_done, total_files, f"{label}\nDownloading cover")
+
+                    # One download per album, reused across every member track.
+                    try:
+                        jpeg_data, cover_error = prepared.pop(position).result()
+                    except LookupCancelled:
+                        cancel()
+                        return
+                    if cover_error:
+                        failed += len(filepaths)
+                        failures.append(f"{album}: {cover_error}")
+                        files_done += len(filepaths)
+                        albums_done += 1
+                        self.progress.emit(files_done, total_files, f"{label}\nCover unavailable")
+                        continue
+
+                    jobs = []
+                    for file_position, filepath in enumerate(filepaths):
+                        source_path = Path(filepath)
+                        relative_file = (
+                            relative_files[file_position]
+                            if file_position < len(relative_files)
+                            else source_path.name
+                        )
+                        jobs.append(
+                            (relative_file, write_pool.submit(self._apply_to_file, source_path, jpeg_data))
+                        )
+
+                    for file_position, (relative_file, future) in enumerate(jobs, start=1):
+                        if self._cancel_requested:
+                            for _, pending in jobs:
+                                pending.cancel()
+                        try:
+                            error = future.result()
+                        except CancelledError:
+                            continue
+                        if error:
+                            failed += 1
+                            failures.append(f"{relative_file}: {error}")
+                        else:
+                            written += 1
+                        files_done += 1
+                        self.progress.emit(
+                            files_done, total_files,
+                            f"{label}\n" + _elide(f"Wrote {file_position}/{len(jobs)}: {relative_file}"),
+                        )
+
+                    if self._cancel_requested:
+                        cancel()
+                        return
+
+                    albums_done += 1
+                    self.progress.emit(files_done, total_files, f"{label}\nDone")
 
             self.finished.emit(
                 self._payload(written, failed, planned, albums_done, total_albums,
@@ -321,6 +345,19 @@ class AlbumArtApplyWorker(QObject):
             )
         except Exception as exc:
             self.failed.emit(str(exc))
+
+    def _prepare_cover(self, image_url: str) -> tuple[bytes | None, str]:
+        """Download and re-encode one cover; returns (jpeg, error message)."""
+        try:
+            raw_image = self.client.fetch_image(image_url)
+        except LookupCancelled:
+            raise
+        except Exception as exc:
+            return None, f"download failed ({exc})"
+        jpeg_data = to_non_progressive_jpeg(raw_image, self.quality)
+        if not jpeg_data:
+            return None, "downloaded cover could not be decoded"
+        return jpeg_data, ""
 
     def _apply_to_file(self, source_path: Path, jpeg_data: bytes) -> str:
         """Embed the cover into one file; return an error message or ''."""
@@ -338,7 +375,8 @@ class AlbumArtApplyWorker(QObject):
             return write_message
 
         # The file changed on disk even if verification below fails.
-        self._processed_paths.append({"filepath": str(source_path)})
+        with self._processed_lock:
+            self._processed_paths.append({"filepath": str(source_path)})
 
         verified_art, verified_mime = read_embedded_album_art(source_path)
         if not verified_art:

@@ -487,6 +487,8 @@ class AlbumArtWidget(QWidget):
             return
 
         self._pending_skipped = skipped
+        if self._lookup_client is not None:
+            self._lookup_client.close()
         self._lookup_client = AlbumArtLookupClient()
 
         progress = QProgressDialog(
