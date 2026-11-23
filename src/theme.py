@@ -210,12 +210,15 @@ def create_palette() -> QPalette:
 # ── Global QSS Stylesheet ──────────────────────────────────────────────────
 import os
 
+# Qt requires forward slashes even on Windows for QSS URLs
+COMBO_ARROW_URL = os.path.join(os.path.dirname(__file__), "assets", "combo_down_arrow.svg").replace('\\', '/')
+
 def global_stylesheet() -> str:
     """Return the global QSS stylesheet string."""
     tick_path = os.path.join(os.path.dirname(__file__), "assets", "tick.svg")
     # Qt requires forward slashes even on Windows for QSS URLs
     tick_path = tick_path.replace('\\', '/')
-    
+
     return f"""
         /* ── Base ─────────────────────────────────────────── */
         * {{
@@ -476,10 +479,12 @@ def global_stylesheet() -> str:
         }}
 
         QComboBox::down-arrow {{
-            image: none;
+            image: url({COMBO_ARROW_URL});
+            width: 16px;
+            height: 16px;
             border: none;
         }}
-        
+
         QComboBox::down-arrow:on {{ /* shift the arrow when popup is open */
             top: 1px;
             left: 1px;

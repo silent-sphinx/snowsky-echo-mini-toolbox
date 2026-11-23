@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QBrush
 
-from ..theme import Colours
+from ..theme import COMBO_ARROW_URL, Colours
 from ..models.drive_data import DriveDataModel, TrackMetadata
 from ..models.music_compatibility_model import (
     MusicCompatibilityTableModel,
@@ -125,11 +125,10 @@ class MusicCompatibilityWidget(QWidget):
                 width: 24px;
             }}
             QComboBox::down-arrow {{
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 5px solid {Colours.TEXT_SECONDARY};
-                margin-right: 8px;
+                image: url({COMBO_ARROW_URL});
+                width: 16px;
+                height: 16px;
+                margin-right: 4px;
             }}
             QComboBox QAbstractItemView {{
                 background-color: {Colours.BG_ELEVATED};
