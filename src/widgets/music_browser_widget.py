@@ -25,7 +25,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QDialog,
     QInputDialog,
-    QProgressDialog
+    QProgressDialog,
+    QFileDialog,
 )
 from PySide6.QtGui import QBrush
 
@@ -33,7 +34,13 @@ from ..theme import Colours
 from ..models.drive_data import DriveDataModel, TrackMetadata
 from ..utils.lyrics import atomic_write_text, decode_text_file_bytes
 from ..utils.metadata_writer import canonical_tag_key, save_metadata
-from ..utils.album_art import extract_album_art, remove_embedded_album_art
+from ..utils.album_art import (
+    extract_album_art,
+    remove_embedded_album_art,
+    supports_artwork_write,
+    to_non_progressive_jpeg,
+    write_embedded_album_art,
+)
 from ..utils.album_art_planner import apply_album_art_result
 from ..utils.album_art_validation import evaluate_album_art
 from ..utils.file_rename import paths_are_same_file
@@ -408,6 +415,13 @@ class MusicBrowserWidget(QWidget):
 
         art_btns_lyt = QHBoxLayout()
         art_btns_lyt.addStretch(1)
+        self._art_upload_btn = QPushButton("Upload Artwork...")
+        self._art_upload_btn.setToolTip(
+            "Embed a custom image as this file's album art, replacing any existing artwork."
+        )
+        self._art_upload_btn.setEnabled(False)
+        self._art_upload_btn.clicked.connect(self._on_upload_artwork_clicked)
+        art_btns_lyt.addWidget(self._art_upload_btn)
         self._art_remove_btn = QPushButton("Remove Artwork")
         self._art_remove_btn.setToolTip("Delete all embedded artwork from this file.")
         self._art_remove_btn.setEnabled(False)
@@ -655,6 +669,7 @@ class MusicBrowserWidget(QWidget):
         """Populate the UI using the centralized data model."""
         self._data_model = data_model
         self._tree_items_built = 0
+        view_state = self._capture_tree_view_state()
         with freeze_view(self._tree, restore_sorting=False):
             self._tree_model.blockSignals(True)
             try:
@@ -667,8 +682,57 @@ class MusicBrowserWidget(QWidget):
                 # cached rows before freeze_view lets any events run.
                 self._tree.reset()
         keep_ui_alive()
-        self._show_blank_details()
-        
+        if not self._restore_tree_view_state(view_state):
+            self._show_blank_details()
+
+    def _capture_tree_view_state(self) -> tuple[set[str], list[str], int]:
+        """Remember expansion, selection and scroll so a rescan doesn't move the user."""
+        expanded: set[str] = set()
+
+        def walk(parent: QStandardItem) -> None:
+            for row in range(parent.rowCount()):
+                child = parent.child(row)
+                if child.rowCount() and self._tree.isExpanded(child.index()):
+                    expanded.add(child.data(Qt.UserRole))
+                walk(child)
+
+        walk(self._tree_model.invisibleRootItem())
+        selected = [
+            index.data(Qt.UserRole)
+            for index in self._tree.selectionModel().selectedRows()
+        ]
+        return expanded, selected, self._tree.verticalScrollBar().value()
+
+    def _restore_tree_view_state(self, state: tuple[set[str], list[str], int]) -> bool:
+        """Reapply captured state; return True if any selection was restored."""
+        expanded, selected, scroll = state
+        selected_paths = set(selected)
+        to_select: list[QStandardItem] = []
+
+        def walk(parent: QStandardItem) -> None:
+            for row in range(parent.rowCount()):
+                child = parent.child(row)
+                path = child.data(Qt.UserRole)
+                if path in expanded:
+                    self._tree.setExpanded(child.index(), True)
+                if path in selected_paths:
+                    to_select.append(child)
+                walk(child)
+
+        walk(self._tree_model.invisibleRootItem())
+        self._tree.verticalScrollBar().setValue(scroll)
+        if not to_select:
+            return False
+        selection_model = self._tree.selectionModel()
+        for item in to_select:
+            selection_model.select(
+                item.index(),
+                QItemSelectionModel.Select | QItemSelectionModel.Rows,
+            )
+        selection_model.setCurrentIndex(to_select[0].index(), QItemSelectionModel.NoUpdate)
+        self._refresh_details_pane()
+        return True
+
     def _build_tree(self, tree_dict: dict, parent_item: QStandardItem, current_path: str) -> None:
         # Sort items: folders first (sub_dict is not None), then A-Z
         sorted_items = sorted(
@@ -1157,9 +1221,10 @@ class MusicBrowserWidget(QWidget):
         self._fill_meta_table(meta)
             
         # Album Art        self._art_table.setRowCount(0)
+        self._art_filepath = meta.filepath
+        self._art_upload_btn.setEnabled(supports_artwork_write(Path(meta.filepath)))
+        self._art_remove_btn.setEnabled(meta.has_album_art)
         if meta.has_album_art:
-            self._art_filepath = meta.filepath
-            self._art_remove_btn.setEnabled(True)
             art_info = extract_album_art(meta.filepath)
             if art_info:
                 # Load Pixmap
@@ -1399,6 +1464,7 @@ class MusicBrowserWidget(QWidget):
         self._art_image_lbl.setPixmap(QPixmap())
         self._art_image_lbl.setText("No Album Art")
         self._art_filepath = None
+        self._art_upload_btn.setEnabled(False)
         self._art_remove_btn.setEnabled(False)
         self._lyrics_text.setPlainText("")
         self._set_lyrics_editable(False)
@@ -1465,6 +1531,47 @@ class MusicBrowserWidget(QWidget):
                 except OSError:
                     pass
         QMessageBox.information(self, "Success", "LRC file saved successfully.")
+
+    def _on_upload_artwork_clicked(self) -> None:
+        filepath = self._art_filepath
+        if not filepath:
+            return
+
+        image_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Album Art",
+            "",
+            "Images (*.jpg *.jpeg *.png *.bmp *.gif *.webp *.tif *.tiff);;All Files (*)",
+        )
+        if not image_path:
+            return
+
+        try:
+            raw_image = Path(image_path).read_bytes()
+        except OSError as exc:
+            QMessageBox.critical(self, "Error", f"Could not read the image:\n{exc}")
+            return
+
+        jpeg_data = to_non_progressive_jpeg(raw_image)
+        if not jpeg_data:
+            QMessageBox.critical(self, "Error", "The selected file is not a readable image.")
+            return
+
+        success, msg = write_embedded_album_art(Path(filepath), jpeg_data)
+        if not success:
+            QMessageBox.critical(self, "Error", f"Failed to write artwork:\n{msg}")
+            return
+
+        track = self._data_model.get_track(filepath) if self._data_model else None
+        if track is not None:
+            apply_album_art_result(track, evaluate_album_art(Path(filepath)))
+            try:
+                track.size_bytes = os.path.getsize(filepath)
+            except OSError:
+                pass
+        self._refresh_details_pane()
+        if self._data_model is not None:
+            self.library_changed.emit(self._data_model)
 
     def _on_remove_artwork_clicked(self) -> None:
         filepath = self._art_filepath
